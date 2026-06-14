@@ -218,16 +218,7 @@ async def handle_message(message):
     # TODO P3: symbol blacklist 检查
 
     # 解析成功后立刻发预警（让用户知道收到了，正在处理）
-    await _safe_notify(format_signal_alert(
-        cfg.name,
-        signal["symbol"],
-        signal["strike"],
-        signal["expiry"],
-        signal["side"][0],
-        signal.get("price", 0) or 0,
-        cfg.default_qty,
-        signal.get("action", "OPEN"),
-    ))
+    await _safe_notify(format_signal_alert(signal, cfg.name))
 
     # ============================================================
     # 风控检查
@@ -252,7 +243,7 @@ async def handle_message(message):
         logger.warning(
             f"🛡️  Risk blocked: {risk_result.reason} - {risk_result.detail}"
         )
-        await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
+        await _safe_notify(format_risk_blocked(signal, risk_result.reason, risk_result.detail))
         return
 
     # ============================================================
@@ -262,7 +253,7 @@ async def handle_message(message):
         order_result = await asyncio.to_thread(place_order, signal, qty)
     except Exception as e:
         logger.exception("place_order failed")
-        await _safe_notify(format_error("Order error", str(e)))
+        await _safe_notify(format_error(f"Order error: {e}", raw))
         return
 
     # 落库订单（业务日志，跟风控的 record_order 是两件事）
@@ -290,15 +281,7 @@ async def handle_message(message):
 
     # ---- 通知 + 延迟统计 ----
     elapsed = (datetime.now() - t0).total_seconds() * 1000
-    await _safe_notify(format_order_filled(
-        signal["symbol"],
-        signal["strike"],
-        signal["side"][0],
-        signal["expiry"],
-        order_result.get("price", signal.get("price", 0) or 0),
-        order_result.get("qty", cfg.default_qty),
-        order_result.get("order_id", "N/A"),
-    ))
+    await _safe_notify(format_order_filled(signal, order_result, elapsed))
     logger.info(f"⏱️  End-to-end latency: {elapsed:.0f}ms")
 
 

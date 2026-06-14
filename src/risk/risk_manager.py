@@ -168,7 +168,8 @@ def _trigger_circuit_breaker(reason: str):
 def check_order(price: float, qty: int, 
                 symbol: str = "", strike: float = 0,
                 side: str = "", expiry: str = "",
-                channel_name: str = "") -> RiskCheckResult:
+                channel_name: str = "",
+                max_price_override: float = None) -> RiskCheckResult:
     """
     下单前风控检查（不记录订单，只检查）
     
@@ -192,11 +193,13 @@ def check_order(price: float, qty: int,
         )
     
     # ---------- Layer 1: 单张价格 ----------
-    if price > MAX_PRICE_PER_CONTRACT:
+    # channel 配置优先；没传则用全局 MAX_PRICE_PER_CONTRACT
+    effective_max_price = max_price_override if max_price_override is not None else MAX_PRICE_PER_CONTRACT
+    if price > effective_max_price:
         return RiskCheckResult(
             passed=False,
             reason="单张合约价格超限",
-            detail=f"信号价 ${price} > 上限 ${MAX_PRICE_PER_CONTRACT}"
+            detail=f"信号价 ${price} > 上限 ${effective_max_price} (channel override={max_price_override is not None})"
         )
     
     # ---------- Layer 2: 单笔成本 ----------

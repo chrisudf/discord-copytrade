@@ -49,9 +49,18 @@ async def send_telegram(text: str, parse_mode: str = "Markdown") -> bool:
             if resp.status_code == 200:
                 logger.debug(f"[Telegram] 发送成功: {text[:50]}...")
                 return True
-            else:
-                logger.error(f"[Telegram] 发送失败 status={resp.status_code} body={resp.text[:200]}")
+            # 400 = Markdown 解析失败，fallback 到纯文本重试一次
+            if resp.status_code == 400 and parse_mode:
+                logger.warning(f"[Telegram] Markdown 解析失败，fallback 纯文本: {resp.text[:120]}")
+                payload.pop("parse_mode", None)
+                resp2 = await client.post(API_URL, json=payload)
+                if resp2.status_code == 200:
+                    logger.debug("[Telegram] 纯文本 fallback 成功")
+                    return True
+                logger.error(f"[Telegram] fallback 也失败 status={resp2.status_code} body={resp2.text[:200]}")
                 return False
+            logger.error(f"[Telegram] 发送失败 status={resp.status_code} body={resp.text[:200]}")
+            return False
     except httpx.TimeoutException:
         logger.error(f"[Telegram] 超时 ({TIMEOUT}s)")
         return False
