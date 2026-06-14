@@ -29,7 +29,6 @@ from src.utils.logger import logger
 DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", 1))
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", 5)) / 100
 TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
 TRADE_PWD = os.getenv("MOOMOO_TRADE_PWD", "")
@@ -49,6 +48,11 @@ except ImportError:
 # ---- 模块级单例 ----
 _ctx = None
 _unlocked = False
+
+
+def _is_dry_run() -> bool:
+    """实时读取 DRY_RUN，避免 import 时锁定导致测试无法覆盖真实分支"""
+    return os.getenv("DRY_RUN", "true").lower() == "true"
 
 
 def _get_trd_env():
@@ -132,13 +136,14 @@ def place_order(signal: dict, qty: int = None) -> dict:
     )
     limit_price = round(signal["price"] * (1 + MAX_SLIPPAGE_PCT), 2)
 
+    dry_run = _is_dry_run()
     logger.info(
         f"[broker] Order: {option_code} x {qty} @ {limit_price:.2f} "
-        f"[env={TRD_ENV_STR}, dry_run={DRY_RUN}] tags={signal.get('tags')}"
+        f"[env={TRD_ENV_STR}, dry_run={dry_run}] tags={signal.get('tags')}"
     )
 
     # ---- DRY_RUN 路径 ----
-    if DRY_RUN:
+    if dry_run:
         return {
             "success": True, "message": "DRY_RUN",
             "order_id": "MOCK_001", "code": option_code,
@@ -192,7 +197,7 @@ def query_order_status(order_id: str) -> dict:
     返回:
         {success, status, filled_qty, filled_avg_price, message}
     """
-    if DRY_RUN:
+    if _is_dry_run():
         return {
             "success": True, "status": "FILLED_ALL",
             "filled_qty": 1, "filled_avg_price": 0.0,
