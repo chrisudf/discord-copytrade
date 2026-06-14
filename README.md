@@ -1,6 +1,6 @@
 # Discord Copy Trade Bot
 
-自动监听 Discord 付费群信号 -> 解析 -> moomoo 下单 -> Telegram 通知 -> 复盘报告
+自动监听 Discord 信号 -> 解析 -> moomoo 下单 -> Telegram 通知 -> 复盘报告
 
 ## 快速开始
 
@@ -17,4 +17,4 @@
 - utils/     : 日志/工具
 
 ## 风险声明
-0DTE 期权风险极高, Self-bot 违反 Discord TOS. 请先用模拟盘测试.
+期权风险极高, 请先用模拟盘测试
