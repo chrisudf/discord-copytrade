@@ -1,49 +1,52 @@
-"""Phase 1: just verify we can connect and see the channel."""
+"""Phase 1: verify Discord connection + multi-channel config loading."""
 import os
+import sys
 import asyncio
-import discord
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv("config/.env")
+# 让 src 可 import
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+load_dotenv(Path(__file__).resolve().parents[1] / "config" / ".env", override=True)
+
+import discord
+from src.config.channel_loader import registry
 
 TOKEN = os.getenv("DISCORD_USER_TOKEN")
-CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", 0))
-TRIGGER_USERS = [int(x) for x in os.getenv("DISCORD_TRIGGER_USER_IDS", "").split(",") if x]
 
 client = discord.Client()
 
 
 @client.event
 async def on_ready():
-    print(f"✅ Logged in as: {client.user} (id={client.user.id})")
-    print(f"📺 Target channel: {CHANNEL_ID}")
-    print(f"👤 Trigger users: {TRIGGER_USERS}")
+    print(f"\n✅ Logged in as: {client.user} (id={client.user.id})")
+    print(f"📋 Monitored channels ({len(registry.enabled_channel_ids())}):")
 
-    ch = client.get_channel(CHANNEL_ID)
-    if ch is None:
-        print(f"❌ Channel {CHANNEL_ID} NOT visible. Check token / membership.")
-        await client.close()
-        return
-    print(f"✅ Channel visible: #{ch.name}")
-    if ch.guild:
-        print(f"   Guild: {ch.guild.name}")
-    print("\n👂 Listening for messages... (Ctrl+C to stop)\n")
+    for cid in registry.enabled_channel_ids():
+        cfg = registry.get(cid)
+        ch = client.get_channel(cid)
+        if ch is None:
+            print(f"   ❌ {cfg.name} ({cid}) NOT visible — check membership/token")
+        else:
+            guild_name = ch.guild.name if ch.guild else "DM"
+            print(f"   ✅ {cfg.name} ({cid}) → #{ch.name} @ {guild_name}")
+            print(f"      trigger_users={cfg.trigger_user_ids}, qty={cfg.default_qty}, max_price={cfg.max_price}")
+
+    print("\n👂 Listening... (Ctrl+C to stop)\n")
 
 
 @client.event
 async def on_message(message):
-    is_target_channel = message.channel.id == CHANNEL_ID
-    is_target_user = (not TRIGGER_USERS) or message.author.id in TRIGGER_USERS
+    cid = message.channel.id
+    if not registry.is_monitored(cid):
+        return  # 完全忽略非监控频道
 
-    marker = ""
-    if is_target_channel and is_target_user:
-        marker = "🎯 MATCH"
-    elif is_target_channel:
-        marker = "📍 channel match, user mismatch"
-    else:
-        return  # ignore other channels entirely
+    cfg = registry.get(cid)
+    is_trigger = cfg.is_trigger_user(message.author.id)
+    marker = "🎯 TRIGGER" if is_trigger else "📍 channel match, user mismatch"
 
-    print(f"\n[{marker}] {message.author.name} (id={message.author.id}) in #{message.channel.name}")
+    print(f"\n[{marker}] {message.author.name} (id={message.author.id}) in #{message.channel.name} ({cfg.name})")
     print(f"  Content: {message.content!r}")
     if message.embeds:
         print(f"  Embeds: {len(message.embeds)}")
