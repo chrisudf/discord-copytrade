@@ -1,0 +1,61 @@
+# scripts/test_parser_rules.py
+"""验证 4 条规则在样本上的表现"""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.parser.signal_parser import parse_signal
+
+SAMPLES = [
+    # (label, text, expected_symbol_or_None)
+    ("KC AMZN swing", "@everyone\nKC Trades Bot:AMZN 260c 7/17 @ 2.64 swing", "AMZN"),
+    ("KC SPIR IPO lotto", "@everyone\nKC Trades Bot:Space X IPO lotto, SPIR 20c 6/18 @ 1.90", "SPIR"),
+    ("KC MSFT 多腿 → 只取第一", "@everyone\nKC Trades Bot:Dumpster Diver trade setup\n\nMSFT 440c 7/17 @ 3.05 swing, I like the 420c 7/17 @ 6.05 if you want a higher delta", "MSFT"),
+    ("KC SMH put", "@everyone\nKC Trades Bot:SMH 530p 6/18 lotto swing @ 8.20\n\nRemember, PPI data tomorrow", "SMH"),
+    ("KC HIMS small swing", "@everyone\nKC Trades Bot:small swing/lotto size\n\nHIMS 35c 7/17 @ 1.46", "HIMS"),
+    ("KC AMZN put", "@everyone\nKC Trades Bot:AMZN 240p 6/18 @ 3.40", "AMZN"),
+
+    ("enrich IREN 0DTE", "enrich:\nLotto $IREN 0DTE $60 calls $.68\n\n@everyone $alert", "IREN"),
+    ("enrich TSLA puts", "enrich:\nScalp - lotto\n\n$TSLA 0DTE $405 PUTS $1.17\n\n@everyone $alert", "TSLA"),
+    ("enrich SPY hedge", "enrich:\n$SPY 0DTE $752 puts for $.55\n\nLotto size - nice hedge into EOD\n\n@everyone $alert", "SPY"),
+    ("enrich HIMS super lotto", "enrich:\nSuper lotto - $HIMS 0DTE $26.50 calls $.15\n\nPlease go light\n\n@everyone $alert", "HIMS"),
+
+    # 重复播报：两条都应该解析到（去重靠 dedup deque，不在 parser 层）
+    ("enrich MRVL @.95", "美股会员网rich:\n$MRVL - lotto - 1% \n\n0DTE $185 calls $.95\n\n@everyone $alert", "MRVL"),
+    ("enrich MRVL @1.10", "美股会员网rich:\n$MRVL - lotto - 1%\n\n0DTE $185 calls - $1.10 fill\n\n@everyone $alert", "MRVL"),
+
+    # 规则 3: 持仓汇报 → None
+    ("持仓汇报", "美股会员网rich:\nInto tomorrow, this is what I'm holding:\n\n$ARM $232.50 1DTE calls\n$APLD remaining 5/22 $50 calls\n$OSCR remaining 6/18 $25 calls", None),
+
+    # 规则 4: 价格区间 → None
+    ("价格区间 NBIS", "美股会员网rich:\n$NBIS - Lotto - 1% - scalp\n\n0DTE $152.50 calls - try to fill close to $1.30 - $1.70\n\n@everyone $alert\n\n美股会员网rich:\n$NBIS - 彩票", None),
+
+    # 规则 1: 中文段被切掉，英文段正常解析
+    ("中英双语 TSLA fill", "美股会员网rich:\nLotto - size for 0 \n\n$TSLA 0dte $340 puts $.45 fill\n\n@everyone $alert\n\n美股会员网rich:\n彩票 - 尺寸为 0\n\n$TSLA 0dte $340 看跌期权 $.45 成交", "TSLA"),
+    ("中英双语 TSLA heavy", "美股会员网rich:\nLOTTO DO NOT SIZE HEAVY \n\n$TSLA 0DTE $342.50 puts $.70 \n\n@everyone $alert\n\n美股会员网rich:\n彩票不要重仓", "TSLA"),
+]
+
+
+def main():
+    pass_count = 0
+    fail_count = 0
+    for label, text, expected in SAMPLES:
+        result = parse_signal(text)
+        actual = result["symbol"] if result else None
+        ok = (actual == expected)
+        mark = "✅" if ok else "❌"
+        print(f"{mark} {label:<35} expected={expected!s:<8} actual={actual!s:<8}")
+        if result:
+            print(f"     → {result['symbol']} {result['strike']}{result['side'][0]} "
+                  f"{result['expiry']} @ ${result['price']} tags={result['tags']}")
+        if ok:
+            pass_count += 1
+        else:
+            fail_count += 1
+            if result:
+                print(f"     raw matched: {result['matched']}")
+    print(f"\n=== {pass_count}/{len(SAMPLES)} passed, {fail_count} failed ===")
+
+
+if __name__ == "__main__":
+    main()

@@ -197,8 +197,9 @@ async def handle_message(message):
         return
 
     # ---- 多信号：取第一个 ----
-    # parser 可能返回 dict（单信号）或 list[dict]（多合约）
-    # 策略：只下第一个，其他在 Telegram 里告知人工评估
+    # TODO: parser 已重写为只返回 dict|None，此分支当前不可达。
+    # 保留作为防御层；若未来 parser 改回支持多信号 list，此处自动生效。
+    # 触达后请确认是否还要 Telegram 告警（用户目前规则：不做多腿）。
     if isinstance(signal, list):
         all_signals = signal
         signal = all_signals[0]
