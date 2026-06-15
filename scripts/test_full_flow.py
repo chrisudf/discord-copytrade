@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.listener.discord_client import handle_message, client as discord_client
+from src.listener import discord_client as dc_module  # === [新增] 用于 reset state ===
 from src.utils.logger import logger
 
 
@@ -70,10 +71,19 @@ def next_msg_id() -> int:
     return _MSG_ID_COUNTER[0]
 
 
+# === [新增] 清空 listener 内部状态，保证 case 之间相互独立 ===
+def reset_state():
+    """清空 fingerprint 指纹 + msg_id dedup + processed set，避免 case 间互相干扰"""
+    dc_module._signal_fps.clear()
+    dc_module._processed_msg_ids.clear()
+    dc_module._processed_set.clear()
+
+
 # ============================================================
 # Test cases
 # ============================================================
 async def test_1_normal_signal():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[1] 正常信号：KC 在 kc 频道发 IREN 60C")
     print("=" * 60)
@@ -87,6 +97,7 @@ async def test_1_normal_signal():
 
 
 async def test_2_unmonitored_channel():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[2] 非监听频道：应该完全忽略")
     print("=" * 60)
@@ -101,6 +112,7 @@ async def test_2_unmonitored_channel():
 
 
 async def test_3_wrong_user():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[3] 监听频道但非触发用户：应该忽略")
     print("=" * 60)
@@ -115,6 +127,7 @@ async def test_3_wrong_user():
 
 
 async def test_4_parse_fail():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[4] 垃圾内容：parse 失败应发 Telegram 报错")
     print("=" * 60)
@@ -128,6 +141,7 @@ async def test_4_parse_fail():
 
 
 async def test_5_price_too_high():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[5] 价格 $8 > channel max_price $5：风控应拦截")
     print("=" * 60)
@@ -141,6 +155,7 @@ async def test_5_price_too_high():
 
 
 async def test_6_dedup():
+    reset_state()  # === [新增] case 内部需要保留状态，所以只在开头 reset ===
     print("\n" + "=" * 60)
     print("[6] 重复 message_id：dedup 应跳过第二次")
     print("=" * 60)
@@ -159,6 +174,7 @@ async def test_6_dedup():
 
 
 async def test_7_close_signal():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[7] CLOSE 信号：应跳过不下单")
     print("=" * 60)
@@ -172,6 +188,7 @@ async def test_7_close_signal():
 
 
 async def test_8_multi_signal():
+    reset_state()  # === [新增] ===
     print("\n" + "=" * 60)
     print("[8] 多信号：应取第一个")
     print("=" * 60)

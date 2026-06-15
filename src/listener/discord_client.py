@@ -21,7 +21,7 @@ import os
 import sys
 import asyncio
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta   # === [新增] timedelta 给 fingerprint 窗口用 ===
 from pathlib import Path
 
 import discord
@@ -71,6 +71,72 @@ def _seen(msg_id: int) -> bool:
     _processed_msg_ids.append(msg_id)
     _processed_set.add(msg_id)
     return False
+
+
+# ============================================================
+# === [新增] Dedup 层 2: signal fingerprint 去重 ===
+# ============================================================
+# 上面的 _seen() 只能拦 msg_id 重复（edit / 重连重放）。
+# 但有一类场景 msg_id 不同、信号语义却相同，需要单独拦：
+#
+# 实测场景：
+#   1. 翻译机器人独立中英文双发
+#      MRVL 5/11 15:23:51（中文）+ 15:23:53（英文）间隔 2s，两条独立 msg
+#   2. KC 同信号重发
+#      NNE 5/11 17:57:55 + 17:58:03 间隔 8s
+#   3. KC 价格修正（fill 通知）
+#      MRVL 5/15 $1.10 → $.95，间隔 68s，按"订阅第一信号"原则只跟首条
+#   4. 跨频道转发（KC 主频道 + enrich 翻译版同一信号）
+#
+# 设计要点：
+#   - key = symbol|side|strike|expiry_date（不含 price/channel/tags）
+#     → 价格修正 / 跨频道都能拦
+#   - 5 分钟窗口（实测最长间隔 ~68s 价格修正场景，留 4x 余量）
+#   - dict 存 timestamp：惰性 GC + 硬上限保护，避免内存无限增长
+#
+# 拦截位置：parse 成功后、风控前。拦得越早越好（省 risk_check / TG / broker）。
+FINGERPRINT_WINDOW = timedelta(minutes=5)
+_FP_MAX = 200
+_signal_fps: dict[str, datetime] = {}
+
+
+def _signal_fingerprint(sig: dict) -> str:
+    """同 symbol + side + strike + expiry_date → 视为同信号"""
+    return (
+        f"{sig['symbol']}|{sig['side']}|"
+        f"{sig['strike']}|{sig.get('expiry_date', '')}"
+    )
+
+
+def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
+    """
+    返回 (是否重复, 距上次秒数)。
+
+    每次调用都先惰性清理过期项 + 硬上限保护，
+    极端情况下（窗口内来 200+ 不同信号）丢最老的。
+    """
+    fp = _signal_fingerprint(sig)
+    now = datetime.now()
+
+    # 1. 惰性清理过期项（最多 200 个，O(n) 可接受）
+    expired = [k for k, ts in _signal_fps.items() if now - ts > FINGERPRINT_WINDOW]
+    for k in expired:
+        _signal_fps.pop(k, None)
+
+    # 2. 硬上限保护
+    if len(_signal_fps) >= _FP_MAX:
+        oldest = min(_signal_fps, key=_signal_fps.get)
+        _signal_fps.pop(oldest, None)
+
+    # 3. 查重
+    prev_ts = _signal_fps.get(fp)
+    if prev_ts is not None:
+        ago = (now - prev_ts).total_seconds()
+        return True, ago
+
+    # 4. 记录
+    _signal_fps[fp] = now
+    return False, 0.0
 
 
 # ============================================================
@@ -215,6 +281,22 @@ async def handle_message(message):
                 for i, s in enumerate(all_signals)
             )
         )
+
+    # ============================================================
+    # === [新增] Fingerprint 去重 ===
+    # ============================================================
+    # 必须放在 parse 成功之后（要拿 symbol/strike/side/expiry_date 作 key）
+    # 必须放在风控/TG/下单之前（拦得越早越省）
+    # 不发 TG：双发场景下 TG 跟着双响会刷屏；只 log 留痕用于复盘
+    is_dup, ago_sec = _is_duplicate_signal(signal)
+    if is_dup:
+        logger.info(
+            f"🔁 Duplicate signal skipped: "
+            f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+            f"{signal.get('expiry_date', '')} "
+            f"(prev {ago_sec:.0f}s ago)"
+        )
+        return
 
     # TODO P3: symbol blacklist 检查
 
