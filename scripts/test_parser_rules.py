@@ -33,6 +33,16 @@ SAMPLES = [
     # 规则 1: 中文段被切掉，英文段正常解析
     ("中英双语 TSLA fill", "美股会员网rich:\nLotto - size for 0 \n\n$TSLA 0dte $340 puts $.45 fill\n\n@everyone $alert\n\n美股会员网rich:\n彩票 - 尺寸为 0\n\n$TSLA 0dte $340 看跌期权 $.45 成交", "TSLA"),
     ("中英双语 TSLA heavy", "美股会员网rich:\nLOTTO DO NOT SIZE HEAVY \n\n$TSLA 0DTE $342.50 puts $.70 \n\n@everyone $alert\n\n美股会员网rich:\n彩票不要重仓", "TSLA"),
+
+    # === [新增] 英文月份 - Pattern A2 ===
+    ("KC NOW June 26", "@everyone\nKC Trades Bot:NOW 115c June 26 @ 2.00", "NOW"),
+    ("KC IWM June 22", "@everyone\nKC Trades Bot:IWM 293p June 22 @ 2.23", "IWM"),
+    ("KC AMZN January 15", "@everyone\nKC Trades Bot:AMZN 200c January 15 @ 3.50", "AMZN"),
+    ("KC AAPL Jun 26th", "@everyone\nKC Trades Bot:AAPL 240c Jun 26th @ 4.20", "AAPL"),
+    ("KC TSLA Sept 19", "@everyone\nKC Trades Bot:TSLA 350p Sept 19 @ 4.50", "TSLA"),
+
+    # === [新增] 英文月份 - Pattern B0.5 ===
+    ("enrich NVDA June 20", "enrich:\n$NVDA June 20 $180 calls $2.50\n\n@everyone $alert", "NVDA"),
 ]
 
 

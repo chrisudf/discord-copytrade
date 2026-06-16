@@ -6,7 +6,9 @@
   3. 当日累计成本上限（触发后当日全停）
   4. 当日下单次数上限（触发后当日全停）
 
-时区：美东时间 00:00 切换交易日
+时区：
+  - trading_date: 美东自然日 YYYY-MM-DD（00:00 ET 切换）
+  - ts / triggered_at: UTC ISO with 'Z' 后缀（跟 trades.db 对齐）
 持久化：SQLite，重启不丢失
 """
 import os
@@ -32,8 +34,7 @@ MAX_DAILY_ORDERS = int(os.getenv("MAX_DAILY_ORDERS", "10"))
 DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "risk.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# 美东时区（不考虑夏令时简化版，US Eastern = UTC-5/UTC-4）
-# Python 内置时区处理：用 ZoneInfo 更准
+# 美东时区（用 ZoneInfo 自动处理夏/冬令时）
 try:
     from zoneinfo import ZoneInfo
     US_EASTERN = ZoneInfo("America/New_York")
@@ -59,10 +60,21 @@ class RiskCheckResult:
 def get_trading_date() -> str:
     """
     返回当前交易日字符串 YYYY-MM-DD（美东时间）
-    切换时点：美东 00:00
+    切换时点：美东 00:00（ZoneInfo 自动处理 DST）
     """
     now_et = datetime.now(US_EASTERN)
     return now_et.strftime("%Y-%m-%d")
+
+
+def _utc_iso() -> str:
+    """统一 UTC ISO 格式带 Z 后缀，跟 logger_db.py 对齐
+    例: 2026-06-16T14:30:00.123Z
+    """
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 # ============ 数据库 ============
@@ -152,7 +164,7 @@ def is_circuit_broken(trading_date: Optional[str] = None) -> bool:
 def _trigger_circuit_breaker(reason: str):
     """触发当日熔断"""
     trading_date = get_trading_date()
-    now = datetime.now(US_EASTERN).isoformat()
+    now = _utc_iso()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             INSERT OR IGNORE INTO daily_circuit_breaker 
@@ -247,7 +259,7 @@ def record_order(price: float, qty: int,
     记录已下单（必须在下单成功后调用）
     """
     trading_date = get_trading_date()
-    now = datetime.now(US_EASTERN).isoformat()
+    now = _utc_iso()
     cost = price * 100 * qty
     
     with sqlite3.connect(DB_PATH) as conn:

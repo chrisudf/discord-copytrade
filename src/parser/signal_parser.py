@@ -32,6 +32,29 @@ def _next_friday(today: date) -> date:
     return today + timedelta(days=days_to_friday)
 
 
+# === [新增] 英文月份映射 ===
+MONTH_NAME_TO_NUM = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+# === [新增] 月份正则片段（用于嵌入其他模式）===
+MONTH_NAMES_RE = (
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sept?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+)
+
+
 # ===== Pre-filter =====
 SKIP_KEYWORDS = [
     "holding", "remaining", "into tomorrow",
@@ -123,7 +146,42 @@ def parse_signal(text: str, msg_ts: date = None):
 
 
 def _try_pattern_a(text: str, today: date):
-    """Pattern A: SYMBOL STRIKEc/p MM/DD @ PRICE"""
+    """Pattern A: SYMBOL STRIKEc/p {MM/DD | Month DD} @ PRICE"""
+
+    # === [新增] A2: 英文月份在先（优先级更高，避免 A1 误吃）===
+    # 例: "NOW 115c June 26 @ 2.00" / "IWM 293p Jan 15th @ 2.23"
+    pattern_a2 = re.compile(
+        rf"\b([A-Z]{{1,5}})\s+"
+        rf"(\d+(?:\.\d+)?)([cp])\s+"
+        rf"({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
+        re.IGNORECASE,
+    )
+    for m in pattern_a2.finditer(text):
+        symbol, strike, cp, month_name, dd, price = m.groups()
+        if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        if price is None:
+            filled = re.search(r"filled?\s*@\s*\$?(\d+(?:\.\d+)?)", text, re.I)
+            if filled:
+                price = filled.group(1)
+        if price is None:
+            continue
+        mm = MONTH_NAME_TO_NUM[month_name.lower()]
+        dd_int = int(dd)
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if cp.lower() == "c" else "PUT",
+            "strike": float(strike),
+            "expiry": f"{mm}/{dd_int}",
+            "expiry_date": smart_expiry(mm, dd_int, today=today),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+
+    # A1: 数字日期 MM/DD（原逻辑）
     pattern = re.compile(
         r"\b([A-Z]{1,5})\s+"
         r"(\d+(?:\.\d+)?)([cp])\s+"
@@ -165,10 +223,11 @@ def _try_pattern_b(text: str, today: date):
     """Pattern B: 多种 $SYMBOL 形态。
 
     优先级：
-    B0: 含明确 MM/DD（最准确）
-    B1: 含 NDTE
-    B2: weekly 无日期 → 默认本周五
-    B3: $STRIKE 在 calls 前的倒序写法
+    B0:    含明确 MM/DD（最准确）
+    B0.5:  含英文月份 (June 26 / Jan 15)         # === [新增] ===
+    B1:    含 NDTE
+    B2:    weekly 无日期 → 默认本周五
+    B3:    $STRIKE 在 calls 前的倒序写法
     """
 
     # ----- B0: 含 MM/DD（包括 "weekly 5/15" / "4/29" 等） -----
@@ -190,6 +249,31 @@ def _try_pattern_b(text: str, today: date):
             "strike": float(strike),
             "expiry": f"{int(mm)}/{int(dd)}",
             "expiry_date": smart_expiry(int(mm), int(dd), today=today),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+
+    # === [新增] B0.5: $SYMBOL ... Month DD ... $STRIKE calls $PRICE -----
+    p_month_name = re.compile(
+        rf"\$([A-Z]{{1,5}})\b"
+        rf"[^\$\n]*?({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
+        rf"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+    m = p_month_name.search(text)
+    if m:
+        symbol, month_name, dd, strike, side, price = m.groups()
+        mm = MONTH_NAME_TO_NUM[month_name.lower()]
+        dd_int = int(dd)
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if side.lower().startswith("call") else "PUT",
+            "strike": float(strike),
+            "expiry": f"{mm}/{dd_int}",
+            "expiry_date": smart_expiry(mm, dd_int, today=today),
             "price": float(price),
             "tags": _extract_tags(text),
         }
