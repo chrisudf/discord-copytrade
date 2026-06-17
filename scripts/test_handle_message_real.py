@@ -69,8 +69,8 @@ async def run_test():
     TRIGGER_USER_ID = 1426229538722938880
 
     # 构造一条肯定能解析 + 风控通过的信号
-    # SPY 700p 6/15 @ $0.01 → 限价 $0.0105，模拟盘不会成交
-    content = "SPY 700p 6/15 @ 0.01"
+    # SPY 700p 06/19 @ $0.01 → 限价 $0.0105，模拟盘不会成交
+    content = "SPY 700p 06/19 @ 0.01"
 
     print(f"\n[mock] channel_id = {KC_CHANNEL_ID}")
     print(f"[mock] author_id  = {TRIGGER_USER_ID}")
@@ -99,7 +99,7 @@ async def run_test():
         return
 
     print("\n📋 请确认：")
-    print("  1. moomoo App 是否看到 SPY 260615 PUT 700 挂单？")
+    print("  1. moomoo App 是否看到 SPY 260618 PUT 700 挂单？")
     print("  2. Telegram 是否收到 '信号' 和 '下单成功' 两条消息？")
     print("  3. data/trades.db 是否有新记录？")
     print("\n⚠️  确认后请去 moomoo App 手动撤单！")

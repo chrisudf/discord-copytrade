@@ -46,24 +46,44 @@ SAMPLES = [
 ]
 
 
+def _is_skip(r):
+    return isinstance(r, dict) and r.get("skip")
+
+
+def _is_signal(r):
+    return isinstance(r, dict) and not r.get("skip")
+
+
 def main():
     pass_count = 0
     fail_count = 0
     for label, text, expected in SAMPLES:
         result = parse_signal(text)
-        actual = result["symbol"] if result else None
+
+        # 兼容新增 intentional skip：视为 None（无可下单信号）
+        if _is_signal(result):
+            actual = result["symbol"]
+        else:
+            actual = None
+
         ok = (actual == expected)
         mark = "✅" if ok else "❌"
         print(f"{mark} {label:<35} expected={expected!s:<8} actual={actual!s:<8}")
-        if result:
+
+        if _is_signal(result):
             print(f"     → {result['symbol']} {result['strike']}{result['side'][0]} "
                   f"{result['expiry']} @ ${result['price']} tags={result['tags']}")
+        elif _is_skip(result):
+            print(f"     → SKIP ({result['skip']})")
+        # else: None → 不打印额外行
+
         if ok:
             pass_count += 1
         else:
             fail_count += 1
-            if result:
+            if _is_signal(result):
                 print(f"     raw matched: {result['matched']}")
+
     print(f"\n=== {pass_count}/{len(SAMPLES)} passed, {fail_count} failed ===")
 
 

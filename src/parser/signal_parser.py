@@ -6,9 +6,12 @@ Rules (2026-06):
 3. No price = no trade
 4. No price range
 5. expiry 相对消息时间戳计算（回测正确性）
+6. expiry 落假日/周末 → 自动前移到最近交易日（如 6/19 Juneteenth → 6/18）
+7. expiry 显示字符串与 expiry_date 保持一致（避免 TG/DB 显示 6/19 但实际下 6/18）
 """
 import re
 from datetime import date, timedelta
+from src.parser.holidays import adjust_to_trading_day, is_trading_day
 from src.utils.logger import logger
 
 
@@ -32,7 +35,38 @@ def _next_friday(today: date) -> date:
     return today + timedelta(days=days_to_friday)
 
 
-# === [新增] 英文月份映射 ===
+# === 假日调整封装 ===
+def _adjust_expiry(d: date, context: str = "") -> date:
+    """把 expiry 调整到最近的交易日（向前回退）。
+
+    适用场景：weekly 算到 6/19 Juneteenth → 实际为 6/18 周四。
+
+    Args:
+        d: 候选 expiry
+        context: 日志上下文（如 "weekly" / "MM/DD"），仅 log 用
+    """
+    if is_trading_day(d):
+        return d
+    adjusted = adjust_to_trading_day(d, direction="backward")
+    logger.info(
+        f"[parser] expiry {d} → {adjusted} (holiday/weekend adjusted, ctx={context})"
+    )
+    return adjusted
+
+
+# === 同步 expiry 显示字符串（避免 holiday adjust 后显示与实际不符）===
+def _finalize_signal(sig: dict) -> dict:
+    """在 return 之前调用：
+    - 保证 expiry 字符串与 expiry_date 一致（用 M/D 格式，简洁直观）
+    - DTE 类型保留原始 'NDTE' 不动（仍写实际日期更有用），改为 M/D 反映实际下单日
+    """
+    if sig.get("expiry_date"):
+        d = sig["expiry_date"]
+        sig["expiry"] = f"{d.month}/{d.day}"
+    return sig
+
+
+# === 英文月份映射 ===
 MONTH_NAME_TO_NUM = {
     "jan": 1, "january": 1,
     "feb": 2, "february": 2,
@@ -48,7 +82,6 @@ MONTH_NAME_TO_NUM = {
     "dec": 12, "december": 12,
 }
 
-# === [新增] 月份正则片段（用于嵌入其他模式）===
 MONTH_NAMES_RE = (
     r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sept?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
@@ -114,6 +147,11 @@ def parse_signal(text: str, msg_ts: date = None):
     Args:
         text: 消息内容
         msg_ts: 消息发送日期（默认 today，回测时传消息时间戳）
+
+    Returns:
+        - dict: 成功解析的信号
+        - dict {"skip": "..."}: 主动 skip（非错误，listener 不应警告）
+        - None: 真·解析失败（应警告 + TG）
     """
     if not text or len(text.strip()) < 5:
         return None
@@ -126,11 +164,11 @@ def parse_signal(text: str, msg_ts: date = None):
 
     if _has_skip_keyword(text):
         logger.info(f"[parser] skip (holding/remaining): {text[:60]}")
-        return None
+        return {"skip": "holding_or_remaining"}
 
     if _has_price_range(text):
         logger.info(f"[parser] skip (price range): {text[:60]}")
-        return None
+        return {"skip": "price_range"}
 
     sig = _try_pattern_a(text, today) or _try_pattern_b(text, today)
 
@@ -140,16 +178,15 @@ def parse_signal(text: str, msg_ts: date = None):
 
     if sig.get("price") is None:
         logger.warning(f"[parser] skip (no price): {sig['matched']}")
-        return None
+        return {"skip": "no_price"}
 
-    return sig
+    return _finalize_signal(sig)
 
 
 def _try_pattern_a(text: str, today: date):
     """Pattern A: SYMBOL STRIKEc/p {MM/DD | Month DD} @ PRICE"""
 
-    # === [新增] A2: 英文月份在先（优先级更高，避免 A1 误吃）===
-    # 例: "NOW 115c June 26 @ 2.00" / "IWM 293p Jan 15th @ 2.23"
+    # === A2: 英文月份在先（优先级更高，避免 A1 误吃）===
     pattern_a2 = re.compile(
         rf"\b([A-Z]{{1,5}})\s+"
         rf"(\d+(?:\.\d+)?)([cp])\s+"
@@ -176,12 +213,14 @@ def _try_pattern_a(text: str, today: date):
             "side": "CALL" if cp.lower() == "c" else "PUT",
             "strike": float(strike),
             "expiry": f"{mm}/{dd_int}",
-            "expiry_date": smart_expiry(mm, dd_int, today=today),
+            "expiry_date": _adjust_expiry(
+                smart_expiry(mm, dd_int, today=today), context="A2 Month DD"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
 
-    # A1: 数字日期 MM/DD（原逻辑）
+    # A1: 数字日期 MM/DD
     pattern = re.compile(
         r"\b([A-Z]{1,5})\s+"
         r"(\d+(?:\.\d+)?)([cp])\s+"
@@ -211,7 +250,9 @@ def _try_pattern_a(text: str, today: date):
             "side": "CALL" if cp.lower() == "c" else "PUT",
             "strike": float(strike),
             "expiry": f"{int(mm)}/{int(dd)}",
-            "expiry_date": smart_expiry(int(mm), int(dd), today=today),
+            "expiry_date": _adjust_expiry(
+                smart_expiry(int(mm), int(dd), today=today), context="A1 MM/DD"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
@@ -224,13 +265,13 @@ def _try_pattern_b(text: str, today: date):
 
     优先级：
     B0:    含明确 MM/DD（最准确）
-    B0.5:  含英文月份 (June 26 / Jan 15)         # === [新增] ===
+    B0.5:  含英文月份 (June 26 / Jan 15)
     B1:    含 NDTE
     B2:    weekly 无日期 → 默认本周五
     B3:    $STRIKE 在 calls 前的倒序写法
     """
 
-    # ----- B0: 含 MM/DD（包括 "weekly 5/15" / "4/29" 等） -----
+    # ----- B0: 含 MM/DD -----
     p_mmdd = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
@@ -248,12 +289,14 @@ def _try_pattern_b(text: str, today: date):
             "side": "CALL" if side.lower().startswith("call") else "PUT",
             "strike": float(strike),
             "expiry": f"{int(mm)}/{int(dd)}",
-            "expiry_date": smart_expiry(int(mm), int(dd), today=today),
+            "expiry_date": _adjust_expiry(
+                smart_expiry(int(mm), int(dd), today=today), context="B0 MM/DD"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
 
-    # === [新增] B0.5: $SYMBOL ... Month DD ... $STRIKE calls $PRICE -----
+    # ----- B0.5: $SYMBOL ... Month DD ... $STRIKE calls $PRICE -----
     p_month_name = re.compile(
         rf"\$([A-Z]{{1,5}})\b"
         rf"[^\$\n]*?({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
@@ -273,7 +316,9 @@ def _try_pattern_b(text: str, today: date):
             "side": "CALL" if side.lower().startswith("call") else "PUT",
             "strike": float(strike),
             "expiry": f"{mm}/{dd_int}",
-            "expiry_date": smart_expiry(mm, dd_int, today=today),
+            "expiry_date": _adjust_expiry(
+                smart_expiry(mm, dd_int, today=today), context="B0.5 Month DD"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
@@ -296,12 +341,14 @@ def _try_pattern_b(text: str, today: date):
             "side": "CALL" if side.lower().startswith("call") else "PUT",
             "strike": float(strike),
             "expiry": f"{dte}DTE",
-            "expiry_date": today + timedelta(days=int(dte)),
+            "expiry_date": _adjust_expiry(
+                today + timedelta(days=int(dte)), context="B1 NDTE"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
 
-    # ----- B1b: $SYMBOL $STRIKE calls NDTE $PRICE （DTE 在中间） -----
+    # ----- B1b: $SYMBOL $STRIKE calls NDTE $PRICE -----
     p_dte_mid = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
@@ -319,7 +366,9 @@ def _try_pattern_b(text: str, today: date):
             "side": "CALL" if side.lower().startswith("call") else "PUT",
             "strike": float(strike),
             "expiry": f"{dte}DTE",
-            "expiry_date": today + timedelta(days=int(dte)),
+            "expiry_date": _adjust_expiry(
+                today + timedelta(days=int(dte)), context="B1b NDTE"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
@@ -341,7 +390,9 @@ def _try_pattern_b(text: str, today: date):
             "side": "CALL" if side.lower().startswith("call") else "PUT",
             "strike": float(strike),
             "expiry": "weekly",
-            "expiry_date": _next_friday(today),
+            "expiry_date": _adjust_expiry(
+                _next_friday(today), context="B2 weekly"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }
@@ -365,7 +416,9 @@ def _try_pattern_b(text: str, today: date):
             "side": "CALL" if side.lower().startswith("call") else "PUT",
             "strike": float(strike),
             "expiry": f"{int(mm)}/{int(dd)}",
-            "expiry_date": smart_expiry(int(mm), int(dd), today=today),
+            "expiry_date": _adjust_expiry(
+                smart_expiry(int(mm), int(dd), today=today), context="B3 MM/DD"
+            ),
             "price": float(price),
             "tags": _extract_tags(text),
         }

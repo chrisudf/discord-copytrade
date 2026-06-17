@@ -13,6 +13,9 @@ moomoo 真实下单测试（模拟盘）
   4. 提示用户去 moomoo App 看 → 手动撤单
 """
 import os, sys, time
+
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv("config/.env", override=True)
@@ -23,7 +26,7 @@ os.environ["DRY_RUN"] = "false"
 from datetime import date
 from src.broker.moomoo_client import (
     place_order, query_order_status, build_option_code, close_ctx,
-    SDK_AVAILABLE, DRY_RUN, TRD_ENV_STR, ACC_ID,
+    SDK_AVAILABLE, TRD_ENV_STR, ACC_ID,
 )
 
 

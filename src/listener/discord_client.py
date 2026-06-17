@@ -6,14 +6,14 @@ Discord self-bot 监听器（多频道版）
     ↓ channel 过滤（registry.is_monitored）
     ↓ user 过滤（cfg.is_trigger_user）
     ↓ dedup（防止 edit/重连重复处理）
-    ↓ parse_signal
-    ↓ risk_manager.check_order  ← 全局熔断 + 单笔/日累计/日次数
-    ↓ broker.place_order        ← 实际下单（DRY_RUN 时只 mock）
-    ↓ risk_manager.record_order ← 写库累计统计
+    ↓ parse_signal（传 msg_ts 用 ET 日期）
+    ↓ risk_manager.check_order
+    ↓ broker.place_order
+    ↓ record_order ← 仅 success=True 才记（避免污染配额）
     ↓ telegram 通知
 
 注意：
-- on_message_edit 只记录日志，不重新触发下单（避免重复下单风险）
+- on_message_edit 只记录日志，不重新触发下单
 - 一切异常都吞掉只 log，不让 Discord 链路崩
 - broker.place_order 是同步函数，必须用 asyncio.to_thread 包
 """
@@ -21,8 +21,9 @@ import os
 import sys
 import asyncio
 from collections import deque
-from datetime import datetime, timedelta   # === [新增] timedelta 给 fingerprint 窗口用 ===
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from dotenv import load_dotenv
@@ -47,11 +48,12 @@ from src.storage.logger_db import log_raw_signal, log_order
 from src.utils.logger import logger
 
 TOKEN = os.getenv("DISCORD_USER_TOKEN")
+ET_TZ = ZoneInfo("America/New_York")
 
 client = discord.Client()
 
 # ============================================================
-# Dedup: bounded deque + set，O(1) 查重，避免无限增长
+# Dedup: bounded deque + set 查重，避免无限增长
 # ============================================================
 # 场景：同一条 message 被 on_message 和 on_message_edit 都触发；
 #       或断线重连时 ready 阶段重放历史 message
@@ -74,7 +76,7 @@ def _seen(msg_id: int) -> bool:
 
 
 # ============================================================
-# === [新增] Dedup 层 2: signal fingerprint 去重 ===
+# Dedup 层 2: signal fingerprint 去重 ===
 # ============================================================
 # 上面的 _seen() 只能拦 msg_id 重复（edit / 重连重放）。
 # 但有一类场景 msg_id 不同、信号语义却相同，需要单独拦：
@@ -140,11 +142,29 @@ def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
 
 
 # ============================================================
+# 工具：从 message 提取 ET 日期（给 parser 用）
+# ============================================================
+def _extract_et_date(message) -> "date":
+    """
+    Discord message.created_at 是 UTC aware datetime（discord.py 保证）。
+    转 ET 后取 date，用于 parser 计算 expiry（如 weekly → _next_friday）。
+
+    FakeMessage（test_full_flow）可能没 created_at，fallback 到 utcnow。
+    """
+    created = getattr(message, "created_at", None)
+    if created is None:
+        created = datetime.now(timezone.utc)
+    elif created.tzinfo is None:
+        # 极端兜底（不应发生）：discord.py 始终返回 aware
+        created = created.replace(tzinfo=timezone.utc)
+    return created.astimezone(ET_TZ).date()
+
+
+# ============================================================
 # Discord events
 # ============================================================
 @client.event
 async def on_ready():
-    """连接成功时打印监听的频道清单 + 检查可见性。"""
     logger.info(f"Discord logged in as: {client.user} (id={client.user.id})")
 
     enabled = registry.enabled_channel_ids()
@@ -192,7 +212,7 @@ async def on_message_edit(before, after):
 
 
 # ============================================================
-# 核心处理函数（抽出来方便测试，FakeMessage 也能调）
+# 核心处理函数
 # ============================================================
 async def handle_message(message):
     """
@@ -241,7 +261,7 @@ async def handle_message(message):
 
     logger.info(f"📩 [{cfg.name}] {message.author.name}: {raw}")
 
-    # 落库原始信号（即使后面失败也留底）
+# 落库原始信号（即使后面失败也留底）
     try:
         log_raw_signal(message.id, message.author.name, raw, t0)
     except Exception as e:
@@ -256,13 +276,23 @@ async def handle_message(message):
         return
 
     # ---- 解析信号 ----
-    signal = parse_signal(raw)
-    if not signal:
+    # === [改动 Bug C] 传 msg_ts=ET 日期，避免 fallback 到 AEST 本地 ===
+    msg_date_et = _extract_et_date(message)
+    signal = parse_signal(raw, msg_ts=msg_date_et)
+
+    # === [改动 Bug B] 区分 intentional skip vs 真·解析失败 ===
+    if signal is None:
+        # 真·没匹配任何模式（rare），值得报警关注
         logger.warning("Parse failed")
         await _safe_notify(format_error("Parse failed", raw))
         return
 
-    # ---- 多信号：取第一个 ----
+    if signal.get("skip"):
+        # parser 主动 skip（holding / price_range / no_price），属于正常过滤，不发 TG
+        logger.debug(f"Parser intentional skip: {signal['skip']}")
+        return
+
+    # ---- 多信号（防御层，parser 当前不返 list） ----
     # TODO: parser 已重写为只返回 dict|None，此分支当前不可达。
     # 保留作为防御层；若未来 parser 改回支持多信号 list，此处自动生效。
     # 触达后请确认是否还要 Telegram 告警（用户目前规则：不做多腿）。
@@ -282,9 +312,7 @@ async def handle_message(message):
             )
         )
 
-    # ============================================================
-    # === [新增] Fingerprint 去重 ===
-    # ============================================================
+    # ---- Fingerprint 去重 ----
     # 必须放在 parse 成功之后（要拿 symbol/strike/side/expiry_date 作 key）
     # 必须放在风控/TG/下单之前（拦得越早越省）
     # 不发 TG：双发场景下 TG 跟着双响会刷屏；只 log 留痕用于复盘
@@ -298,9 +326,9 @@ async def handle_message(message):
         )
         return
 
-    # TODO P3: symbol blacklist 检查
+    # TODO P3: symbol blacklist
 
-    # 解析成功后立刻发预警（让用户知道收到了，正在处理）
+    # 解析成功立即预警
     await _safe_notify(format_signal_alert(
         cfg.name,
         signal["symbol"],
@@ -312,14 +340,11 @@ async def handle_message(message):
         signal.get("action", "OPEN"),
     ))
 
-    # ============================================================
-    # 风控检查
-    # ============================================================
+    # ---- 风控 ----
     # 关键参数说明：
     # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
     # - qty 来自 channel 配置，不同 channel 可以设不同张数
     qty = cfg.default_qty
-
     risk_result = check_order(
         price=signal["price"],
         qty=qty,
@@ -338,9 +363,8 @@ async def handle_message(message):
         await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
         return
 
-    # ============================================================
+    # ---- 下单 ----
     # 下单（broker.place_order 是同步函数，必须 to_thread 包装）
-    # ============================================================
     try:
         order_result = await asyncio.to_thread(place_order, signal, qty)
     except Exception as e:
@@ -348,15 +372,27 @@ async def handle_message(message):
         await _safe_notify(format_error("Order error", str(e)))
         return
 
-    # 落库订单（业务日志，跟风控的 record_order 是两件事）
+    # 落库订单（成功失败都记，作为业务日志）
     try:
         log_order(message.id, signal, order_result)
     except Exception as e:
         logger.error(f"log_order failed: {e}")
 
-    # 记录风控累计（DRY_RUN 也算 —— 因为我们要测试累计统计的准确性）
-    # 真实场景下，如果下单失败可能不该计数，但保守起见还是计：
-    # 宁可让今日额度变紧，也不要因为 broker 误报"失败"而漏算实际成交
+    # === [改动 Bug A] 只有 success=True 才 record_order ===
+    # 实测背景：6/16 QCOM/IREN 期权代码错误（Juneteenth 未处理），
+    # broker 返回 success=False，但旧逻辑仍 record_order 污染配额，
+    # 导致 daily_orders 表出现"成功记录"但订单实际未成交。
+    # 现在失败 → 发 TG 提示用户 + 不污染配额。
+    if not order_result.get("success"):
+        err_msg = order_result.get("message", "unknown error")
+        logger.error(f"Order rejected by broker: {err_msg}")
+        await _safe_notify(format_error(
+            "Order rejected by broker",
+            f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+            f"{signal.get('expiry', '')}\n{err_msg}"
+        ))
+        return
+
     try:
         record_order(
             price=signal["price"],
@@ -386,7 +422,7 @@ async def handle_message(message):
 
 
 # ============================================================
-# 工具：安全的 Telegram 通知（吞异常）
+# 工具：Telegram 通知
 # ============================================================
 async def _safe_notify(msg: str):
     """
