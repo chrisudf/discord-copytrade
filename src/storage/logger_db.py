@@ -16,8 +16,13 @@ def _utc_iso(dt: datetime = None) -> str:
     if dt is None:
         dt = datetime.now(timezone.utc)
     elif dt.tzinfo is None:
-        # naive datetime 一律视作 UTC（防御性，正常不应进入此分支）
-        dt = dt.replace(tzinfo=timezone.utc)
+        # naive datetime 是上游 bug（典型：datetime.now() 返回本地时区裸时间）
+        # 早期版本"防御性"地视作 UTC，导致 AEST 数字被贴 Z 后缀错位 10h（实测 6/16-6/17 received_at 全错）
+        # 现在直接抛错，强制上游传 tz-aware
+        raise ValueError(
+            f"_utc_iso() received naive datetime: {dt!r}. "
+            f"Caller must pass tz-aware datetime (use datetime.now(timezone.utc))."
+        )
     else:
         dt = dt.astimezone(timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")

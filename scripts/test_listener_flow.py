@@ -7,12 +7,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.parser.signal_parser import parse_signal, detect_action
 from src.broker.moomoo_client import place_order
 from src.storage.logger_db import log_raw_signal, log_order
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 async def simulate(raw_msg: str, msg_id: str = "TEST_001"):
     print(f"\n{'='*70}\nSimulating: {raw_msg}")
-    t0 = datetime.now()
+    t0 = datetime.now(timezone.utc)
     log_raw_signal(msg_id, "test_user", raw_msg, t0)
 
     action = detect_action(raw_msg)
@@ -30,7 +30,8 @@ async def simulate(raw_msg: str, msg_id: str = "TEST_001"):
         print(f"-> {len(signal)} signals, taking first")
         signal = signal[0]
 
-    result = await place_order(signal)
+    result = await asyncio.to_thread(place_order, signal)
+
     log_order(msg_id, signal, result)
     print(f"-> Order result: {result}")
 

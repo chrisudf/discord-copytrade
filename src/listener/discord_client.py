@@ -118,7 +118,7 @@ def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
     极端情况下（窗口内来 200+ 不同信号）丢最老的。
     """
     fp = _signal_fingerprint(sig)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     # 1. 惰性清理过期项（最多 200 个，O(n) 可接受）
     expired = [k for k, ts in _signal_fps.items() if now - ts > FINGERPRINT_WINDOW]
@@ -227,7 +227,7 @@ async def handle_message(message):
         message.embeds (list, optional)
         message.attachments (list, optional)
     """
-    t0 = datetime.now()
+    t0 = datetime.now(timezone.utc)
 
     # ---- 过滤 1：忽略自己发的消息 ----
     if client.user and message.author.id == client.user.id:
@@ -408,7 +408,7 @@ async def handle_message(message):
         logger.error(f"record_order failed: {e}")
 
     # ---- 通知 + 延迟统计 ----
-    elapsed = (datetime.now() - t0).total_seconds() * 1000
+    elapsed = (datetime.now(timezone.utc) - t0).total_seconds() * 1000
     await _safe_notify(format_order_filled(
         signal["symbol"],
         signal["strike"],
