@@ -56,9 +56,10 @@ def _adjust_expiry(d: date, context: str = "") -> date:
 
 # === 同步 expiry 显示字符串（避免 holiday adjust 后显示与实际不符）===
 def _finalize_signal(sig: dict) -> dict:
-    """在 return 之前调用：
-    - 保证 expiry 字符串与 expiry_date 一致（用 M/D 格式，简洁直观）
-    - DTE 类型保留原始 'NDTE' 不动（仍写实际日期更有用），改为 M/D 反映实际下单日
+    """在 return 之前调用：把 expiry 字符串统一改成 M/D，
+    与 expiry_date 实际日期对齐。
+    NDTE / weekly 原始字符串会被覆盖——实际下单日比相对表达更有用，
+    TG/DB 也不会出现"显示 6/19 实际下 6/18"的错位。
     """
     if sig.get("expiry_date"):
         d = sig["expiry_date"]

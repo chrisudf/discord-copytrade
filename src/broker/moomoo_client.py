@@ -55,6 +55,20 @@ _ctx = None
 _unlocked = False
 
 
+def _reset_ctx():
+    """连接异常后重置单例，下次调用会重连。
+    OpenD 重启或网络抖动会让旧 ctx 永久变坏，必须显式丢弃。"""
+    global _ctx, _unlocked
+    if _ctx is not None:
+        try:
+            _ctx.close()
+        except Exception:
+            pass
+    _ctx = None
+    _unlocked = False
+    logger.warning("[broker] ctx reset, will reconnect on next call")
+
+
 def _is_dry_run() -> bool:
     """实时读取 DRY_RUN，避免 import 时锁定导致测试无法覆盖真实分支"""
     return os.getenv("DRY_RUN", "true").lower() == "true"
@@ -228,6 +242,7 @@ def place_order(signal: dict, qty: int = None) -> dict:
             }
     except Exception as e:
         logger.exception("[broker] place_order 异常")
+        _reset_ctx()
         return {
             "success": False, "message": str(e),
             "order_id": None, "code": option_code,
@@ -273,6 +288,7 @@ def query_order_status(order_id: str) -> dict:
         }
     except Exception as e:
         logger.exception("[broker] query_order_status 异常")
+        _reset_ctx()
         return {"success": False, "message": str(e),
                 "status": None, "filled_qty": 0, "filled_avg_price": 0.0}
 

@@ -394,8 +394,10 @@ async def handle_message(message):
         return
 
     try:
+        # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
+        effective_price = order_result.get("price", signal["price"])
         record_order(
-            price=signal["price"],
+            price=effective_price,
             qty=qty,
             symbol=signal["symbol"],
             strike=signal["strike"],
