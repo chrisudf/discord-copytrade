@@ -2,7 +2,7 @@
 moomoo OpenAPI 下单封装
 
 职责：
-- 构造 option_code、计算 limit_price、调用 SDK
+- 构造 option_code、计算 limit_price（分档 slippage）、调用 SDK
 - 不做风控（已迁移到 risk_manager）
 - 同步函数，调用方需 asyncio.to_thread 包装
 
@@ -10,6 +10,12 @@ moomoo OpenAPI 下单封装
 - ctx 单例懒加载（首次 place_order 才连 OpenD）
 - account_id 从 .env 读，写死 MOOMOO_ACC_ID
 - unlock_trade 只解一次（模拟盘其实不需要，留着兼容真实盘）
+
+Slippage 分档（基于 6/17 HOOD 4-bagger 实战教训）：
+- price <  $1.5  → 12%   # lotto / 低价单 spread 宽
+- price <  $3.0  →  8%
+- price >= $3.0  →  5%
+TODO: 用 Polygon 回测后用真实 fill 数据校准这三档
 
 返回格式约定（成功 / 失败统一字段）：
 {
@@ -27,7 +33,6 @@ from src.utils.logger import logger
 
 # ---- 配置（从 .env 读取） ----
 DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", 1))
-MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", 5)) / 100
 TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
 OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
@@ -58,6 +63,41 @@ def _is_dry_run() -> bool:
 def _get_trd_env():
     """字符串配置 → SDK 枚举"""
     return TrdEnv.REAL if TRD_ENV_STR == "REAL" else TrdEnv.SIMULATE
+
+
+def _get_slippage_pct(price: float) -> float:
+    """
+    分档 slippage：低价合约 spread 更宽，需要更大偏移才追得到 fill。
+
+    分档（v1，待回测校准）：
+    - < $1.5  → 12%
+    - < $3.0  →  8%
+    - >= $3.0 →  5%
+
+    例子：
+    - HOOD 1.10 → 1.10 * 1.12 = 1.23   (旧版 5% 只挂 1.16，6/17 漏吃 4-bagger)
+    - NOW  3.90 → 3.90 * 1.05 = 4.09   (与旧版一致)
+    - IREN 0.68 → 0.68 * 1.12 = 0.76
+    """
+    if price < 1.5:
+        return 0.12
+    elif price < 3.0:
+        return 0.08
+    else:
+        return 0.05
+
+
+def _calc_limit_price(price: float) -> float:
+    """
+    计算挂单限价 = entry_price * (1 + slippage_pct)，2 位小数。
+
+    TODO: 加入 Penny Pilot tick 档位对齐
+    - Penny Pilot (IREN/SPY/QQQ/HOOD 等)：tick = $0.01，当前 round(2) 已对齐
+    - 非 Penny：< $3 → $0.05 / >= $3 → $0.10，当前会挂出非法价位
+    暂不实现，等收集到非 Penny 拒单数据再做。
+    """
+    pct = _get_slippage_pct(price)
+    return round(price * (1 + pct), 2)
 
 
 def _get_ctx():
@@ -99,6 +139,7 @@ def _ensure_unlocked():
     _unlocked = True
     logger.info("[broker] unlock_trade OK")
 
+
 def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> str:
     """
     构造 moomoo 期权代码
@@ -118,6 +159,7 @@ def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> 
     strike_str = f"{int(strike * 1000):06d}"
     return f"US.{symbol}{date_str}{cp}{strike_str}"
 
+
 def place_order(signal: dict, qty: int = None) -> dict:
     """
     下单（同步函数，调用方需用 asyncio.to_thread 包装）
@@ -134,11 +176,14 @@ def place_order(signal: dict, qty: int = None) -> dict:
         signal["symbol"], signal["expiry_date"],
         signal["strike"], signal["side"],
     )
-    limit_price = round(signal["price"] * (1 + MAX_SLIPPAGE_PCT), 2)
+    entry_price = signal["price"]
+    limit_price = _calc_limit_price(entry_price)
+    slip_pct = _get_slippage_pct(entry_price)
 
     dry_run = _is_dry_run()
     logger.info(
         f"[broker] Order: {option_code} x {qty} @ {limit_price:.2f} "
+        f"(entry={entry_price:.2f}, slip={slip_pct*100:.0f}%) "
         f"[env={TRD_ENV_STR}, dry_run={dry_run}] tags={signal.get('tags')}"
     )
 
