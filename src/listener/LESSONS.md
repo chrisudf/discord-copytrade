@@ -203,3 +203,24 @@ python scripts/test_parser_rules.py
 
 bash
 python scripts/test_handle_message_real.py
+
+## 时区 bug 历史脏数据（2026-06-18 修复）
+
+### `trades.db.raw_signals.received_at` rowid 6-71（共 66 条）
+- **现象**：无 Z 后缀，数字是 AEST 实际时间（不是 UTC）
+- **根因**：`discord_client.handle_message` t0 = `datetime.now()` naive，
+  `logger_db._utc_iso` 防御性 `dt.replace(tzinfo=utc)` 误当 UTC 贴 Z
+- **复盘转换**：值 - 10h = 真 UTC；或值 - 14h = 真 ET（对应 KC 信号时间）
+- **修复 commit**：见 fix(tz) commit hash
+- **未 migrate 原因**：rowid 6-15 是 test fixture / backtest 数据无价值；
+  rowid 16-71 是真信号但只用于复盘，心算 -10h 即可
+
+### `risk.db.daily_orders.ts` rowid ≤ 3（共 3 条）
+- **现象**：ET offset 格式 `2026-06-15T11:32:44.885107-04:00`
+- **migrate**：已 normalize 为 UTC+Z 标准格式
+- **migrate SQL**：`update daily_orders set ts = strftime('%Y-%m-%dT%H:%M:%fZ', datetime(ts)) where ts like '%-04:00'`
+
+### 现行规范
+- 所有 DB 时间字段统一 `YYYY-MM-DDTHH:MM:SS.sssZ`（UTC + Z + 毫秒）
+- 调用方传入 `datetime` 必须 tz-aware
+- `logger_db._utc_iso(dt)` 遇 naive 抛 `ValueError`（不再悄悄当 UTC）
