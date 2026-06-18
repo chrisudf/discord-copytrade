@@ -250,6 +250,88 @@ def place_order(signal: dict, qty: int = None) -> dict:
         }
 
 
+def place_sell_order(
+    option_code: str,
+    qty: int,
+    limit_price: float,
+    remark: str = "auto_close",
+) -> dict:
+    """卖单（限价，同步，调用方需 to_thread 包装）
+
+    Args:
+        option_code: 标的代码（同 build_option_code 输出）
+        qty: 卖出张数
+        limit_price: 限价。SL/EOD 场景建议传 bid * 0.95 偏激进确保成交；
+                     CLOSE 信号正常 trim 可传 bid 附近。
+        remark: 标记触发源（kc_close / sl_polling / tp_polling / eod_force）
+
+    返回:
+        {success, message, order_id, code, qty, price}
+
+    TODO（测试调整）：
+    - 实测后看是否要支持 OrderType.MARKET（SL 紧急情况）
+    - 模拟盘 SIMULATE 卖单是否需要先有真实持仓，没有的话 SDK 会拒
+    - 部分成交（dealt_qty < qty）的处理 —— 当前只看 RET_OK，不轮询 fill
+    """
+    if qty <= 0:
+        return {
+            "success": False, "message": f"invalid qty={qty}",
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+
+    dry_run = _is_dry_run()
+    logger.info(
+        f"[broker] SELL: {option_code} x {qty} @ {limit_price:.2f} "
+        f"[env={TRD_ENV_STR}, dry_run={dry_run}, remark={remark}]"
+    )
+
+    if dry_run:
+        return {
+            "success": True, "message": "DRY_RUN sell",
+            "order_id": f"MOCK_SELL_{option_code[-6:]}",
+            "code": option_code, "qty": qty, "price": limit_price,
+        }
+
+    try:
+        ctx = _get_ctx()
+        acc_id = _ensure_account()
+        _ensure_unlocked()
+
+        ret, data = ctx.place_order(
+            price=limit_price,
+            qty=qty,
+            code=option_code,
+            trd_side=TrdSide.SELL,
+            order_type=OrderType.NORMAL,  # 限价
+            trd_env=_get_trd_env(),
+            acc_id=acc_id,
+            remark=remark,
+        )
+        if ret == RET_OK:
+            order_id = str(data["order_id"].iloc[0])
+            logger.info(f"[broker] 卖单成功 order_id={order_id}")
+            return {
+                "success": True, "message": "submitted",
+                "order_id": order_id, "code": option_code,
+                "qty": qty, "price": limit_price,
+            }
+        logger.error(f"[broker] 卖单失败: {data}")
+        return {
+            "success": False, "message": str(data),
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+    except Exception as e:
+        logger.exception("[broker] place_sell_order 异常")
+        _reset_ctx()
+        return {
+            "success": False, "message": str(e),
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+
+
 def query_order_status(order_id: str) -> dict:
     """
     查单状态（同步）
@@ -291,6 +373,37 @@ def query_order_status(order_id: str) -> dict:
         _reset_ctx()
         return {"success": False, "message": str(e),
                 "status": None, "filled_qty": 0, "filled_avg_price": 0.0}
+
+
+def get_last_price(option_code: str):
+    """查期权最新成交价。SL / EOD watcher 用。
+
+    返回:
+        float 最新价；None 表示拿不到（watcher 应跳过该仓位）
+
+    DRY_RUN 路径：
+        - 默认返回 None（不误触发 SL）
+        - 设 MOCK_LAST_PRICE=0.5 强制固定价，方便联调 SL 阈值
+        - 设 MOCK_LAST_PRICE_<CODE>=0.5 针对单 option_code 设价
+
+    TODO（实测调整）：
+    - 上真盘换 OpenQuoteContext.get_market_snapshot([code])，取 last_price 字段
+    - quote_ctx 单独维护（和 trade_ctx 分开），同样懒加载 + reset 策略
+    - 批量查询：watcher 一次拿一批 code 比 N 次单查省 N 倍 RTT
+    - 行情订阅 vs 快照：snapshot 简单，但延迟高；订阅推送实时但要状态管理
+    """
+    if _is_dry_run():
+        per_code = os.getenv(f"MOCK_LAST_PRICE_{option_code}")
+        if per_code:
+            return float(per_code)
+        fixed = os.getenv("MOCK_LAST_PRICE")
+        if fixed:
+            return float(fixed)
+        return None
+
+    # TODO: 真盘走 quote_ctx.get_market_snapshot
+    logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
+    return None
 
 
 def close_ctx():

@@ -112,7 +112,29 @@ def format_error(scope: str, error: str) -> str:
     return f"❌ *系统错误*\n模块: `{scope}`\n错误: ```{error[:500]}```"
 
 
-def format_daily_summary(orders: int, total_cost: float, 
+def format_close_filled(symbol: str, strike: float, side: str, expiry: str,
+                        qty_sold: int, fill_price: float, pct: int,
+                        trigger: str, order_id: str) -> str:
+    """卖单成交通知"""
+    return (
+        f"💰 *平仓成交*\n"
+        f"标的: *{symbol}* {strike}{side.upper()} {expiry}\n"
+        f"卖出: {qty_sold} 张 @ ${fill_price} ({pct}%)\n"
+        f"触发: `{trigger}`\n"
+        f"订单号: `{order_id}`"
+    )
+
+
+def format_close_skipped(reason: str, raw: str) -> str:
+    """CLOSE 信号收到但未执行（没匹配到持仓 / 解析跳过 / parser 拒绝）"""
+    return (
+        f"📭 *CLOSE 未执行*\n"
+        f"原因: {reason}\n"
+        f"原文: ```{raw[:300]}```"
+    )
+
+
+def format_daily_summary(orders: int, total_cost: float,
                          max_orders: int, max_cost: float) -> str:
     """格式化每日统计"""
     return (
