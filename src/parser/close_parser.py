@@ -123,6 +123,47 @@ def _extract_signal_price(scope: str) -> "float | None":
     return None
 
 
+# === KC 喊的 PnL (% 标注) ===
+# 场景：
+#   "closed NOW small day trade -15%"      → -15
+#   "Closed IREN 60c for +30%"             → +30
+#   "closed NOW at entry"                  → 0   （持平退出）
+#   "trimmed @ break even"                 → 0
+# 不同于 trim 比例 ("Selling 25%")：PnL 必须带正负号 / 或 "at entry" 之类显式标记。
+PNL_SIGNED_PATTERN = re.compile(r"([+\-])\s*(\d{1,3}(?:\.\d+)?)\s*%")
+AT_ENTRY_PATTERN = re.compile(
+    r"\bat\s+(?:entry|breakeven|break\s*even|be)\b", re.I
+)
+# 中文版："在进场位 / 在入场位 / 保本 / 平本"
+ZH_AT_ENTRY_PATTERN = re.compile(r"在\s*(?:进场|入场)位|保本|平本")
+
+
+def _extract_signal_pnl(scope: str, is_zh: bool = False) -> "float | None":
+    """从 action 句 scope 抽 KC 报告的 PnL（%）。
+
+    返回 None → 没找到（不代表 PnL 为零，而是不知道）
+    返回 0    → 显式 "at entry" / "保本"
+    返回 -15  → "-15%"
+    """
+    # 显式持平
+    if AT_ENTRY_PATTERN.search(scope):
+        return 0.0
+    if is_zh and ZH_AT_ENTRY_PATTERN.search(scope):
+        return 0.0
+
+    # 带符号 N%
+    m = PNL_SIGNED_PATTERN.search(scope)
+    if m:
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        try:
+            v = float(m.group(2))
+            if 0 <= v <= 1000:  # 合理 PnL 范围（lotto +500% 也可能）
+                return sign * v
+        except ValueError:
+            pass
+    return None
+
+
 # ============================================================
 # 中文 fallback
 # ============================================================
@@ -272,6 +313,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
 
     scope_en = _action_sentences(text)
     signal_price = _extract_signal_price(scope_en)
+    signal_pnl_pct = _extract_signal_pnl(scope_en, is_zh=False)
 
     if _has_bulk_marker(text_lower):
         pct = _extract_pct(text, text_lower)
@@ -279,7 +321,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
             pct = 50
         logger.info(f"[close_parser] EN BULK_TRIM pct={pct}")
         return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
-                "signal_price": signal_price,
+                "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "en"}
 
     symbols = _extract_symbols(text, open_symbols)
@@ -288,10 +330,10 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     pct = _extract_pct(text, text_lower)
     logger.info(
         f"[close_parser] EN CLOSE symbols={symbols} pct={pct} "
-        f"price={signal_price} text={text[:80]}"
+        f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
     )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
-            "signal_price": signal_price,
+            "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "matched": text[:120], "lang": "en"}
 
 
@@ -379,6 +421,7 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
 
     scope_zh = _zh_action_sentences(text)
     signal_price = _extract_signal_price(scope_zh)
+    signal_pnl_pct = _extract_signal_pnl(scope_zh, is_zh=True)
 
     if _has_zh_bulk(text):
         pct = _extract_zh_pct(text)
@@ -386,13 +429,11 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
             pct = 50
         logger.info(f"[close_parser] ZH BULK_TRIM pct={pct}")
         return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
-                "signal_price": signal_price,
+                "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "zh"}
 
     symbols = _extract_zh_symbols(text, open_symbols)
     if not symbols:
-        # 中文 action 动词 + 无 $SYMBOL + 无白名单裸 ticker → 八成是中文公司名
-        # 不动手（EN 版本会兜底），但留 warning 便于事后看到底漏了什么
         logger.warning(
             f"[close_parser] [zh_unrecognized] ZH close intent but symbol "
             f"not extractable (likely Chinese company name): {text[:120]}"
@@ -401,10 +442,10 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     pct = _extract_zh_pct(text)
     logger.info(
         f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} "
-        f"price={signal_price} text={text[:80]}"
+        f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
     )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
-            "signal_price": signal_price,
+            "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "matched": text[:120], "lang": "zh"}
 
 

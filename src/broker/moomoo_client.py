@@ -156,6 +156,27 @@ def _ensure_unlocked():
     logger.info("[broker] unlock_trade OK")
 
 
+def breakeven_exit_price(entry_price: float, sell_slip: float = 0.05) -> tuple[float, float]:
+    """计算"我们跟单不亏"所需的最低 KC 卖出价（毛 PnL %）。
+
+    我们买入 ≈ entry × (1 + buy_slip)
+    我们卖出 ≈ KC_exit × (1 - sell_slip)
+    净 PnL = 0 → KC_exit = entry × (1 + buy_slip) / (1 - sell_slip)
+
+    返回 (breakeven_price, breakeven_gross_pct)
+    例: entry=2.70（$1.5-$3 档，buy_slip=8%）→ (3.07, +13.7%)
+
+    实战价值：开单时 TG 提示 KC 至少要 +N% 退出我们才不亏，
+    用户对照 KC 历史 trim 阈值（通常 +50%/+100%）能直观判断信号好坏。
+    """
+    if entry_price is None or entry_price <= 0:
+        return 0.0, 0.0
+    buy = _get_slippage_pct(entry_price)
+    be_price = entry_price * (1 + buy) / (1 - sell_slip)
+    be_pct = (be_price / entry_price - 1) * 100
+    return round(be_price, 2), round(be_pct, 1)
+
+
 def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> str:
     """
     构造 moomoo 期权代码

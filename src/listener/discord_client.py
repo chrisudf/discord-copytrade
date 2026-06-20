@@ -35,7 +35,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / "config" / ".env", override=Tr
 
 from src.parser.signal_parser import parse_signal, detect_action
 from src.parser.close_parser import parse_close
-from src.broker.moomoo_client import place_order, place_sell_order
+from src.broker.moomoo_client import place_order, place_sell_order, breakeven_exit_price
 from src.config.channel_loader import registry
 from src.risk.risk_manager import check_order, record_order
 from src.notifier.telegram_client import (
@@ -372,16 +372,19 @@ async def handle_message(message):
 
     # TODO P3: symbol blacklist
 
-    # 解析成功立即预警
+    # 解析成功立即预警，带 breakeven 提示
+    entry_p = signal.get("price", 0) or 0
+    be_info = breakeven_exit_price(entry_p) if entry_p > 0 else None
     await _safe_notify(format_signal_alert(
         cfg.name,
         signal["symbol"],
         signal["strike"],
         signal["expiry"],
         signal["side"][0],
-        signal.get("price", 0) or 0,
+        entry_p,
         cfg.default_qty,
         signal.get("action", "OPEN"),
+        breakeven=be_info,
     ))
 
     # ---- 风控 ----

@@ -71,12 +71,17 @@ async def send_telegram(text: str, parse_mode: str = "Markdown") -> bool:
 
 # ============ 格式化辅助函数 ============
 
-def format_signal_alert(channel_name: str, symbol: str, strike: float, 
-                        expiry: str, side: str, price: float, qty: int, 
-                        action: str = "OPEN") -> str:
-    """格式化信号触发通知"""
+def format_signal_alert(channel_name: str, symbol: str, strike: float,
+                        expiry: str, side: str, price: float, qty: int,
+                        action: str = "OPEN",
+                        breakeven: tuple = None) -> str:
+    """格式化信号触发通知
+
+    breakeven: (price, gross_pct_needed) —— 来自 broker.breakeven_exit_price
+               显示"KC 至少 ≥ ${price} (+{gross}%) 退出我们才不亏"
+    """
     emoji = "🟢" if side.upper() == "C" else "🔴"
-    return (
+    msg = (
         f"{emoji} *新信号触发*\n"
         f"频道: `{channel_name}`\n"
         f"标的: *{symbol}* {strike}{side.upper()} {expiry}\n"
@@ -85,6 +90,10 @@ def format_signal_alert(channel_name: str, symbol: str, strike: float,
         f"数量: {qty} 张\n"
         f"成本: ${price * 100 * qty:.0f}"
     )
+    if breakeven:
+        be_price, be_pct = breakeven
+        msg += f"\n📐 盈亏平衡: KC ≥ *${be_price}* (gross +{be_pct:.1f}%)"
+    return msg
 
 
 def format_order_filled(symbol: str, strike: float, side: str, expiry: str,

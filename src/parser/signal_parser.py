@@ -428,11 +428,21 @@ def _try_pattern_b(text: str, today: date):
 
 
 def _extract_tags(text: str) -> list:
+    """从 KC 信号文本抽 tag，给后续 category/分析用。
+
+    KC 风格变种统一：
+      "day trade" / "day-trade" / "daytrade" → day_trade
+      "small day trade" / "small fun day trade" 都命中
+    其它（lotto / swing / scalp / fafo）保留原样。
+    """
     tags = []
     lower = text.lower()
-    for kw in ["lotto", "swing", "scalp", "daytrade", "fafo"]:
+    for kw in ["lotto", "swing", "scalp", "fafo"]:
         if kw in lower:
             tags.append(kw)
+    # day trade 三种写法
+    if any(p in lower for p in ("day trade", "day-trade", "daytrade")):
+        tags.append("day_trade")
     return tags
 
 

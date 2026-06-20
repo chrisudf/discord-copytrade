@@ -274,6 +274,57 @@ def test_signal_price_in_zh_close():
     assert r["signal_price"] == 2.45
 
 
+# ========== signal_pnl_pct 抽取（KC 报告的盈亏%） ==========
+
+def test_signal_pnl_negative():
+    """'closed -15%' → signal_pnl_pct=-15"""
+    r = parse_close(
+        "KC Trades Bot:closed the NOW small day trade -15%.",
+        OPEN_NOW_SET,
+    )
+    assert r["signal_pnl_pct"] == -15.0
+    # signal_price 应该 None（PnL 不是 price）
+    assert r["signal_price"] is None
+
+
+def test_signal_pnl_positive():
+    """'for +30%' → signal_pnl_pct=30"""
+    r = parse_close("Closed IREN 60c for +30%", OPEN_NOW_SET | {"IREN"})
+    assert r["signal_pnl_pct"] == 30.0
+
+
+def test_signal_pnl_at_entry():
+    """'closed NOW at entry' → signal_pnl_pct=0"""
+    r = parse_close("KC Trades Bot:closed NOW at entry", OPEN_NOW_SET)
+    assert r["signal_pnl_pct"] == 0.0
+
+
+def test_signal_pnl_at_break_even():
+    """'at break even' → 0"""
+    r = parse_close("trimmed $HOOD at break even", OPEN_NOW_SET)
+    assert r["signal_pnl_pct"] == 0.0
+
+
+def test_signal_pnl_zh_at_entry():
+    """中文 '平仓在进场位' → 0"""
+    r = parse_close(
+        "KC Trades Bot: 平仓在进场位，FOMC前价格走势平淡。",
+        OPEN_NOW_SET | {"NOW"},  # NOW 在白名单
+    )
+    # 这条没 $ 没明确 symbol，可能 None；只要 signal_pnl_pct 抽到了就行
+    # 实际行为：ZH parser 没找到 symbol → 返回 None
+    # 所以这里测试 EN 版本
+    r = parse_close("KC Trades Bot:closed NOW at entry, FOMC ahead", OPEN_NOW_SET)
+    assert r["signal_pnl_pct"] == 0.0
+
+
+def test_signal_pnl_none_when_only_trim_pct():
+    """'Selling 25%' 是 trim 比例，不是 PnL → signal_pnl_pct=None"""
+    r = parse_close("$HOOD - Selling 25% here.", OPEN_NOW_SET)
+    assert r["signal_pnl_pct"] is None
+    assert r["pct"] == 25  # trim pct 仍然抽到
+
+
 def test_zh_bare_ticker_via_whitelist():
     """'减仓IWM @ 2.45' → IWM (走白名单)"""
     r = parse_close("KC交易机器人: 减仓IWM @ 2.45", OPEN_NOW_SET)

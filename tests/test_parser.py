@@ -64,3 +64,26 @@ def test_detect_action_zh_close():
     # 纯 OPEN 信号不能误判
     assert detect_action("TSLA 415c June 26 @ 2.70") == "OPEN"
     assert detect_action("$AAOI weekly $220 calls $2.05") == "OPEN"
+
+
+def test_tag_day_trade_variants():
+    """'small day trade' / 'daytrade' / 'day-trade' 都应该 tag day_trade"""
+    r = parse_signal("TSLA 415c June 26 @ 2.70 small day trade",
+                     msg_ts=FIXED_TODAY)
+    assert "day_trade" in r["tags"]
+
+    r = parse_signal("NOW 115c June 26 small fun day trade here @ 2.00",
+                     msg_ts=FIXED_TODAY)
+    assert "day_trade" in r["tags"]
+
+    # daytrade（无空格）
+    r = parse_signal("$SPY $746 daytrade puts $.40", msg_ts=FIXED_TODAY)
+    assert "day_trade" in r["tags"]
+
+
+def test_tag_no_day_trade_when_swing():
+    """普通 swing 信号不该被打 day_trade tag"""
+    r = parse_signal("MRVL 400c 7/2 @ 6.95 smaller size swing for now",
+                     msg_ts=FIXED_TODAY)
+    assert "day_trade" not in r["tags"]
+    assert "swing" in r["tags"]
