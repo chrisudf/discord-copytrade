@@ -372,7 +372,7 @@ async def handle_message(message):
 
     # TODO P3: symbol blacklist
 
-    # 解析成功立即预警，带 breakeven 提示
+    # 解析成功立即预警，带 breakeven 提示 + KC tags
     entry_p = signal.get("price", 0) or 0
     be_info = breakeven_exit_price(entry_p) if entry_p > 0 else None
     await _safe_notify(format_signal_alert(
@@ -385,6 +385,7 @@ async def handle_message(message):
         cfg.default_qty,
         signal.get("action", "OPEN"),
         breakeven=be_info,
+        tags=signal.get("tags") or None,
     ))
 
     # ---- 风控 ----
