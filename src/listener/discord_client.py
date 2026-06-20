@@ -597,6 +597,7 @@ async def _handle_close_signal(raw: str, msg_id: int):
             except Exception as e:
                 logger.exception("place_sell_order failed")
                 await _safe_notify(format_error("Sell order error", str(e)))
+                any_executed = True  # 持仓找到了只是 broker 异常，不再报 "no matching"
                 continue
 
             if not result.get("success"):
@@ -606,6 +607,7 @@ async def _handle_close_signal(raw: str, msg_id: int):
                     "Sell rejected by broker",
                     f"{pos['option_code']} qty={qty_to_sell}\n{err}",
                 ))
+                any_executed = True  # 持仓找到了只是 broker 拒单，不再报 "no matching"
                 continue
 
             try:

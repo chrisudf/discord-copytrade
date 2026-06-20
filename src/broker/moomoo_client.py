@@ -36,7 +36,9 @@ DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", 1))
 TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
 OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
-TRADE_PWD = os.getenv("MOOMOO_TRADE_PWD", "")
+# .env 里统一 MOOMOO_TRD_* 前缀（TRD_ENV / TRD_PWD），跟原 MOOMOO_TRADE_PWD 对齐
+# 模拟盘 SIMULATE 不需要密码所以历史没发现这个 typo，上真盘前必修
+TRADE_PWD = os.getenv("MOOMOO_TRD_PWD", "")
 ACC_ID = int(os.getenv("MOOMOO_ACC_ID", 0))
 
 # ---- SDK 导入 ----
@@ -391,6 +393,13 @@ def get_last_price(option_code: str):
     - quote_ctx 单独维护（和 trade_ctx 分开），同样懒加载 + reset 策略
     - 批量查询：watcher 一次拿一批 code 比 N 次单查省 N 倍 RTT
     - 行情订阅 vs 快照：snapshot 简单，但延迟高；订阅推送实时但要状态管理
+
+    TODO（Discord 重连相关）：
+    6/18 出现 29 次 Discord 重连（vs 之前 2-4 次/天）。
+    怀疑 moomoo SDK 在 OPRA 拒绝路径下偶尔挂线程，间接占住 event loop。
+    待 6/19 起 on_disconnect 日志收集数据后，若仍异常：
+    - 给真盘路径加 asyncio.wait_for(timeout=2.0)
+    - 给 broker 调用统一加 timeout，避免 SDK 卡死拖垮 watcher
     """
     if _is_dry_run():
         per_code = os.getenv(f"MOCK_LAST_PRICE_{option_code}")
