@@ -158,17 +158,43 @@ def test_eod_window_weekend():
 
 
 @pytest.mark.asyncio
-async def test_eod_force_closes_matching_expiry():
-    """expiry==today 且 eod_force_close=True → 强平"""
-    today_et = datetime.now(timezone.utc).astimezone(ET_TZ).date()
-    code = _uniq_code("EOD1")
-    _open_0dte("EODT1", code, expiry=today_et, qty=2, entry=1.00)
-
-    # 模拟 15:51 ET
+async def test_eod_skips_when_no_quote():
+    """EOD 触发但拿不到 quote → 不应该挂 entry × 0.9 卖单。"""
+    # 用 shifted now_et 同步 expiry，确保周末跑测试也正确
     now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
-    # 强行让 weekday 是工作日
     while now_et.weekday() >= 5:
         now_et = now_et.replace(day=now_et.day - 1)
+    today_et = now_et.date()
+    code = _uniq_code("EODN")
+    _open_0dte("EODNQ", code, expiry=today_et, qty=2, entry=1.00)
+
+    sell_mock = AsyncMock()
+    tg_mock = AsyncMock()
+    # 清掉 backoff 状态（同 code 可能上一个 test run 留的）
+    eod_watcher._skip_until.pop(code, None)
+    with patch("src.position.eod_watcher.get_last_price", return_value=None), \
+         patch("src.position.eod_watcher.place_sell_order", side_effect=sell_mock), \
+         patch("src.position.eod_watcher.send_telegram_sync") as tg, \
+         patch("src.position.eod_watcher._is_eod_window", return_value=True):
+        await eod_watcher._eod_tick(now_et)
+
+    # 关键：没有卖单提交
+    sell_mock.assert_not_called()
+    # 仓位还在 OPEN
+    assert positions_db.get(code)["status"] == "OPEN"
+    # 收尾
+    positions_db.record_close(code, 2, 1.0, "manual", note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_eod_force_closes_matching_expiry():
+    """expiry==today 且 eod_force_close=True → 强平"""
+    now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
+    while now_et.weekday() >= 5:
+        now_et = now_et.replace(day=now_et.day - 1)
+    today_et = now_et.date()
+    code = _uniq_code("EOD1")
+    _open_0dte("EODT1", code, expiry=today_et, qty=2, entry=1.00)
 
     with patch("src.position.eod_watcher.get_last_price", return_value=0.30), \
          patch("src.position.eod_watcher.place_sell_order",
@@ -215,3 +241,7 @@ async def test_eod_skips_before_window():
     with patch("src.position.eod_watcher.place_sell_order", side_effect=sell_mock):
         await eod_watcher._eod_tick(now_et)
     sell_mock.assert_not_called()
+    # 收尾：这是个 today expiry + eod_force_close 的 lurking 仓位，
+    # 不清会被下一个 test 的 _eod_tick 一锅端
+    positions_db.record_close(code, qty_sold=1, fill_price=1.0,
+                              trigger_source="manual", note="ut cleanup")

@@ -84,6 +84,44 @@ BARE_SYM_PATTERN_ZH = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,5})(?![A-Za-z0-9])")
 # "N% LEFT" / "down to N% runners" / "runners only" → 卖 (100-N)%
 LEFT_PATTERN = re.compile(r"(\d{1,3})\s*%\s*(?:left|remaining)", re.I)
 
+# KC 喊出的卖出价 —— 用来挂卖单限价，避免按 entry × 0.95 倒挂
+# 场景：
+#   `trimmed MSFT 420c @ 7.00`     ← @ + 价
+#   `trimmed IWM @ 2.45`           ← @ + 价
+#   `BANG! Trimmed another IWM here @ 2.80` ← @ + 价
+#   `trimmed TSLA 3.00`            ← 无 @，裸 X.XX
+# 排除：strike ("$420")、pct ("25%")、PnL ("-15%")、合约后缀 (420c)
+PRICE_AT_PATTERN = re.compile(r"@\s*\$?(\.?\d+(?:\.\d+)?)")
+# 裸 X.XX：必须带小数点，且前面不是 $ 或数字，后面不是 c/p/%/ 数字
+PRICE_BARE_PATTERN = re.compile(
+    r"(?<![\$\d.])(\d+\.\d{1,2})(?![cp%\d])",
+    re.IGNORECASE,
+)
+
+
+def _extract_signal_price(scope: str) -> "float | None":
+    """从 action 句 scope 抽取 KC 喊的卖出价。
+
+    返回 None → caller fallback 到 entry-based 算法
+    """
+    m = PRICE_AT_PATTERN.search(scope)
+    if m:
+        try:
+            v = float(m.group(1))
+            if 0.01 <= v <= 100:  # 期权合理价区间
+                return v
+        except ValueError:
+            pass
+    m = PRICE_BARE_PATTERN.search(scope)
+    if m:
+        try:
+            v = float(m.group(1))
+            if 0.01 <= v <= 100:
+                return v
+        except ValueError:
+            pass
+    return None
+
 
 # ============================================================
 # 中文 fallback
@@ -148,13 +186,15 @@ _ACTION_RE = re.compile("|".join(re.escape(v) for v in [
 
 
 def _action_sentences(text: str) -> str:
-    """返回包含动作动词的句子拼接（用 . 分句，过滤掉纯 commentary 句）。
+    """返回包含动作动词的句子拼接。
 
+    用 . ! ? 分句，但避免在小数点处切（`@ 2.45` 必须保持完整）。
     场景：'closed the NOW small day trade -15%. Just hanging out now after 3/3 on AMZN MSFT swings.'
     第一句有 closed 抓 NOW；第二句是复盘，不该抓 AMZN/MSFT。
     若没有任何句子命中（整段一句话），fallback 用整段 —— 不漏召回。
     """
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    # 分隔符：句末 .!? 后跟空白（且 .!? 前后不是数字 → 排除小数点）
+    sentences = re.split(r"(?<!\d)[.!?](?!\d)\s+|(?<=[.!?])(?=\s)", text)
     hit = [s for s in sentences if _ACTION_RE.search(s)]
     return " ".join(hit) if hit else text
 
@@ -230,20 +270,28 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if not _has_action_verb(text_lower):
         return None
 
+    scope_en = _action_sentences(text)
+    signal_price = _extract_signal_price(scope_en)
+
     if _has_bulk_marker(text_lower):
         pct = _extract_pct(text, text_lower)
         if pct == 33:
             pct = 50
         logger.info(f"[close_parser] EN BULK_TRIM pct={pct}")
         return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
+                "signal_price": signal_price,
                 "matched": text[:120], "lang": "en"}
 
     symbols = _extract_symbols(text, open_symbols)
     if not symbols:
         return None
     pct = _extract_pct(text, text_lower)
-    logger.info(f"[close_parser] EN CLOSE symbols={symbols} pct={pct} text={text[:80]}")
+    logger.info(
+        f"[close_parser] EN CLOSE symbols={symbols} pct={pct} "
+        f"price={signal_price} text={text[:80]}"
+    )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "signal_price": signal_price,
             "matched": text[:120], "lang": "en"}
 
 
@@ -266,8 +314,11 @@ def _has_zh_full_close(text: str) -> bool:
 
 
 def _zh_action_sentences(text: str) -> str:
-    """按中文句号 / 英文句号切，留含动作动词的句子。"""
-    sents = re.split(r"[。！？.!?]\s*", text)
+    """按中文句号 / 英文句号切，留含动作动词的句子。
+
+    `.` 在数字之间不切（如 '@ 2.45'）。中文 `。！？` 总是切。
+    """
+    sents = re.split(r"[。！？]|(?<!\d)[.!?](?!\d)", text)
     hit = [s for s in sents if any(v in s for v in ZH_ACTION_VERBS)]
     return " ".join(hit) if hit else text
 
@@ -326,12 +377,16 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
     if not _has_zh_action(text):
         return None
 
+    scope_zh = _zh_action_sentences(text)
+    signal_price = _extract_signal_price(scope_zh)
+
     if _has_zh_bulk(text):
         pct = _extract_zh_pct(text)
         if pct == 33:
             pct = 50
         logger.info(f"[close_parser] ZH BULK_TRIM pct={pct}")
         return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
+                "signal_price": signal_price,
                 "matched": text[:120], "lang": "zh"}
 
     symbols = _extract_zh_symbols(text, open_symbols)
@@ -344,8 +399,12 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         )
         return None
     pct = _extract_zh_pct(text)
-    logger.info(f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} text={text[:80]}")
+    logger.info(
+        f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} "
+        f"price={signal_price} text={text[:80]}"
+    )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "signal_price": signal_price,
             "matched": text[:120], "lang": "zh"}
 
 

@@ -224,6 +224,56 @@ def test_en_handles_full_close_signal_as_zh_missed():
     assert r["pct"] == 100  # closed → full
 
 
+# ========== signal_price 抽取（修 TSLA 卖价 bug）==========
+
+def test_signal_price_at_explicit():
+    """'trimmed IWM @ 2.45' → signal_price=2.45"""
+    r = parse_close("KC Trades Bot:trimmed IWM @ 2.45", OPEN_NOW_SET)
+    assert r["signal_price"] == 2.45
+
+
+def test_signal_price_bare_decimal():
+    """'trimmed TSLA 3.00' → signal_price=3.00（无 @ 但有 X.XX 裸数字）"""
+    r = parse_close("KC Trades Bot:trimmed TSLA 3.00", OPEN_NOW_SET | {"TSLA"})
+    assert r is not None
+    assert r["signal_price"] == 3.00
+
+
+def test_signal_price_with_strike_not_confused():
+    """'trimmed MSFT 420c @ 7.00' → signal_price=7.00（不是 420 strike）"""
+    r = parse_close("KC Trades Bot:trimmed MSFT 420c @ 7.00", OPEN_NOW_SET)
+    assert r["signal_price"] == 7.00
+
+
+def test_signal_price_dot_prefix():
+    """'@ $.95' → signal_price=0.95"""
+    r = parse_close("trimmed IWM @ $.95", OPEN_NOW_SET)
+    assert r["signal_price"] == 0.95
+
+
+def test_signal_price_absent():
+    """'trimmed AMZN' 无价 → signal_price=None"""
+    r = parse_close("KC Trades Bot:trimmed AMZN", OPEN_NOW_SET)
+    assert r["signal_price"] is None
+
+
+def test_signal_price_pnl_not_confused():
+    """'closed NOW -15%' 的 -15% 不能被当成价（pct 也已经排除）"""
+    r = parse_close(
+        "KC Trades Bot:closed the NOW small day trade -15%.",
+        OPEN_NOW_SET,
+    )
+    # -15 不带小数点，PRICE_BARE 不会抓；@ 也没有
+    assert r["signal_price"] is None
+
+
+def test_signal_price_in_zh_close():
+    """中文 '减仓IWM @ 2.45' → signal_price=2.45"""
+    r = parse_close("KC交易机器人: 减仓IWM @ 2.45", OPEN_NOW_SET)
+    assert r["lang"] == "zh"
+    assert r["signal_price"] == 2.45
+
+
 def test_zh_bare_ticker_via_whitelist():
     """'减仓IWM @ 2.45' → IWM (走白名单)"""
     r = parse_close("KC交易机器人: 减仓IWM @ 2.45", OPEN_NOW_SET)

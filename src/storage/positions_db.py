@@ -118,6 +118,7 @@ def _init_db():
                 category         TEXT NOT NULL,
                 apply_sl         INTEGER NOT NULL,
                 eod_force_close  INTEGER NOT NULL DEFAULT 0,
+                tp_hits          INTEGER NOT NULL DEFAULT 0,
                 tags             TEXT,
                 channel_name     TEXT,
                 open_msg_id      TEXT,
@@ -151,13 +152,18 @@ def _init_db():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_evt_code ON position_events(option_code)
         """)
-        # 迁移：早期版本没有 eod_force_close 列
+        # 迁移：早期版本可能缺新列
         cols = {r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
         if "eod_force_close" not in cols:
             conn.execute(
                 "ALTER TABLE positions ADD COLUMN eod_force_close INTEGER NOT NULL DEFAULT 0"
             )
             logger.info("[positions] migrated: added eod_force_close column")
+        if "tp_hits" not in cols:
+            conn.execute(
+                "ALTER TABLE positions ADD COLUMN tp_hits INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("[positions] migrated: added tp_hits column")
 
 
 _init_db()
@@ -319,6 +325,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["apply_sl"] = bool(d["apply_sl"])
     d["eod_force_close"] = bool(d.get("eod_force_close", 0))
+    d["tp_hits"] = int(d.get("tp_hits", 0) or 0)
     try:
         d["tags"] = json.loads(d["tags"]) if d["tags"] else []
     except json.JSONDecodeError:
@@ -373,6 +380,19 @@ def find_by_symbol(symbol: str) -> list[dict]:
             ORDER BY opened_at DESC
         """, (symbol,)).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def mark_tp_hit(option_code: str, tier_bit: int) -> None:
+    """标记某档 TP 已触发。tier_bit 是位掩码（1=T1, 2=T2, 4=T3...）。
+
+    用 OR 累加，多次调用幂等。SL/EOD 全平后 status=CLOSED，该字段不再被查询，
+    所以不需要重置。
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE positions SET tp_hits = tp_hits | ? WHERE option_code = ?",
+            (tier_bit, option_code),
+        )
 
 
 def get_events(option_code: str) -> list[dict]:

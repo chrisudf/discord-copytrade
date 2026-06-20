@@ -276,7 +276,7 @@ def _try_pattern_b(text: str, today: date):
     p_mmdd = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
@@ -301,7 +301,7 @@ def _try_pattern_b(text: str, today: date):
     p_month_name = re.compile(
         rf"\$([A-Z]{{1,5}})\b"
         rf"[^\$\n]*?({MONTH_NAMES_RE})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
-        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
+        rf"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         rf"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
@@ -328,7 +328,7 @@ def _try_pattern_b(text: str, today: date):
     p_dte_first = re.compile(
         r"\$([A-Z]{1,5})\b"
         r".*?(\d+)DTE"
-        r".*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
+        r".*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r".*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE | re.DOTALL,
     )
@@ -352,7 +352,7 @@ def _try_pattern_b(text: str, today: date):
     # ----- B1b: $SYMBOL $STRIKE calls NDTE $PRICE -----
     p_dte_mid = re.compile(
         r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r"[^\$\n]*?(\d+)DTE"
         r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
@@ -377,7 +377,7 @@ def _try_pattern_b(text: str, today: date):
     # ----- B2: $SYMBOL [weekly] $STRIKE calls/puts $PRICE （无日期） -----
     p_weekly = re.compile(
         r"\$([A-Z]{1,5})\b"
-        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(calls?|puts?)"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
     )
@@ -402,7 +402,7 @@ def _try_pattern_b(text: str, today: date):
     p_alt = re.compile(
         r"\$([A-Z]{1,5})\b"
         r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*"
-        r"(?:weekly\s+)?(calls?|puts?)"
+        r"\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
         r"[^\$\n]*?(\d{1,2})/(\d{1,2})"
         r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)",
         re.IGNORECASE,
@@ -437,8 +437,12 @@ def _extract_tags(text: str) -> list:
 
 
 # ===== Action detection =====
+# 必须双语都覆盖。否则 ZH close 信号会被路由到 OPEN parser，浪费一次解析失败
+# + 错过中文先到的场景。
 CLOSE_KEYWORDS = re.compile(
-    r"\b(closed?|sold|exit|stopped|trim|trimmed|out of)\b", re.I
+    r"\b(closed?|sold|exit|stopped|trim|trimmed|out of)\b"
+    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空",
+    re.I,
 )
 
 

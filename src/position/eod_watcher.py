@@ -87,13 +87,27 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     code = pos["option_code"]
     qty = pos["qty_remaining"]
 
-    # 拿 last_price 作参照位；拿不到就用 avg_entry 兜底（DRY_RUN 无报价）
     last = await asyncio.to_thread(get_last_price, code)
-    ref = last if last is not None else pos["avg_entry_price"]
-    limit = max(0.01, round(ref * (1 - sell_slip), 2))
+    if last is None:
+        # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价
+        # backoff 30 分钟避免 30s tick 反复刷 TG
+        if _skip_until.get(code, 0) <= ts_now:
+            _skip_until[code] = ts_now + 1800
+            logger.warning(
+                f"[eod] no quote for {code}, refusing entry-fallback sell, "
+                f"manual close required"
+            )
+            await asyncio.to_thread(send_telegram_sync, format_error(
+                "EOD 强平跳过：无报价",
+                f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
+                f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
+                f"请在 moomoo 手动平仓"
+            ))
+        return
 
+    limit = max(0.01, round(last * (1 - sell_slip), 2))
     logger.warning(
-        f"[eod] 🕒 force-close {code}: qty={qty} ref={ref:.2f} limit={limit}"
+        f"[eod] 🕒 force-close {code}: qty={qty} last={last:.2f} limit={limit}"
     )
 
     try:
@@ -124,7 +138,7 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
             fill_price=result.get("price", limit),
             trigger_source="eod",
             order_id=result.get("order_id"),
-            note=f"EOD force close (ref={ref:.2f})",
+            note=f"EOD force close (last={last:.2f})",
         )
     except Exception as e:
         logger.error(f"[eod] on_close_filled failed: {e}")

@@ -51,6 +51,7 @@ from src.storage.logger_db import log_raw_signal, log_order
 from src.position import manager as position_mgr
 from src.position.sl_watcher import run_sl_watcher
 from src.position.eod_watcher import run_eod_watcher
+from src.position.tp_watcher import run_tp_watcher
 from src.utils.logger import logger
 
 TOKEN = os.getenv("DISCORD_USER_TOKEN")
@@ -491,9 +492,23 @@ async def handle_message(message):
 SELL_SLIP = 0.05
 
 
-def _calc_sell_limit(avg_entry: float) -> float:
-    """卖出限价：avg_entry * (1 - SELL_SLIP)。模拟盘临时方案。"""
-    return round(avg_entry * (1 - SELL_SLIP), 2)
+def _calc_sell_limit(avg_entry: float, signal_price: float = None) -> "float | None":
+    """卖出限价。
+
+    优先级：
+      1. signal_price 存在 → 用 KC 喊的价 × (1 - SELL_SLIP)
+      2. signal_price 缺失 → 返回 None，**拒绝执行**
+
+    设计原则（"宁错过不错杀"）：
+    没有可靠价参照（信号没喊价 + OPRA 报价不可用）就不卖。
+    用 avg_entry 当兜底参照会**锁定 -5% 亏损**——曾在 TSLA 案例上踩坑。
+
+    TODO（OPRA 到位后）: signal_price 缺失时 fallback 到 last_price，
+    都没有才返回 None。
+    """
+    if signal_price is None:
+        return None
+    return round(signal_price * (1 - SELL_SLIP), 2)
 
 
 async def _handle_close_signal(raw: str, msg_id: int):
@@ -549,10 +564,27 @@ async def _handle_close_signal(raw: str, msg_id: int):
             qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
             if qty_to_sell <= 0:
                 continue
-            limit = _calc_sell_limit(pos["avg_entry_price"])
+            limit = _calc_sell_limit(
+                pos["avg_entry_price"], parsed.get("signal_price"),
+            )
+            if limit is None:
+                # 信号没喊价 + OPRA 不可用 → 拒绝执行，TG 警报让人工接管
+                logger.warning(
+                    f"[CLOSE] no price ref for {pos['option_code']}, "
+                    f"skipping sell ({pct}%)"
+                )
+                await _safe_notify(format_error(
+                    "CLOSE 跳过：无价格参照",
+                    f"{pos['option_code']} qty={qty_to_sell} ({pct}%)\n"
+                    f"原因：信号无价 + OPRA 报价不可用\n"
+                    f"请在 moomoo 手动平仓\n\n"
+                    f"原文: {raw[:200]}"
+                ))
+                any_executed = True  # 算"处理过"，不让外层再发 "no matching" 提示
+                continue
             logger.info(
                 f"[CLOSE] sell {pos['option_code']} qty={qty_to_sell} "
-                f"limit={limit} ({pct}%)"
+                f"limit={limit} ({pct}%, ref=signal)"
             )
             try:
                 result = await asyncio.to_thread(
@@ -636,5 +668,6 @@ async def start_listener():
     # fire-and-forget 后台 task；它们自己用 try/except 兜底，不会让主循环退出
     asyncio.create_task(run_sl_watcher(), name="sl_watcher")
     asyncio.create_task(run_eod_watcher(), name="eod_watcher")
+    asyncio.create_task(run_tp_watcher(), name="tp_watcher")
 
     await client.start(TOKEN)

@@ -72,15 +72,26 @@ def preflight() -> str:
 client = discord.Client()
 
 
+# on_ready 每次重连都会触发（discord.py-self 约 20-30 min 一次），
+# 只在首次连接时发 TG 启动通知，避免刷屏。
+_startup_notified = False
+
+
 @client.event
 async def on_ready():
+    global _startup_notified
     logger.info(f"✅ Discord logged in as: {client.user} (id={client.user.id})")
+    if _startup_notified:
+        return  # 重连不发
+    _startup_notified = True
     try:
+        # 用纯文本，避免 Markdown 解析错误（client.user 可能含 *_` 等特殊字符）
         await send_telegram(
-            f"🟢 *Listener 启动*\n"
-            f"账号: `{client.user}`\n"
+            f"🟢 Listener 启动\n"
+            f"账号: {client.user}\n"
             f"监听: {len(registry.enabled_channel_ids())} 频道\n"
-            f"DRY_RUN: `{os.getenv('DRY_RUN', 'true')}`"
+            f"DRY_RUN: {os.getenv('DRY_RUN', 'true')}",
+            parse_mode=None,
         )
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
