@@ -38,7 +38,13 @@ OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
 # .env 里统一 MOOMOO_TRD_* 前缀（TRD_ENV / TRD_PWD），跟原 MOOMOO_TRADE_PWD 对齐
 # 模拟盘 SIMULATE 不需要密码所以历史没发现这个 typo，上真盘前必修
-TRADE_PWD = os.getenv("MOOMOO_TRD_PWD", "")
+# 兼容老 .env 里的 MOOMOO_TRADE_PWD：旧名字命中时打个 warn 提示迁移
+_legacy_pwd = os.getenv("MOOMOO_TRADE_PWD")
+TRADE_PWD = os.getenv("MOOMOO_TRD_PWD") or _legacy_pwd or ""
+if _legacy_pwd and not os.getenv("MOOMOO_TRD_PWD"):
+    logger.warning(
+        "[broker] 检测到旧 env 名 MOOMOO_TRADE_PWD，建议改为 MOOMOO_TRD_PWD（见 .env.example）"
+    )
 ACC_ID = int(os.getenv("MOOMOO_ACC_ID", 0))
 
 # ---- SDK 导入 ----
@@ -55,6 +61,10 @@ except ImportError:
 # ---- 模块级单例 ----
 _ctx = None
 _unlocked = False
+
+# get_last_price 真盘路径日志去重状态（见 get_last_price 注释）
+_real_quote_warned_once: bool = False
+_real_quote_warned_codes: set[str] = set()
 
 
 def _reset_ctx():
@@ -432,7 +442,18 @@ def get_last_price(option_code: str):
         return None
 
     # TODO: 真盘走 quote_ctx.get_market_snapshot
-    logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
+    # 日志去重：每个 code 只 warn 一次（避免 watcher tick 每 5s 刷屏）
+    # 同时首次进入真盘路径时打一次响亮警告，说明 SL/TP/EOD 在真盘不会触发
+    global _real_quote_warned_once
+    if not _real_quote_warned_once:
+        _real_quote_warned_once = True
+        logger.error(
+            "[broker] ⚠️  真盘 get_last_price 未实现：SL / TP / EOD watcher 将无法触发！"
+            " 0DTE 仓位会持有到 expire，请手动监控。详见 TODO。"
+        )
+    if option_code not in _real_quote_warned_codes:
+        _real_quote_warned_codes.add(option_code)
+        logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
     return None
 
 

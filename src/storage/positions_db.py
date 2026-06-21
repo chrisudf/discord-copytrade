@@ -217,10 +217,13 @@ def open_or_add(
             new_total = old_total + qty
             new_avg = (old_total * old_avg + qty * fill_price) / new_total
             new_remaining = existing["qty_remaining"] + qty
+            # closed_at = NULL：之前可能 CLOSED 过，这里同 option_code 重新加仓，
+            # 否则 status='OPEN' 与历史 closed_at 共存，下游按 closed_at IS NULL
+            # 过滤会漏掉这个仓位
             conn.execute("""
                 UPDATE positions
                 SET qty_total = ?, qty_remaining = ?, avg_entry_price = ?,
-                    last_action_at = ?, status = ?
+                    last_action_at = ?, status = ?, closed_at = NULL
                 WHERE option_code = ?
             """, (
                 new_total, new_remaining, new_avg,

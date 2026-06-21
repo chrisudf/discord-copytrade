@@ -4,7 +4,7 @@
 """
 import asyncio
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch, AsyncMock
 from zoneinfo import ZoneInfo
 
@@ -163,7 +163,7 @@ async def test_eod_skips_when_no_quote():
     # 用 shifted now_et 同步 expiry，确保周末跑测试也正确
     now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
     while now_et.weekday() >= 5:
-        now_et = now_et.replace(day=now_et.day - 1)
+        now_et = now_et - timedelta(days=1)
     today_et = now_et.date()
     code = _uniq_code("EODN")
     _open_0dte("EODNQ", code, expiry=today_et, qty=2, entry=1.00)
@@ -191,7 +191,7 @@ async def test_eod_force_closes_matching_expiry():
     """expiry==today 且 eod_force_close=True → 强平"""
     now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
     while now_et.weekday() >= 5:
-        now_et = now_et.replace(day=now_et.day - 1)
+        now_et = now_et - timedelta(days=1)
     today_et = now_et.date()
     code = _uniq_code("EOD1")
     _open_0dte("EODT1", code, expiry=today_et, qty=2, entry=1.00)

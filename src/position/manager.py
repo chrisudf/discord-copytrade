@@ -15,6 +15,7 @@ TODO（测试调整）：
   query_order_status 拿 dealt_avg_price，回填 avg_entry_price
 - on_close_filled 没算实际 PnL，等真实 fill 数据接入后补
 """
+import math
 from datetime import date, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -133,10 +134,13 @@ def calc_qty_to_sell(position: dict, pct: int) -> int:
     - 否则向上取整，至少卖 1 张
       （信号说"trim 33%"但只剩 1 张 → 卖掉 1 张比留着合理，反正是 trim 意图）
 
+    用 math.ceil 而不是 round()：round() 是 banker's rounding，
+    remaining=5/pct=50 会算成 2（应为 3），与"向上取整"语义不符。
+
     TODO: 实测后看 33% 是否应该向下取整保留 runner
     """
     remaining = position["qty_remaining"]
     if pct >= 100:
         return remaining
-    qty = max(1, round(remaining * pct / 100))
+    qty = max(1, math.ceil(remaining * pct / 100))
     return min(qty, remaining)
