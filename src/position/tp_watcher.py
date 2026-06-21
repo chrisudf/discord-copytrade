@@ -31,7 +31,7 @@ from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
 from src.storage import positions_db
 from src.notifier.telegram_client import (
-    send_telegram_sync, format_close_filled, format_error,
+    send_telegram, format_close_filled, format_error,
 )
 from src.utils.logger import logger
 
@@ -92,16 +92,14 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
     except Exception as e:
         logger.exception("[tp] place_sell_order failed")
         _triggered_this_tick.discard(key)
-        await asyncio.to_thread(send_telegram_sync,
-            format_error("TP sell error", f"{code}\n{e}"))
+        await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
         return
 
     if not result.get("success"):
         err = result.get("message", "unknown")
         logger.error(f"[tp] sell rejected: {err}")
         _triggered_this_tick.discard(key)
-        await asyncio.to_thread(send_telegram_sync,
-            format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
+        await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
         return
 
     # 先持久化档位（即使下面 on_close_filled 出错也不会重复触发同档）
@@ -122,7 +120,7 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
     except Exception as e:
         logger.error(f"[tp] on_close_filled failed: {e}")
 
-    await asyncio.to_thread(send_telegram_sync, format_close_filled(
+    await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
         result.get("qty", qty_to_sell), result.get("price", limit),
         trim_pct, f"tp_t{tier_bit}", result.get("order_id", "N/A"),

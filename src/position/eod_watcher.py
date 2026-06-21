@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
 from src.notifier.telegram_client import (
-    send_telegram_sync, format_close_filled, format_error,
+    send_telegram, format_close_filled, format_error,
 )
 from src.utils.logger import logger
 
@@ -97,7 +97,7 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
                 f"[eod] no quote for {code}, refusing entry-fallback sell, "
                 f"manual close required"
             )
-            await asyncio.to_thread(send_telegram_sync, format_error(
+            await send_telegram(format_error(
                 "EOD 强平跳过：无报价",
                 f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
                 f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
@@ -119,16 +119,14 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     except Exception as e:
         logger.exception("[eod] place_sell_order failed")
         _skip_until[code] = ts_now + 60  # 1 分钟后再试
-        await asyncio.to_thread(send_telegram_sync,
-            format_error("EOD sell error", f"{code}\n{e}"))
+        await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
         return
 
     if not result.get("success"):
         err = result.get("message", "unknown")
         logger.error(f"[eod] sell rejected: {err}")
         _skip_until[code] = ts_now + 60
-        await asyncio.to_thread(send_telegram_sync,
-            format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
+        await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
         return
 
     try:
@@ -143,7 +141,7 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     except Exception as e:
         logger.error(f"[eod] on_close_filled failed: {e}")
 
-    await asyncio.to_thread(send_telegram_sync, format_close_filled(
+    await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
         result.get("qty", qty), result.get("price", limit),
         100, "eod", result.get("order_id", "N/A"),

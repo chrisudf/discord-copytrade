@@ -39,7 +39,7 @@ from src.broker.moomoo_client import place_order, place_sell_order, breakeven_ex
 from src.config.channel_loader import registry
 from src.risk.risk_manager import check_order, record_order
 from src.notifier.telegram_client import (
-    send_telegram_sync,
+    send_telegram,
     format_signal_alert,
     format_order_filled,
     format_risk_blocked,
@@ -645,13 +645,9 @@ async def _handle_close_signal(raw: str, msg_id: int):
 # 工具：Telegram 通知
 # ============================================================
 async def _safe_notify(msg: str):
-    """
-    发 Telegram，失败只 log 不抛。
-    用 to_thread 是因为 send_telegram_sync 内部用 httpx 同步调用，
-    不能在事件循环里阻塞。
-    """
+    """发 Telegram，失败只 log 不抛。"""
     try:
-        await asyncio.to_thread(send_telegram_sync, msg)
+        await send_telegram(msg)
     except Exception as e:
         logger.error(f"telegram notify failed: {e}")
 

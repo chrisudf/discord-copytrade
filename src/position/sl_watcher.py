@@ -32,7 +32,7 @@ from typing import Optional
 from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
 from src.notifier.telegram_client import (
-    send_telegram_sync, format_close_filled, format_error,
+    send_telegram, format_close_filled, format_error,
 )
 from src.utils.logger import logger
 
@@ -78,16 +78,14 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         )
     except Exception as e:
         logger.exception("[sl] place_sell_order failed")
-        await asyncio.to_thread(send_telegram_sync,
-            format_error("SL sell error", f"{code}\n{e}"))
+        await send_telegram(format_error("SL sell error", f"{code}\n{e}"))
         _triggered.discard(code)  # 让下一轮重试
         return
 
     if not result.get("success"):
         err = result.get("message", "unknown")
         logger.error(f"[sl] sell rejected: {err}")
-        await asyncio.to_thread(send_telegram_sync,
-            format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
+        await send_telegram(format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
         _triggered.discard(code)
         return
 
@@ -103,7 +101,7 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
     except Exception as e:
         logger.error(f"[sl] on_close_filled failed: {e}")
 
-    await asyncio.to_thread(send_telegram_sync, format_close_filled(
+    await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
         result.get("qty", qty), result.get("price", limit),
         100, "sl_polling", result.get("order_id", "N/A"),

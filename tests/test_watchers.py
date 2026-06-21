@@ -65,7 +65,7 @@ async def test_sl_triggers_on_threshold():
          patch("src.position.sl_watcher.place_sell_order",
                return_value={"success": True, "qty": 3, "price": 0.37,
                              "order_id": "SL_ORD_1", "code": code}), \
-         patch("src.position.sl_watcher.send_telegram_sync"):
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
 
     pos = positions_db.get(code)
@@ -89,7 +89,7 @@ async def test_sl_skips_above_threshold():
     sell_mock = AsyncMock()
     with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.60)), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
-         patch("src.position.sl_watcher.send_telegram_sync"):
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
 
     sell_mock.assert_not_called()
@@ -115,7 +115,7 @@ async def test_sl_skips_apply_sl_false():
     sell_mock = AsyncMock()
     with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.05)), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
-         patch("src.position.sl_watcher.send_telegram_sync"):
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
     sell_mock.assert_not_called()
     positions_db.record_close(code, qty_sold=2, fill_price=0.05,
@@ -132,7 +132,7 @@ async def test_sl_skips_when_quote_unavailable():
     sell_mock = AsyncMock()
     with patch("src.position.sl_watcher.get_last_price", return_value=None), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
-         patch("src.position.sl_watcher.send_telegram_sync"):
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
     sell_mock.assert_not_called()
     positions_db.record_close(code, qty_sold=1, fill_price=1.0,
@@ -174,7 +174,7 @@ async def test_eod_skips_when_no_quote():
     eod_watcher._skip_until.pop(code, None)
     with patch("src.position.eod_watcher.get_last_price", return_value=None), \
          patch("src.position.eod_watcher.place_sell_order", side_effect=sell_mock), \
-         patch("src.position.eod_watcher.send_telegram_sync") as tg, \
+         patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock) as tg, \
          patch("src.position.eod_watcher._is_eod_window", return_value=True):
         await eod_watcher._eod_tick(now_et)
 
@@ -200,7 +200,7 @@ async def test_eod_force_closes_matching_expiry():
          patch("src.position.eod_watcher.place_sell_order",
                return_value={"success": True, "qty": 2, "price": 0.27,
                              "order_id": "EOD_ORD", "code": code}), \
-         patch("src.position.eod_watcher.send_telegram_sync"), \
+         patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock), \
          patch("src.position.eod_watcher._is_eod_window", return_value=True):
         await eod_watcher._eod_tick(now_et)
 
