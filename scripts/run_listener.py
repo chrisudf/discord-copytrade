@@ -37,14 +37,29 @@ def preflight() -> str:
     if not token:
         logger.error("❌ DISCORD_USER_TOKEN 未配置")
         sys.exit(1)
-    
+
     enabled_ids = registry.enabled_channel_ids()
     if not enabled_ids:
         logger.error("❌ config/channels.json 没有任何 enabled 频道")
         sys.exit(1)
-    
+
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     trd_env = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
+
+    # 实盘/模拟盘真单模式都需要 ACC_ID。空着启动 → 接到信号才报错的悲剧
+    # （6/18 IWM 卖单失败就是这个原因）。
+    if not dry_run:
+        try:
+            acc_id = int(os.getenv("MOOMOO_ACC_ID", 0))
+        except ValueError:
+            acc_id = 0
+        if acc_id == 0:
+            logger.error(
+                "❌ DRY_RUN=False 但 MOOMOO_ACC_ID 未配置或为 0。\n"
+                "   检查 config/.env 里 MOOMOO_ACC_ID=<数字> 是否存在且非零。\n"
+                "   不强制 exit 反而下单时才暴露，会丢真实信号。"
+            )
+            sys.exit(1)
     
     logger.info("=" * 60)
     logger.info("🚀 Discord Copytrade Listener 启动")
@@ -72,15 +87,26 @@ def preflight() -> str:
 client = discord.Client()
 
 
+# on_ready 每次重连都会触发（discord.py-self 约 20-30 min 一次），
+# 只在首次连接时发 TG 启动通知，避免刷屏。
+_startup_notified = False
+
+
 @client.event
 async def on_ready():
+    global _startup_notified
     logger.info(f"✅ Discord logged in as: {client.user} (id={client.user.id})")
+    if _startup_notified:
+        return  # 重连不发
+    _startup_notified = True
     try:
+        # 用纯文本，避免 Markdown 解析错误（client.user 可能含 *_` 等特殊字符）
         await send_telegram(
-            f"🟢 *Listener 启动*\n"
-            f"账号: `{client.user}`\n"
+            f"🟢 Listener 启动\n"
+            f"账号: {client.user}\n"
             f"监听: {len(registry.enabled_channel_ids())} 频道\n"
-            f"DRY_RUN: `{os.getenv('DRY_RUN', 'true')}`"
+            f"DRY_RUN: {os.getenv('DRY_RUN', 'true')}",
+            parse_mode=None,
         )
     except Exception as e:
         logger.warning(f"Telegram startup notify failed: {e}")
@@ -103,6 +129,23 @@ async def on_message_edit(before, after):
     # 暂不触发下单，只记录（防止 KC 改单价导致重复触发）
     if registry.is_monitored(after.channel.id):
         logger.info(f"✏️  [edit] {after.channel.name}: {after.content[:80]}")
+
+
+# 诊断断线原因：6/18 出现 29 次重连（vs 之前 2-4 次/天）
+# discord.py-self 不会自动 log reason，得自己挂 event handler。
+@client.event
+async def on_disconnect():
+    logger.warning("⚠️  Discord on_disconnect fired (websocket dropped)")
+
+
+@client.event
+async def on_resumed():
+    logger.info("🔄 Discord session resumed")
+
+
+@client.event
+async def on_error(event_name, *args, **kwargs):
+    logger.exception(f"❌ Discord on_error in '{event_name}'")
 
 
 # ============ 优雅退出 ============

@@ -71,12 +71,19 @@ async def send_telegram(text: str, parse_mode: str = "Markdown") -> bool:
 
 # ============ 格式化辅助函数 ============
 
-def format_signal_alert(channel_name: str, symbol: str, strike: float, 
-                        expiry: str, side: str, price: float, qty: int, 
-                        action: str = "OPEN") -> str:
-    """格式化信号触发通知"""
+def format_signal_alert(channel_name: str, symbol: str, strike: float,
+                        expiry: str, side: str, price: float, qty: int,
+                        action: str = "OPEN",
+                        breakeven: tuple = None,
+                        tags: list = None) -> str:
+    """格式化信号触发通知
+
+    breakeven: (price, gross_pct_needed) —— 来自 broker.breakeven_exit_price
+    tags: parser 抽出的标签列表 ['lotto', 'swing', 'scalp', 'day_trade']
+          直观告诉你这是 KC 自标的什么类型 trade
+    """
     emoji = "🟢" if side.upper() == "C" else "🔴"
-    return (
+    msg = (
         f"{emoji} *新信号触发*\n"
         f"频道: `{channel_name}`\n"
         f"标的: *{symbol}* {strike}{side.upper()} {expiry}\n"
@@ -85,6 +92,14 @@ def format_signal_alert(channel_name: str, symbol: str, strike: float,
         f"数量: {qty} 张\n"
         f"成本: ${price * 100 * qty:.0f}"
     )
+    if tags:
+        # 显眼的 tag 行：[day_trade] [lotto] 之类
+        tag_str = " ".join(f"`{t}`" for t in tags)
+        msg += f"\n🏷️ {tag_str}"
+    if breakeven:
+        be_price, be_pct = breakeven
+        msg += f"\n📐 盈亏平衡: KC ≥ *${be_price}* (gross +{be_pct:.1f}%)"
+    return msg
 
 
 def format_order_filled(symbol: str, strike: float, side: str, expiry: str,
@@ -112,7 +127,29 @@ def format_error(scope: str, error: str) -> str:
     return f"❌ *系统错误*\n模块: `{scope}`\n错误: ```{error[:500]}```"
 
 
-def format_daily_summary(orders: int, total_cost: float, 
+def format_close_filled(symbol: str, strike: float, side: str, expiry: str,
+                        qty_sold: int, fill_price: float, pct: int,
+                        trigger: str, order_id: str) -> str:
+    """卖单成交通知"""
+    return (
+        f"💰 *平仓成交*\n"
+        f"标的: *{symbol}* {strike}{side.upper()} {expiry}\n"
+        f"卖出: {qty_sold} 张 @ ${fill_price} ({pct}%)\n"
+        f"触发: `{trigger}`\n"
+        f"订单号: `{order_id}`"
+    )
+
+
+def format_close_skipped(reason: str, raw: str) -> str:
+    """CLOSE 信号收到但未执行（没匹配到持仓 / 解析跳过 / parser 拒绝）"""
+    return (
+        f"📭 *CLOSE 未执行*\n"
+        f"原因: {reason}\n"
+        f"原文: ```{raw[:300]}```"
+    )
+
+
+def format_daily_summary(orders: int, total_cost: float,
                          max_orders: int, max_cost: float) -> str:
     """格式化每日统计"""
     return (

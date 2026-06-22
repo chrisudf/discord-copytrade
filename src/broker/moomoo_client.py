@@ -36,7 +36,9 @@ DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", 1))
 TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
 OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
-TRADE_PWD = os.getenv("MOOMOO_TRADE_PWD", "")
+# .env 里统一 MOOMOO_TRD_* 前缀（TRD_ENV / TRD_PWD），跟原 MOOMOO_TRADE_PWD 对齐
+# 模拟盘 SIMULATE 不需要密码所以历史没发现这个 typo，上真盘前必修
+TRADE_PWD = os.getenv("MOOMOO_TRD_PWD", "")
 ACC_ID = int(os.getenv("MOOMOO_ACC_ID", 0))
 
 # ---- SDK 导入 ----
@@ -154,6 +156,27 @@ def _ensure_unlocked():
     logger.info("[broker] unlock_trade OK")
 
 
+def breakeven_exit_price(entry_price: float, sell_slip: float = 0.05) -> tuple[float, float]:
+    """计算"我们跟单不亏"所需的最低 KC 卖出价（毛 PnL %）。
+
+    我们买入 ≈ entry × (1 + buy_slip)
+    我们卖出 ≈ KC_exit × (1 - sell_slip)
+    净 PnL = 0 → KC_exit = entry × (1 + buy_slip) / (1 - sell_slip)
+
+    返回 (breakeven_price, breakeven_gross_pct)
+    例: entry=2.70（$1.5-$3 档，buy_slip=8%）→ (3.07, +13.7%)
+
+    实战价值：开单时 TG 提示 KC 至少要 +N% 退出我们才不亏，
+    用户对照 KC 历史 trim 阈值（通常 +50%/+100%）能直观判断信号好坏。
+    """
+    if entry_price is None or entry_price <= 0:
+        return 0.0, 0.0
+    buy = _get_slippage_pct(entry_price)
+    be_price = entry_price * (1 + buy) / (1 - sell_slip)
+    be_pct = (be_price / entry_price - 1) * 100
+    return round(be_price, 2), round(be_pct, 1)
+
+
 def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> str:
     """
     构造 moomoo 期权代码
@@ -250,6 +273,88 @@ def place_order(signal: dict, qty: int = None) -> dict:
         }
 
 
+def place_sell_order(
+    option_code: str,
+    qty: int,
+    limit_price: float,
+    remark: str = "auto_close",
+) -> dict:
+    """卖单（限价，同步，调用方需 to_thread 包装）
+
+    Args:
+        option_code: 标的代码（同 build_option_code 输出）
+        qty: 卖出张数
+        limit_price: 限价。SL/EOD 场景建议传 bid * 0.95 偏激进确保成交；
+                     CLOSE 信号正常 trim 可传 bid 附近。
+        remark: 标记触发源（kc_close / sl_polling / tp_polling / eod_force）
+
+    返回:
+        {success, message, order_id, code, qty, price}
+
+    TODO（测试调整）：
+    - 实测后看是否要支持 OrderType.MARKET（SL 紧急情况）
+    - 模拟盘 SIMULATE 卖单是否需要先有真实持仓，没有的话 SDK 会拒
+    - 部分成交（dealt_qty < qty）的处理 —— 当前只看 RET_OK，不轮询 fill
+    """
+    if qty <= 0:
+        return {
+            "success": False, "message": f"invalid qty={qty}",
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+
+    dry_run = _is_dry_run()
+    logger.info(
+        f"[broker] SELL: {option_code} x {qty} @ {limit_price:.2f} "
+        f"[env={TRD_ENV_STR}, dry_run={dry_run}, remark={remark}]"
+    )
+
+    if dry_run:
+        return {
+            "success": True, "message": "DRY_RUN sell",
+            "order_id": f"MOCK_SELL_{option_code[-6:]}",
+            "code": option_code, "qty": qty, "price": limit_price,
+        }
+
+    try:
+        ctx = _get_ctx()
+        acc_id = _ensure_account()
+        _ensure_unlocked()
+
+        ret, data = ctx.place_order(
+            price=limit_price,
+            qty=qty,
+            code=option_code,
+            trd_side=TrdSide.SELL,
+            order_type=OrderType.NORMAL,  # 限价
+            trd_env=_get_trd_env(),
+            acc_id=acc_id,
+            remark=remark,
+        )
+        if ret == RET_OK:
+            order_id = str(data["order_id"].iloc[0])
+            logger.info(f"[broker] 卖单成功 order_id={order_id}")
+            return {
+                "success": True, "message": "submitted",
+                "order_id": order_id, "code": option_code,
+                "qty": qty, "price": limit_price,
+            }
+        logger.error(f"[broker] 卖单失败: {data}")
+        return {
+            "success": False, "message": str(data),
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+    except Exception as e:
+        logger.exception("[broker] place_sell_order 异常")
+        _reset_ctx()
+        return {
+            "success": False, "message": str(e),
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+
+
 def query_order_status(order_id: str) -> dict:
     """
     查单状态（同步）
@@ -291,6 +396,44 @@ def query_order_status(order_id: str) -> dict:
         _reset_ctx()
         return {"success": False, "message": str(e),
                 "status": None, "filled_qty": 0, "filled_avg_price": 0.0}
+
+
+def get_last_price(option_code: str):
+    """查期权最新成交价。SL / EOD watcher 用。
+
+    返回:
+        float 最新价；None 表示拿不到（watcher 应跳过该仓位）
+
+    DRY_RUN 路径：
+        - 默认返回 None（不误触发 SL）
+        - 设 MOCK_LAST_PRICE=0.5 强制固定价，方便联调 SL 阈值
+        - 设 MOCK_LAST_PRICE_<CODE>=0.5 针对单 option_code 设价
+
+    TODO（实测调整）：
+    - 上真盘换 OpenQuoteContext.get_market_snapshot([code])，取 last_price 字段
+    - quote_ctx 单独维护（和 trade_ctx 分开），同样懒加载 + reset 策略
+    - 批量查询：watcher 一次拿一批 code 比 N 次单查省 N 倍 RTT
+    - 行情订阅 vs 快照：snapshot 简单，但延迟高；订阅推送实时但要状态管理
+
+    TODO（Discord 重连相关）：
+    6/18 出现 29 次 Discord 重连（vs 之前 2-4 次/天）。
+    怀疑 moomoo SDK 在 OPRA 拒绝路径下偶尔挂线程，间接占住 event loop。
+    待 6/19 起 on_disconnect 日志收集数据后，若仍异常：
+    - 给真盘路径加 asyncio.wait_for(timeout=2.0)
+    - 给 broker 调用统一加 timeout，避免 SDK 卡死拖垮 watcher
+    """
+    if _is_dry_run():
+        per_code = os.getenv(f"MOCK_LAST_PRICE_{option_code}")
+        if per_code:
+            return float(per_code)
+        fixed = os.getenv("MOCK_LAST_PRICE")
+        if fixed:
+            return float(fixed)
+        return None
+
+    # TODO: 真盘走 quote_ctx.get_market_snapshot
+    logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
+    return None
 
 
 def close_ctx():
