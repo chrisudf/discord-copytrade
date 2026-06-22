@@ -36,7 +36,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / "config" / ".env", override=Tr
 from src.parser.signal_parser import parse_signal, detect_action
 from src.parser.close_parser import parse_close
 from src.broker.moomoo_client import place_order, place_sell_order, breakeven_exit_price
-from src.config.channel_loader import registry
+from src.config.channel_loader import registry, validate_channels
 from src.risk.risk_manager import check_order, record_order
 from src.notifier.telegram_client import (
     send_telegram,
@@ -212,21 +212,21 @@ def _extract_et_date(message) -> "date":
 @client.event
 async def on_ready():
     logger.info(f"Discord logged in as: {client.user} (id={client.user.id})")
-
-    enabled = registry.enabled_channel_ids()
-    logger.info(f"Monitoring {len(enabled)} channel(s):")
-    for cid in enabled:
-        cfg = registry.get(cid)
-        ch = client.get_channel(cid)
-        if ch is None:
-            # 看不到说明：token 没那个频道权限 / 不在那个服务器 / 频道 ID 错
-            logger.error(f"  ❌ {cfg.name} ({cid}) NOT visible!")
-        else:
-            guild = ch.guild.name if ch.guild else "DM"
-            logger.info(
-                f"  ✅ {cfg.name} ({cid}) → #{ch.name} @ {guild} "
-                f"qty={cfg.default_qty} max_price={cfg.max_price}"
+    failures = await validate_channels(client)
+    if failures:
+        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        await _safe_notify(format_error(
+            "频道配置校验失败",
+            f"{len(failures)}/{len(registry.enabled_channel_ids())} 个频道无法解析:\n{lines}\n\n"
+            f"请检查 config/channels.json 的 channel_id"
+        ))
+        if len(failures) == len(registry.enabled_channel_ids()):
+            logger.error(
+                "❌ 所有 enabled 频道都校验失败，listener 没有任何消息源 — 退出。"
+                " 修复 config/channels.json 后重启。"
             )
+            await client.close()
+            return
 
 
 @client.event

@@ -23,7 +23,7 @@ load_dotenv(ENV_PATH, override=True)
 import discord
 from loguru import logger
 
-from src.config.channel_loader import registry
+from src.config.channel_loader import registry, validate_channels
 from src.listener.discord_client import handle_message
 from src.notifier.telegram_client import send_telegram, format_error
 from src.risk.risk_manager import get_daily_stats
@@ -96,15 +96,39 @@ _startup_notified = False
 async def on_ready():
     global _startup_notified
     logger.info(f"✅ Discord logged in as: {client.user} (id={client.user.id})")
+
+    # 仅首次 on_ready 做完整频道校验（REST fetch），重连只 log 不重新探测
     if _startup_notified:
-        return  # 重连不发
+        return
     _startup_notified = True
+
+    failures = await validate_channels(client)
+    enabled_count = len(registry.enabled_channel_ids())
+
+    if failures:
+        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        try:
+            await send_telegram(
+                f"⚠️ 频道配置校验失败\n"
+                f"{len(failures)}/{enabled_count} 个频道无法解析:\n{lines}\n"
+                f"请检查 config/channels.json",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.warning(f"Telegram channel-failure notify failed: {e}")
+        if len(failures) == enabled_count:
+            logger.error(
+                "❌ 所有 enabled 频道都校验失败，listener 没有消息源 — 退出。"
+                " 修复 config/channels.json 后重启。"
+            )
+            await client.close()
+            return
+
     try:
-        # 用纯文本，避免 Markdown 解析错误（client.user 可能含 *_` 等特殊字符）
         await send_telegram(
             f"🟢 Listener 启动\n"
             f"账号: {client.user}\n"
-            f"监听: {len(registry.enabled_channel_ids())} 频道\n"
+            f"监听: {enabled_count - len(failures)}/{enabled_count} 频道有效\n"
             f"DRY_RUN: {os.getenv('DRY_RUN', 'true')}",
             parse_mode=None,
         )
