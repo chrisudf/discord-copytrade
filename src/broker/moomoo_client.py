@@ -150,20 +150,27 @@ def _ensure_account():
 
 
 def _ensure_unlocked():
-    """首次调用解锁交易。模拟盘可能不需要密码。"""
+    """首次调用解锁交易。
+
+    moomoo SIMULATE 模式 **不支持** unlock_trade —— 调它必返回
+    "ERROR. No one available account!"（即使 acc_status=ACTIVE）。
+    因此 SIMULATE 永远跳过，无论 TRADE_PWD 是否配置。
+    """
     global _unlocked
     if _unlocked:
         return
-    ctx = _get_ctx()
-    if TRD_ENV_STR == "SIMULATE" and not TRADE_PWD:
-        logger.info("[broker] 模拟盘且无密码，跳过 unlock_trade")
+    if TRD_ENV_STR == "SIMULATE":
+        logger.info("[broker] SIMULATE 模式，跳过 unlock_trade（moomoo 不支持）")
         _unlocked = True
         return
+    ctx = _get_ctx()
+    if not TRADE_PWD:
+        raise RuntimeError("REAL 模式但 MOOMOO_TRD_PWD 未配置，无法 unlock_trade")
     ret, data = ctx.unlock_trade(password=TRADE_PWD, is_unlock=True)
     if ret != RET_OK:
         raise RuntimeError(f"unlock_trade failed: {data}")
     _unlocked = True
-    logger.info("[broker] unlock_trade OK")
+    logger.info("[broker] unlock_trade OK (REAL)")
 
 
 def breakeven_exit_price(entry_price: float, sell_slip: float = 0.05) -> tuple[float, float]:
@@ -455,6 +462,87 @@ def get_last_price(option_code: str):
         _real_quote_warned_codes.add(option_code)
         logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
     return None
+
+
+def probe_broker() -> tuple[bool, str]:
+    """启动时探测 broker 健康度。供 run_listener 在 client.start 前调用。
+
+    检查项：
+      1. SDK 装好了吗
+      2. OpenD 连得上吗
+      3. get_acc_list 返回里有没有 MOOMOO_ACC_ID + MOOMOO_TRD_ENV 匹配的活跃账户
+      4. REAL 模式：unlock_trade 测一下密码
+
+    DRY_RUN=true 时跳过整套探测，直接返回 OK。
+
+    Returns:
+        (ok, message)：ok=False 时 message 是用户可读的诊断原因
+    """
+    if _is_dry_run():
+        return True, "DRY_RUN: 跳过 broker 探测"
+    if not SDK_AVAILABLE:
+        return False, "moomoo SDK 未安装（pip install moomoo-api）"
+    if ACC_ID == 0:
+        return False, "MOOMOO_ACC_ID 未配置或为 0"
+
+    try:
+        ctx = _get_ctx()
+    except Exception as e:
+        return False, f"连接 OpenD {OPEND_HOST}:{OPEND_PORT} 失败: {e}"
+
+    try:
+        ret, df = ctx.get_acc_list()
+    except Exception as e:
+        _reset_ctx()
+        return False, f"get_acc_list 抛异常: {type(e).__name__}: {e}"
+
+    if ret != RET_OK:
+        return False, f"get_acc_list 失败: {df}"
+    if df is None or len(df) == 0:
+        return False, (
+            "OpenD 没返回任何账户。检查：\n"
+            "  1) moomoo 桌面端是否已登录\n"
+            "  2) SIMULATE: 需要在桌面端启用模拟交易并选过一个账户\n"
+            "  3) 试着重启 OpenD 或重登桌面端"
+        )
+
+    # 匹配账户
+    try:
+        matched = df[(df["acc_id"] == ACC_ID) & (df["trd_env"] == TRD_ENV_STR)]
+    except Exception as e:
+        return False, f"过滤账户列异常: {e}（df.columns={getattr(df, 'columns', '?').tolist() if hasattr(df, 'columns') else '?'}）"
+
+    if len(matched) == 0:
+        ids = df["acc_id"].tolist() if "acc_id" in df.columns else []
+        envs = df["trd_env"].tolist() if "trd_env" in df.columns else []
+        return False, (
+            f"MOOMOO_ACC_ID={ACC_ID} env={TRD_ENV_STR} 不在可用账户列表里。\n"
+            f"  OpenD 返回的 acc_id: {ids}\n"
+            f"  OpenD 返回的 trd_env: {envs}\n"
+            f"  → 把 .env 里 MOOMOO_ACC_ID 改成上面其中之一"
+        )
+
+    status = matched.iloc[0].get("acc_status", "UNKNOWN")
+    if status != "ACTIVE":
+        return False, f"账户 {ACC_ID} 状态为 {status}（非 ACTIVE），无法下单"
+
+    # REAL 模式：试 unlock。SIMULATE 由 _ensure_unlocked 直接 skip，这里不碰
+    if TRD_ENV_STR == "REAL":
+        if not TRADE_PWD:
+            return False, "REAL 模式但 MOOMOO_TRD_PWD 未配置"
+        try:
+            ret, data = ctx.unlock_trade(password=TRADE_PWD, is_unlock=True)
+            if ret != RET_OK:
+                return False, f"REAL unlock_trade 失败: {data}（密码错？）"
+            global _unlocked
+            _unlocked = True
+        except Exception as e:
+            return False, f"unlock_trade 抛异常: {type(e).__name__}: {e}"
+
+    return True, (
+        f"OK · env={TRD_ENV_STR} acc_id={ACC_ID} status={status} "
+        f"({len(matched)} matching / {len(df)} total)"
+    )
 
 
 def close_ctx():

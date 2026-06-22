@@ -27,6 +27,7 @@ from src.config.channel_loader import registry, validate_channels
 from src.listener.discord_client import handle_message
 from src.notifier.telegram_client import send_telegram, format_error
 from src.risk.risk_manager import get_daily_stats
+from src.broker.moomoo_client import probe_broker
 
 
 # ============ 启动检查 ============
@@ -71,6 +72,20 @@ def preflight() -> str:
         cfg = registry.get(cid)
         logger.info(f"  • {cfg.name} (id={cid}, qty={cfg.default_qty}, "
                     f"max_price=${cfg.max_price}, triggers={cfg.trigger_user_ids})")
+
+    # Broker 启动探测：避免昨晚那种"运行一夜才发现 broker 链路是死的"
+    logger.info("─" * 60)
+    logger.info("🔍 Broker 健康探测...")
+    ok, msg = probe_broker()
+    if ok:
+        logger.info(f"  ✅ {msg}")
+    else:
+        logger.error(f"  ❌ {msg}")
+        if not dry_run:
+            logger.error("DRY_RUN=False 但 broker 不可用，拒绝启动。修复后重试。")
+            sys.exit(1)
+        else:
+            logger.warning("DRY_RUN=True，broker 探测失败但允许继续（不会真下单）")
     
     stats = get_daily_stats()
     logger.info(f"今日风控      : {stats['order_count']}/{stats['max_orders']} 单, "
