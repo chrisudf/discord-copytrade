@@ -90,9 +90,20 @@ MONTH_NAMES_RE = (
 
 
 # ===== Pre-filter =====
+# 注意：bare "holding" 之前会误伤 "holding up well" 这种描述价格走势的状态语，
+# 导致 6/23 APLD weekly $50 calls $.66 真信号被 skip。
+# 改为精确短语清单，只 skip 明确"我在持有/已持有"语境。
+# 风险：若 KC 出现 "Started holding AMZN 255c @ 2.25" 这种边缘写法，
+# 会被当真信号下单。实测样本里没出现，等真碰到再加。
 SKIP_KEYWORDS = [
-    "holding", "remaining", "into tomorrow",
-    "持仓", "i'm holding", "im holding",
+    "remaining", "into tomorrow", "持仓",
+    # 第一人称主语 + holding
+    "i'm holding", "im holding", "i am holding",
+    # 状语 + holding
+    "still holding", "currently holding", "just holding", "keep holding",
+    # holding + 明确的所有物/介词
+    "holding my", "holding the", "holding all", "holding our",
+    "holding into", "holding overnight", "holding tight",
 ]
 
 PRICE_RANGE_PATTERN = re.compile(

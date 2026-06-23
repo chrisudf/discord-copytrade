@@ -149,3 +149,49 @@ def test_shorthand_requires_dollar_prefix():
     """
     r = parse_signal("APLD 50c weeklies .98 fill", msg_ts=FIXED_TODAY)
     assert r is None
+
+
+# === 6/23 APLD "holding up well" skip 误伤回归 ===
+# 修改 SKIP_KEYWORDS 后：精确短语 skip status 消息，"holding up well" 不再误伤
+
+def test_apld_with_holding_up_well_NOT_skipped():
+    """6/23 漏接原文：'$APLD weekly $50 calls $.66 ... holding up well'
+
+    'holding up well' 是描述价格走势，不该 skip。
+    """
+    text = ("enrich:\nUsing some $IBM gains - lotto sized (1%)\n\n"
+            "$APLD weekly $50 calls $.66\n\n"
+            "Risky business - holding up well though\n\n"
+            "@everyone $alert")
+    r = parse_signal(text, msg_ts=FIXED_TODAY)
+    assert r is not None and r.get("symbol") == "APLD", (
+        f"APLD 信号应该被解析，实际: {r}"
+    )
+    assert r["strike"] == 50.0
+    assert r["price"] == 0.66
+    assert r["side"] == "CALL"
+
+
+def test_holding_status_phrases_still_skipped():
+    """status 短语仍然正确 skip，不变成"无效信号下单"风险源"""
+    cases = [
+        "I'm holding into tomorrow",
+        "still holding my SNOW calls",
+        "currently holding 3 contracts",
+        "keep holding the position",
+        "holding my other half overnight",
+        "持仓 +30%",
+    ]
+    for c in cases:
+        r = parse_signal(c, msg_ts=FIXED_TODAY)
+        assert r is None or (isinstance(r, dict) and r.get("skip") == "holding_or_remaining"), (
+            f"应 skip 但没 skip: {c} → {r}"
+        )
+
+
+def test_holding_up_well_with_no_signal_returns_none():
+    """没有信号语法的 status 消息：之前 skip，现在 parse fail → None。
+    不会下错单（无 SYMBOL+strike+price 三件套）。
+    """
+    r = parse_signal("Stock is holding up well today, no setups yet", msg_ts=FIXED_TODAY)
+    assert r is None  # 没法 parse 出 OPEN 信号

@@ -645,11 +645,20 @@ async def _handle_close_signal(raw: str, msg_id: int):
 # 工具：Telegram 通知
 # ============================================================
 async def _safe_notify(msg: str):
-    """发 Telegram，失败只 log 不抛。"""
+    """发 Telegram，失败只 log 不抛。
+
+    return 值打 log 是为了让运营在 log 里能确认 TG 链路是否工作
+    （send_telegram 成功只在 debug 级；6/23 OSCR 拒单 TG 是否发出去看不出）。
+    """
+    head = msg.replace("\n", " ")[:60]
     try:
-        await send_telegram(msg)
+        ok = await send_telegram(msg)
+        if ok:
+            logger.info(f"[notify] TG sent: {head}")
+        else:
+            logger.warning(f"[notify] TG send returned False: {head}")
     except Exception as e:
-        logger.error(f"telegram notify failed: {e}")
+        logger.error(f"[notify] TG raised: {type(e).__name__}: {e} (msg head: {head})")
 
 
 # ============================================================

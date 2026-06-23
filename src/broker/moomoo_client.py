@@ -266,6 +266,12 @@ def place_order(signal: dict, qty: int = None) -> dict:
         }
 
     # ---- 真实下单 ----
+    # TODO: 6/23 OSCR 260626 $30 call broker 拒单 "Cannot find ... in US Stocks"。
+    # 可能原因：(a) 这个 strike+expiry 组合根本不存在；(b) option_code 编码格式问题。
+    # 防御方案：调 quote_ctx.get_option_chain(SYMBOL, expiry, expiry) 验证 strike
+    # 存在再下单。代价：每单多 1 次 API + 等待 quote_ctx 单例落地（见
+    # docs/realtime_quote_design.md）。当前先靠 broker 拒单 + TG 告警，等
+    # quote_ctx 上线后再加预校验。
     try:
         ctx = _get_ctx()
         acc_id = _ensure_account()
