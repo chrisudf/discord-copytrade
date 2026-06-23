@@ -33,7 +33,8 @@ from src.utils.logger import logger
 
 # ---- 配置（从 .env 读取） ----
 DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", 1))
-TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
+# .strip().upper() 防止 .env 写成 "simulate" / " REAL " 之类导致下面所有 == 判断失效
+TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE").strip().upper()
 OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
 # .env 里统一 MOOMOO_TRD_* 前缀（TRD_ENV / TRD_PWD），跟原 MOOMOO_TRADE_PWD 对齐
@@ -173,6 +174,21 @@ def _ensure_unlocked():
     logger.info("[broker] unlock_trade OK (REAL)")
 
 
+# moomoo 会话/账户失效返回的关键字（小写匹配）。命中时 reset ctx + 重试一次。
+# 之所以放白名单：避免把"价格无效""超额"等业务拒单也当成 stale 反复重试。
+_STALE_SESSION_HINTS = (
+    "no one available account",   # SIMULATE 会话过期 / 账户挂起
+    "account is not unlock",      # 真盘 unlock 状态丢失
+    "session",                    # 通用 session 失效
+    "not login",                  # OpenD 失连
+)
+
+
+def _is_stale_session(msg: str) -> bool:
+    s = (msg or "").lower()
+    return any(h in s for h in _STALE_SESSION_HINTS)
+
+
 def breakeven_exit_price(entry_price: float, sell_slip: float = 0.05) -> tuple[float, float]:
     """计算"我们跟单不亏"所需的最低 KC 卖出价（毛 PnL %）。
 
@@ -255,7 +271,7 @@ def place_order(signal: dict, qty: int = None) -> dict:
         acc_id = _ensure_account()
         _ensure_unlocked()
 
-        ret, data = ctx.place_order(
+        order_args = dict(
             price=limit_price,
             qty=qty,
             code=option_code,
@@ -265,6 +281,14 @@ def place_order(signal: dict, qty: int = None) -> dict:
             acc_id=acc_id,
             remark="discord_auto",
         )
+        ret, data = ctx.place_order(**order_args)
+        # 中途 session 失效 → 重连 + 重试一次。避免昨晚 SNOW 那种"运行半夜忽然账户挂"丢信号
+        if ret != RET_OK and _is_stale_session(str(data)):
+            logger.warning(f"[broker] stale session ({data}), reset 后重试一次")
+            _reset_ctx()
+            ctx = _get_ctx()
+            _ensure_unlocked()
+            ret, data = ctx.place_order(**order_args)
         if ret == RET_OK:
             order_id = str(data["order_id"].iloc[0])
             logger.info(f"[broker] 下单成功 order_id={order_id}")
@@ -338,7 +362,7 @@ def place_sell_order(
         acc_id = _ensure_account()
         _ensure_unlocked()
 
-        ret, data = ctx.place_order(
+        order_args = dict(
             price=limit_price,
             qty=qty,
             code=option_code,
@@ -348,6 +372,13 @@ def place_sell_order(
             acc_id=acc_id,
             remark=remark,
         )
+        ret, data = ctx.place_order(**order_args)
+        if ret != RET_OK and _is_stale_session(str(data)):
+            logger.warning(f"[broker] sell stale session ({data}), reset 后重试一次")
+            _reset_ctx()
+            ctx = _get_ctx()
+            _ensure_unlocked()
+            ret, data = ctx.place_order(**order_args)
         if ret == RET_OK:
             order_id = str(data["order_id"].iloc[0])
             logger.info(f"[broker] 卖单成功 order_id={order_id}")
@@ -478,6 +509,12 @@ def probe_broker() -> tuple[bool, str]:
     Returns:
         (ok, message)：ok=False 时 message 是用户可读的诊断原因
     """
+    # 启动时把生效配置打到日志，方便人眼对比 .env，避免"以为改了实际没生效"
+    logger.info(
+        f"[broker] config snapshot: TRD_ENV={TRD_ENV_STR} ACC_ID={ACC_ID} "
+        f"TRADE_PWD={'set' if TRADE_PWD else 'empty'} "
+        f"OpenD={OPEND_HOST}:{OPEND_PORT} DRY_RUN={_is_dry_run()}"
+    )
     if _is_dry_run():
         return True, "DRY_RUN: 跳过 broker 探测"
     if not SDK_AVAILABLE:
