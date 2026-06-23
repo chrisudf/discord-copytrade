@@ -87,3 +87,65 @@ def test_tag_no_day_trade_when_swing():
                      msg_ts=FIXED_TODAY)
     assert "day_trade" not in r["tags"]
     assert "swing" in r["tags"]
+
+
+# === Pattern C: 简写格式（6/22 APLD 漏接修复）===
+
+def test_apld_shorthand_weeklies():
+    """6/22 凌晨 enrich 频道 APLD 漏接，原始文本：
+    'Adding $APLD 50c weeklies here @role_1362783378704699603 +alert .98 fill'
+    """
+    r = parse_signal(
+        "Adding $APLD 50c weeklies here @role_1362783378704699603 +alert .98 fill",
+        msg_ts=FIXED_TODAY,
+    )
+    assert r is not None, "APLD 简写信号应该被识别"
+    assert r["symbol"] == "APLD"
+    assert r["side"] == "CALL"
+    assert r["strike"] == 50.0
+    assert r["price"] == 0.98
+
+
+def test_shorthand_put_mmdd():
+    """简写 + 显式日期：$SYMBOL Nc/p MM/DD ... .XX fill"""
+    r = parse_signal("$SNOW 215p 7/2 .85 fill", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "SNOW"
+    assert r["side"] == "PUT"
+    assert r["strike"] == 215.0
+    assert r["price"] == 0.85
+    assert r["expiry"] == "7/2"
+
+
+def test_shorthand_at_price():
+    """@$X.XX 价格写法"""
+    r = parse_signal("Adding $NVDA 800c weeklies @ $1.20", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "NVDA"
+    assert r["strike"] == 800.0
+    assert r["price"] == 1.20
+
+
+def test_shorthand_at_price_no_dollar():
+    """@.98 不带 $"""
+    r = parse_signal("$IREN 60c weeklies @ .68", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "IREN"
+    assert r["price"] == 0.68
+
+
+def test_shorthand_does_not_match_role_mention():
+    """@role_数字 不应该被当成价格"""
+    # 仅有 @role 没有真价格 → 不匹配
+    r = parse_signal("Adding $APLD 50c weeklies @role_1362783378704699603 alert",
+                     msg_ts=FIXED_TODAY)
+    assert r is None, "没有合法价格写法应该返回 None"
+
+
+def test_shorthand_requires_dollar_prefix():
+    """裸 SYMBOL Nc/p 没有 $ 前缀不应该被 Pattern C 抓（避免假阳）。
+
+    `APLD 50c` 在 A 路径需要 MM/DD，C 路径要求 $ 前缀，两个都不命中 → None
+    """
+    r = parse_signal("APLD 50c weeklies .98 fill", msg_ts=FIXED_TODAY)
+    assert r is None
