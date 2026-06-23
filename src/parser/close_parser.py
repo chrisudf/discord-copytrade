@@ -31,6 +31,17 @@ TODO（实测调整）：
 - ACTION_DONE 里的 "took" 单独看可能误触（"took the trade"），暂依赖 RECAP_MARKERS 兜底
 - 若 [zh_unrecognized] warning 频繁，再考虑数据驱动的中文名→ticker 自动学习
   （EN 版本成功时关联同时段 ZH 文本里的未知中文名）
+
+风险 / 已知漏接（不修，列在这供日后参考）：
+- **无 symbol 的 follow-up close**：例如 "BANG! Out half @ 8.05 💰"
+  这种"承接上一条 trim 信号"的 close 没 ticker，要靠"最近交易"上下文判断。
+  当前一律 return None。修这个等于引入"最近持仓"状态机：要决定时间窗、
+  并发开仓如何选、多语言双发去重——容易引入更严重的"错平别的仓位"风险。
+  当前判断：宁可丢这种 follow-up（前一条 trim 通常已经触发了），
+  也不要 close 错仓位。
+- **CLOSE 误平的代价 > OPEN 误触发**：风控对 OPEN 有 max_price/qty/熔断兜底，
+  但 CLOSE 一旦匹配到 open_symbols 就直接挂卖单。改 close parser 前请
+  把 symbols 必须 in open_symbols 这一硬约束保留住。
 """
 import re
 from typing import Optional

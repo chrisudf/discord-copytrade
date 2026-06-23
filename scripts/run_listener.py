@@ -73,6 +73,29 @@ def preflight() -> str:
         logger.info(f"  • {cfg.name} (id={cid}, qty={cfg.default_qty}, "
                     f"max_price=${cfg.max_price}, triggers={cfg.trigger_user_ids})")
 
+    # TODO: max_price 是真盘最后一道防线，>50 在 REAL+!DRY_RUN 下基本等于裸奔
+    # 这里只在启动时硬性 gate；运行中改 channels.json + reload 不会重跑这个检查
+    HIGH_MAX_PRICE_THRESHOLD = 50.0  # >$50/张就当成"明显放宽了限制"
+    high_price_channels = [
+        (cid, registry.get(cid))
+        for cid in enabled_ids
+        if registry.get(cid).max_price > HIGH_MAX_PRICE_THRESHOLD
+    ]
+    if high_price_channels:
+        is_simulate = trd_env.strip().upper() == "SIMULATE"
+        for cid, cfg in high_price_channels:
+            tag = "OK · SIMULATE" if (is_simulate or dry_run) else "🛑 危险"
+            logger.warning(
+                f"  ⚠️  {cfg.name} max_price=${cfg.max_price} > ${HIGH_MAX_PRICE_THRESHOLD} [{tag}]"
+            )
+        if not is_simulate and not dry_run:
+            logger.error(
+                "❌ 检测到高额 max_price 但当前是 REAL 真实下单环境。\n"
+                "   单笔可能买入数千美元的 contract。拒绝启动。\n"
+                "   修复方法：把 channels.json 的 max_price 改回 ≤$10/张，或切回 SIMULATE。"
+            )
+            sys.exit(1)
+
     # Broker 启动探测：避免昨晚那种"运行一夜才发现 broker 链路是死的"
     logger.info("─" * 60)
     logger.info("🔍 Broker 健康探测...")

@@ -414,3 +414,45 @@ def test_en_takes_precedence_over_zh():
     r = parse_close(text, OPEN_NOW_SET)
     assert r is not None
     assert r["lang"] == "en"
+
+
+# === 6/22 夜里 GOOGL trim 系列 regression lock-down ===
+# 这些 close 信号当晚实际**没** trigger（因为 GOOGL OPEN 被风控砍了，
+# 没进 open_symbols），但 parser 本身在 symbol 已开仓时是正确解析的。
+# 锁住这个行为，防止以后改 parser 把它改坏。
+
+GOOGL_OPEN_SET = OPEN_NOW_SET | {"GOOGL"}
+
+
+def test_zh_sharp_prefix_googl():
+    """'#GOOGL 正在抛售！... 7.00' — BARE_SYM_PATTERN_ZH 应能处理 # 前缀"""
+    r = parse_close(
+        "@everyone\nKC交易机器人：#GOOGL 正在抛售！350 安全减仓区域已触及 7.00 ✅",
+        GOOGL_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["GOOGL"]
+    assert r["signal_price"] == 7.0
+
+
+def test_en_trimmed_at_price_on_symbol():
+    """'trimmed another at 7.25 on GOOGL' — 价格在 symbol 之前的语序"""
+    r = parse_close(
+        "@everyone\nKC Trades Bot:trimmed another at 7.25 on GOOGL, "
+        "+$105 per contract gain here pushing near 20% 💰",
+        GOOGL_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["GOOGL"]
+    assert r["signal_price"] == 7.25
+
+
+def test_zh_verb_adjacent_symbol():
+    """'在7.25减仓GOOGL' — 中文动词紧贴 SYMBOL（无空格）"""
+    r = parse_close(
+        "@everyone\nKC Trades Bot:在7.25减仓GOOGL,每张合约获利105美元,收益率接近20%💰",
+        GOOGL_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["GOOGL"]
+    assert r["signal_price"] == 7.25
