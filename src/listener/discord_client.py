@@ -326,9 +326,11 @@ async def handle_message(message):
 
     # === [改动 Bug B] 区分 intentional skip vs 真·解析失败 ===
     if signal is None:
-        # 真·没匹配任何模式（rare），值得报警关注
+        # 真·没匹配任何模式。只对"含 $TICKER + 侧别 + 价格"三件套的发 TG，
+        # 否则视为 KC 状态评论/行情解说，仅 log（避免每晚 10+ 条 TG 噪音，见 6/24 review）
         logger.warning("Parse failed")
-        await _safe_notify(format_error("Parse failed", raw))
+        if _looks_like_open_attempt(raw):
+            await _safe_notify(format_error("Parse failed (looks like signal)", raw))
         return
 
     if signal.get("skip"):
@@ -534,7 +536,10 @@ async def _handle_close_signal(raw: str, msg_id: int):
     parsed = parse_close(raw, open_symbols)
     if parsed is None:
         logger.info(f"[CLOSE] parser skipped: {raw[:80]}")
-        await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
+        # 只对"含 ticker + 价格 hint"的发 TG：捕获真漏检（如 ZH 公司名映射失败）
+        # 过滤无 ticker 的 follow-up close（如 "trim runners here at 3.45"）
+        if _looks_like_close_attempt(raw):
+            await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 
     # CLOSE dedup —— 双语双发 / 同信号重发拦截
@@ -639,6 +644,59 @@ async def _handle_close_signal(raw: str, msg_id: int):
             "no matching open positions",
             f"parsed: kind={parsed['kind']} symbols={targets} pct={pct}\n\n{raw}",
         ))
+
+
+# ============================================================
+# 启发：判断"看起来像信号"，控制 TG 噪音
+# ============================================================
+# 背景：6/24 夜里 11 条 "Parse failed" TG 全是 KC 闲聊（"$RKLB - Boom."、
+# "AMZN +50% who got paid?!" 之类），实际不是漏检信号，但每条都炸 TG。
+# 改为：parse 失败时 → 只在文本"看起来真的想发信号"才 TG，否则 log.warn 收尾。
+
+import re as _re
+
+# 现成的"开仓"句法特征：含 $TICKER + (Nc/p|calls/puts) + 价格-like 数字
+_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b")
+_OPEN_SIDE_RE = _re.compile(r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b", _re.I)
+# 价格写法：$X.XX / @X.XX / .98 fill / .98 filled
+_OPEN_PRICE_RE = _re.compile(
+    r"\$\.?\d+(?:\.\d+)?"
+    r"|@\s*\$?\.?\d+(?:\.\d+)?"
+    r"|\.?\d+(?:\.\d+)?\s*fill(?:ed)?",
+    _re.I,
+)
+
+
+def _looks_like_open_attempt(text: str) -> bool:
+    """三件套都有 → 大概率是想发开仓信号但 parser 没接住。值得 TG。
+
+    否则一律视为 KC 状态评论 / recap / 行情解说，silence 即可。
+    """
+    if not text:
+        return False
+    return bool(
+        _OPEN_TICKER_RE.search(text)
+        and _OPEN_SIDE_RE.search(text)
+        and _OPEN_PRICE_RE.search(text)
+    )
+
+
+# 常见的中文公司名 → 大致映射到 ticker 的兜底（仅用作"这段文本里含 ticker 提及"判断，
+# 不参与下单）。命中即认为 close skipped TG 有价值。
+_ZH_TICKER_HINTS = ("亚马逊", "微软", "特斯拉", "苹果", "英伟达", "谷歌", "脸书", "网飞")
+
+
+def _looks_like_close_attempt(text: str) -> bool:
+    """close_parser 返回 None 但文本里有 ticker + 价格-like → 值得 TG（可能漏接）
+
+    "can trim some runners here at 3.45" 这种没 ticker 的 follow-up → silence
+    """
+    if not text:
+        return False
+    has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
+    # 价格-like：$X / @X / 任何 d.dd（不用 \b 边界，因为中文+数字无 word boundary）
+    has_price_hint = bool(_re.search(r"\$\.?\d|@\s*\.?\d|\d+\.\d{1,2}", text))
+    return has_ticker and has_price_hint
 
 
 # ============================================================

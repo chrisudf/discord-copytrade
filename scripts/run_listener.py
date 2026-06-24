@@ -137,6 +137,7 @@ async def on_ready():
 
     # 仅首次 on_ready 做完整频道校验（REST fetch），重连只 log 不重新探测
     if _startup_notified:
+        _log_reconnect_time("logged back in")
         return
     _startup_notified = True
 
@@ -195,14 +196,42 @@ async def on_message_edit(before, after):
 
 # 诊断断线原因：6/18 出现 29 次重连（vs 之前 2-4 次/天）
 # discord.py-self 不会自动 log reason，得自己挂 event handler。
+#
+# 6/24 观察：on_disconnect 总是成对触发（< 1s 内两次），疑似 discord.py-self
+# 内部 WS + HTTP 两路 close 各发一次 event。加防抖：< 3s 内的重复只算一次。
+# 同时记录 disconnect → reconnect 用时，方便后续判断网络/库/系统层问题。
+import time as _time
+
+_DISCONNECT_DEBOUNCE_SEC = 3.0
+_last_disconnect_ts: float = 0.0  # monotonic 秒
+_disconnect_in_progress: bool = False
+
+
 @client.event
 async def on_disconnect():
+    global _last_disconnect_ts, _disconnect_in_progress
+    now = _time.monotonic()
+    if _disconnect_in_progress and (now - _last_disconnect_ts) < _DISCONNECT_DEBOUNCE_SEC:
+        # 同一次断线的成对回调，抑制重复日志
+        return
+    _last_disconnect_ts = now
+    _disconnect_in_progress = True
     logger.warning("⚠️  Discord on_disconnect fired (websocket dropped)")
+
+
+def _log_reconnect_time(label: str):
+    """on_ready / on_resumed 复用：算 disconnect→reconnect 用时"""
+    global _last_disconnect_ts, _disconnect_in_progress
+    if not _disconnect_in_progress:
+        return
+    elapsed_ms = (_time.monotonic() - _last_disconnect_ts) * 1000
+    logger.info(f"🔄 Discord {label} after {elapsed_ms:.0f}ms")
+    _disconnect_in_progress = False
 
 
 @client.event
 async def on_resumed():
-    logger.info("🔄 Discord session resumed")
+    _log_reconnect_time("session resumed")
 
 
 @client.event
