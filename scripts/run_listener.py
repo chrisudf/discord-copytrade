@@ -201,22 +201,77 @@ async def on_message_edit(before, after):
 # 内部 WS + HTTP 两路 close 各发一次 event。加防抖：< 3s 内的重复只算一次。
 # 同时记录 disconnect → reconnect 用时，方便后续判断网络/库/系统层问题。
 import time as _time
+import re as _re
+import logging as _stdlib_logging
 
 _DISCONNECT_DEBOUNCE_SEC = 3.0
 _last_disconnect_ts: float = 0.0  # monotonic 秒
 _disconnect_in_progress: bool = False
+_last_close_code: str = ""  # 最近一次 WS 关闭码（由下面的 logging 捕获填充）
+
+
+# 关闭码速查（来自 RFC 6455 + Discord）：
+#   1000 normal closure（干净，库主动 reconnect）
+#   1001 going away（peer 主动关）
+#   1006 abnormal closure（没收到 close frame）—— Mac WiFi 睡 / NAT 超时 / 网络丢包典型
+#   4000 unknown error / 4001 unknown opcode / 4002 decode error
+#   4003 not authenticated / 4004 authentication failed
+#   4007 invalid seq / 4008 rate limited / 4009 session timeout
+#   4010-4014 invalid params（shard / version / 等）
+# 1006 集中 → 网络/系统层；4xxx 集中 → Discord 侧 / 自身账号问题
+_CLOSE_CODE_RE = _re.compile(r"\b(\d{4})\b")
+
+
+class _DiscordGatewayLogCapture(_stdlib_logging.Handler):
+    """抓 discord.py-self 内部 gateway log 里的 close code。
+
+    discord.py-self 自己用 stdlib logging 打 'Webocket Closed with 1006' 这类，
+    不走我们的 loguru。这里附一个 handler 转发关键消息过来，并提取关闭码
+    放到 _last_close_code，供下次 on_disconnect 打到 log 里关联。
+    """
+    def emit(self, record):
+        global _last_close_code
+        try:
+            msg = record.getMessage()
+            lower = msg.lower()
+            if not any(k in lower for k in ("close", "disconnect", "reconnect", "resumed")):
+                return
+            m = _CLOSE_CODE_RE.search(msg)
+            if m:
+                _last_close_code = m.group(1)
+                logger.warning(f"[gateway code={_last_close_code}] {msg[:200]}")
+            else:
+                # 不带 code 但是 close/resume 类，info 级
+                logger.info(f"[gateway] {msg[:200]}")
+        except Exception:
+            pass
+
+
+def _install_gateway_log_capture():
+    """启动时调一次。不要重复挂否则会重复输出。"""
+    h = _DiscordGatewayLogCapture()
+    h.setLevel(_stdlib_logging.INFO)
+    # 挂在 discord 根 logger，覆盖 discord.client / discord.gateway / discord.http
+    _stdlib_logging.getLogger("discord").addHandler(h)
+    # 同时确保它的 level 够低能看到 INFO+
+    _stdlib_logging.getLogger("discord").setLevel(_stdlib_logging.INFO)
+
+
+_install_gateway_log_capture()
 
 
 @client.event
 async def on_disconnect():
-    global _last_disconnect_ts, _disconnect_in_progress
+    global _last_disconnect_ts, _disconnect_in_progress, _last_close_code
     now = _time.monotonic()
     if _disconnect_in_progress and (now - _last_disconnect_ts) < _DISCONNECT_DEBOUNCE_SEC:
         # 同一次断线的成对回调，抑制重复日志
         return
     _last_disconnect_ts = now
     _disconnect_in_progress = True
-    logger.warning("⚠️  Discord on_disconnect fired (websocket dropped)")
+    code_suffix = f" code={_last_close_code}" if _last_close_code else ""
+    logger.warning(f"⚠️  Discord on_disconnect fired (websocket dropped){code_suffix}")
+    _last_close_code = ""  # 用完即清，下次 disconnect 才是新的
 
 
 def _log_reconnect_time(label: str):
