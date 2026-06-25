@@ -62,9 +62,10 @@ def run_parser(content: str) -> str:
 
     parts = [f"action={action}"]
     if isinstance(open_sig, dict) and open_sig.get("symbol"):
+        # parse_signal 返回的字段叫 price，不是 entry_price（之前写错导致一直显示 None）
         parts.append(
             f"OPEN[{open_sig.get('symbol')} {open_sig.get('strike')}{open_sig.get('side')} "
-            f"{open_sig.get('expiry')} @ ${open_sig.get('entry_price')} tags={open_sig.get('tags')}]"
+            f"{open_sig.get('expiry')} @ ${open_sig.get('price')} tags={open_sig.get('tags')}]"
         )
     elif open_sig is None:
         parts.append("OPEN=None")

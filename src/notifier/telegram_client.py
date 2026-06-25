@@ -52,7 +52,10 @@ async def aclose():
     _client = None
 
 
-# MarkdownV2 需要转义的所有字符（不含我们主动用作格式的 `*` `_` `` ` ``）
+# MarkdownV2 完整保留字符列表（含 `*` `_` `` ` ``——这些虽然我们也用作格式，
+# 但在"外部输入"片段里必须转义，否则用户数据里恰好有 `_` 会被 Telegram 当下划线解析）。
+# 关键约束：escape_md() 只能对外部输入（频道名 / symbol / 错误文本 / raw 等）调用，
+# 绝不能对我们模板里主动写的 `*粗体*` / `` `code` `` 这种结构字符调用——否则格式会被吃掉。
 # 完整列表见 https://core.telegram.org/bots/api#markdownv2-style
 _MDV2_ESCAPE = r"_*[]()~`>#+-=|{}.!\\"
 
@@ -253,13 +256,69 @@ def format_daily_summary(orders: int, total_cost: float,
 # async 调用方请直接 `await send_telegram(...)`，不要绕道这里。
 
 def send_telegram_sync(text: str, parse_mode: str = "MarkdownV2") -> bool:
-    """同步调用——不能在已有 event loop 的线程中使用。"""
+    """同步调用。**用纯同步 httpx，不复用模块级 async client/lock。**
+
+    历史 bug：旧实现是 `asyncio.run(send_telegram(...))`，每次新建 event loop。
+    `send_telegram` 里有模块级 `asyncio.Lock` 和 `httpx.AsyncClient`，第一次
+    调用把它们绑到 loopA，loopA 退出后再次调用，loop B 操作"loopA 的锁/客户端"
+    会抛 "RuntimeError: ... bound to a different event loop" 或留下未关闭的
+    socket。改用纯同步 httpx.Client 后整个调用与 async 状态完全隔离。
+
+    限制：仍然不能在 event loop 内调用（async 上下文请直接 await）。
+    """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        pass  # 没有 running loop，正常走
+        pass
     else:
         raise RuntimeError(
             "send_telegram_sync 不能在 event loop 内调用，请直接 await send_telegram(...)"
         )
-    return asyncio.run(send_telegram(text, parse_mode))
+
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.warning("[Telegram] BOT_TOKEN 或 CHAT_ID 未配置，跳过通知")
+        return False
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    url = _api_url()
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.post(url, json=payload)
+    except httpx.TimeoutException:
+        logger.error(f"[Telegram-sync] 超时 ({TIMEOUT}s)")
+        return False
+    except httpx.HTTPError as e:
+        logger.error(f"[Telegram-sync] 网络错误: {type(e).__name__}")
+        return False
+    except Exception as e:
+        logger.error(f"[Telegram-sync] 异常: {type(e).__name__}: {e}")
+        return False
+
+    if resp.status_code == 200:
+        logger.debug(f"[Telegram-sync] 发送成功: {text[:50]}")
+        return True
+
+    # 400 解析失败 → 纯文本兜底重发一次
+    if resp.status_code == 400 and parse_mode:
+        logger.warning(f"[Telegram-sync] {parse_mode} 解析失败，fallback 纯文本: {resp.text[:160]}")
+        payload.pop("parse_mode", None)
+        try:
+            with httpx.Client(timeout=TIMEOUT) as client:
+                resp2 = client.post(url, json=payload)
+            if resp2.status_code == 200:
+                return True
+            logger.error(f"[Telegram-sync] fallback 也失败 status={resp2.status_code} body={resp2.text[:200]}")
+            return False
+        except Exception as e:
+            logger.error(f"[Telegram-sync] fallback 请求异常: {type(e).__name__}: {e}")
+            return False
+
+    logger.error(f"[Telegram-sync] 发送失败 status={resp.status_code} body={resp.text[:200]}")
+    return False

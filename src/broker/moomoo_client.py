@@ -549,9 +549,14 @@ def probe_broker() -> tuple[bool, str]:
             "  3) 试着重启 OpenD 或重登桌面端"
         )
 
-    # 匹配账户
+    # 匹配账户。
+    # moomoo SDK 不同版本对 trd_env 字段返回值不一致：可能是字符串 "SIMULATE"/"REAL"，
+    # 也可能是 enum TrdEnv.SIMULATE / 整型。直接 == TRD_ENV_STR 比较会在 enum/int 形态下
+    # 误判为不匹配，明明账户可用却阻止启动。这里把候选值都转字符串再比，覆盖所有形态。
     try:
-        matched = df[(df["acc_id"] == ACC_ID) & (df["trd_env"] == TRD_ENV_STR)]
+        target = TRD_ENV_STR  # 已经 .upper() 过
+        env_str = df["trd_env"].astype(str).str.upper().str.replace("TRDENV.", "", regex=False)
+        matched = df[(df["acc_id"] == ACC_ID) & (env_str == target)]
     except Exception as e:
         return False, f"过滤账户列异常: {e}（df.columns={getattr(df, 'columns', '?').tolist() if hasattr(df, 'columns') else '?'}）"
 
