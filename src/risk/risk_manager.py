@@ -26,9 +26,33 @@ load_dotenv(ENV_PATH, override=True)
 
 # 风控参数
 MAX_PRICE_PER_CONTRACT = float(os.getenv("MAX_PRICE_PER_CONTRACT", "5.0"))
-MAX_COST_PER_ORDER = float(os.getenv("MAX_COST_PER_ORDER", "500"))
 MAX_DAILY_COST = float(os.getenv("MAX_DAILY_COST", "2000"))
 MAX_DAILY_ORDERS = int(os.getenv("MAX_DAILY_ORDERS", "10"))
+
+# 单笔订单成本上限：env-aware 硬卡
+#   REAL  → 无论 env 怎么设，强制 ≤ $1000（用户硬性要求："实盘单笔 <1000"）
+#   SIMULATE / DRY_RUN → 用 env 值，缺省给一个高数，让模拟盘可以测任何信号
+# 改这个常量请同步 docs/，并明确：这个上限**晚于 channel max_price**生效，
+# 是真盘最后一道防线。
+_REAL_HARD_CAP = 1000.0
+_SIMULATE_DEFAULT = 100000.0
+
+
+def _effective_max_cost_per_order() -> float:
+    """REAL: min(env, $1000)；SIMULATE: env or $100000。
+
+    每次调用都重新读 env / TRD_ENV，避免运行中切环境时拿到过期值（虽然实际不切，
+    但这个变量是真盘最后一道防线，不要 cache）。
+    """
+    trd_env = os.getenv("MOOMOO_TRD_ENV", "SIMULATE").strip().upper()
+    if trd_env == "REAL":
+        env_val = float(os.getenv("MAX_COST_PER_ORDER", str(_REAL_HARD_CAP)))
+        return min(env_val, _REAL_HARD_CAP)
+    return float(os.getenv("MAX_COST_PER_ORDER", str(_SIMULATE_DEFAULT)))
+
+
+# 启动时读取一次用于 banner 显示；运行时每次 check_order 重新调 _effective_max_cost_per_order
+MAX_COST_PER_ORDER = _effective_max_cost_per_order()
 
 # 数据库路径
 DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "risk.db"
@@ -215,11 +239,15 @@ def check_order(price: float, qty: int,
         )
     
     # ---------- Layer 2: 单笔成本 ----------
-    if cost > MAX_COST_PER_ORDER:
+    # 每次 check 重新算 effective cap：REAL 总是硬卡 $1000，SIMULATE 用 env 值。
+    # 这样运行时切环境 (理论上不会发生)也安全，且代码里清楚标示 cap 来源。
+    effective_max_cost = _effective_max_cost_per_order()
+    if cost > effective_max_cost:
+        trd_env = os.getenv("MOOMOO_TRD_ENV", "SIMULATE").strip().upper()
         return RiskCheckResult(
             passed=False,
             reason="单笔订单成本超限",
-            detail=f"本笔成本 ${cost:.0f} > 上限 ${MAX_COST_PER_ORDER:.0f}"
+            detail=f"本笔成本 ${cost:.0f} > 上限 ${effective_max_cost:.0f} (env={trd_env})"
         )
     
     # ---------- Layer 3 & 4: 当日累计 ----------

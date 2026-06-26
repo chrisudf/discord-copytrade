@@ -73,9 +73,10 @@ def preflight() -> str:
         logger.info(f"  • {cfg.name} (id={cid}, qty={cfg.default_qty}, "
                     f"max_price=${cfg.max_price}, triggers={cfg.trigger_user_ids})")
 
-    # TODO: max_price 是真盘最后一道防线，>50 在 REAL+!DRY_RUN 下基本等于裸奔
-    # 这里只在启动时硬性 gate；运行中改 channels.json + reload 不会重跑这个检查
-    HIGH_MAX_PRICE_THRESHOLD = 50.0  # >$50/张就当成"明显放宽了限制"
+    # max_price 高额提示。不再 sys.exit——真盘单笔成本由 risk_manager Layer 2 硬卡 $1000，
+    # 单张价 × 100 × qty 任何超过 $1000 的订单都会被 check_order 拒绝。
+    # channels.json 的 max_price 现在主要服务 SIMULATE 测试灵活性。
+    HIGH_MAX_PRICE_THRESHOLD = 50.0  # >$50/张就当成"明显放宽了 Layer 1"
     high_price_channels = [
         (cid, registry.get(cid))
         for cid in enabled_ids
@@ -84,17 +85,17 @@ def preflight() -> str:
     if high_price_channels:
         is_simulate = trd_env.strip().upper() == "SIMULATE"
         for cid, cfg in high_price_channels:
-            tag = "OK · SIMULATE" if (is_simulate or dry_run) else "🛑 危险"
+            if is_simulate or dry_run:
+                tag = "OK · SIMULATE"
+            else:
+                tag = "REAL · Layer 2 $1000 兜底"
             logger.warning(
                 f"  ⚠️  {cfg.name} max_price=${cfg.max_price} > ${HIGH_MAX_PRICE_THRESHOLD} [{tag}]"
             )
         if not is_simulate and not dry_run:
-            logger.error(
-                "❌ 检测到高额 max_price 但当前是 REAL 真实下单环境。\n"
-                "   单笔可能买入数千美元的 contract。拒绝启动。\n"
-                "   修复方法：把 channels.json 的 max_price 改回 ≤$10/张，或切回 SIMULATE。"
+            logger.warning(
+                "   注意：REAL 单笔成本被 risk_manager 硬卡 $1000，超额订单会在 check_order 被拒绝"
             )
-            sys.exit(1)
 
     # Broker 启动探测：避免昨晚那种"运行一夜才发现 broker 链路是死的"
     logger.info("─" * 60)
@@ -111,8 +112,11 @@ def preflight() -> str:
             logger.warning("DRY_RUN=True，broker 探测失败但允许继续（不会真下单）")
     
     stats = get_daily_stats()
+    from src.risk.risk_manager import _effective_max_cost_per_order
+    per_order_cap = _effective_max_cost_per_order()
     logger.info(f"今日风控      : {stats['order_count']}/{stats['max_orders']} 单, "
                 f"${stats['total_cost']}/${stats['max_cost']}")
+    logger.info(f"单笔成本上限  : ${per_order_cap:,.0f} (REAL 硬卡 $1000，SIMULATE 不限)")
     if stats["circuit_broken"]:
         logger.warning(f"🚨 当日已熔断: {stats['circuit_reason']}")
     logger.info("=" * 60)

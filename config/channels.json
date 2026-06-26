@@ -3,14 +3,14 @@
       "name": "KC-期权-波段",
       "trigger_user_ids": [1426229538722938880],
       "default_qty": 1,
-      "max_price": 10.0,
+      "max_price": 1000.0,
       "enabled": true
     },
     "1517754725615927316": {
       "name": "enrich",
       "trigger_user_ids": [1426229538722938880],
       "default_qty": 1,
-      "max_price": 10.0,
+      "max_price": 1000.0,
       "enabled": true
     }
   }
