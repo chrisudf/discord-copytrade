@@ -127,9 +127,12 @@ def test_get_open_symbols_excludes_closed():
 
 def test_manager_on_order_filled_routes_correctly():
     code = _uniq("MGR")
+    # 用相对日期 today+30 而非硬编码：避免日历走过 2026-06-25 后
+    # categorize() 把信号判成 0DTE → category 变 "0dte_lotto"
+    from datetime import timedelta
     signal = {
         "symbol": "MGRTEST", "strike": 10.0, "side": "CALL",
-        "expiry_date": date(2026, 6, 25), "price": 1.0,
+        "expiry_date": date.today() + timedelta(days=30), "price": 1.0,
         "tags": ["lotto"],
     }
     order_result = {
