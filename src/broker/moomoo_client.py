@@ -28,6 +28,8 @@ TODO: 用 Polygon 回测后用真实 fill 数据校准这三档
 }
 """
 import os
+import threading
+import time
 from datetime import date
 from src.utils.logger import logger
 
@@ -51,7 +53,8 @@ ACC_ID = int(os.getenv("MOOMOO_ACC_ID", 0))
 # ---- SDK 导入 ----
 try:
     from moomoo import (
-        OpenSecTradeContext, TrdMarket, SecurityFirm,
+        OpenSecTradeContext, OpenQuoteContext,
+        TrdMarket, SecurityFirm,
         TrdSide, OrderType, TrdEnv, RET_OK,
     )
     SDK_AVAILABLE = True
@@ -63,9 +66,22 @@ except ImportError:
 _ctx = None
 _unlocked = False
 
-# get_last_price 真盘路径日志去重状态（见 get_last_price 注释）
+# Quote context（行情）独立单例：跟 trd_ctx 解耦避免互相干扰
+# 必须用 threading.Lock 而非 asyncio.Lock：SDK 同步调用通过 to_thread 跑，
+# 多个 watcher 并发调时是真线程并发，asyncio lock 不管用
+_quote_ctx = None
+_quote_lock = threading.Lock()
+
+# 真盘行情限频 backoff（snapshot 60 次/30s 命中后整段冷却）
+_quote_backoff_until: float = 0.0
+
+# get_last_price 真盘路径日志去重（早期未实现时用，保留作为 fallback warning）
 _real_quote_warned_once: bool = False
 _real_quote_warned_codes: set[str] = set()
+
+# 行情新鲜度阈值（秒）：snapshot.update_time 比 now 旧超过这个值视为 stale
+# 延迟数据账户拿到的报价 ~15min 旧，会全部被这个阈值过滤掉 → 启动 probe 时会暴露
+QUOTE_FRESHNESS_SEC = 60.0
 
 
 def _reset_ctx():
@@ -80,6 +96,30 @@ def _reset_ctx():
     _ctx = None
     _unlocked = False
     logger.warning("[broker] ctx reset, will reconnect on next call")
+
+
+def _get_quote_ctx():
+    """懒加载 quote_ctx 单例。失败抛异常由调用方 catch。"""
+    global _quote_ctx
+    if _quote_ctx is None:
+        if not SDK_AVAILABLE:
+            raise RuntimeError("moomoo SDK not installed")
+        logger.info(f"[broker] 连接 quote OpenD {OPEND_HOST}:{OPEND_PORT}")
+        _quote_ctx = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
+    return _quote_ctx
+
+
+def _reset_quote_ctx():
+    """quote 链路异常时重置；下次调用会重连。
+    跟 _reset_ctx 解耦——交易和行情走两条独立 socket，互不影响。"""
+    global _quote_ctx
+    if _quote_ctx is not None:
+        try:
+            _quote_ctx.close()
+        except Exception:
+            pass
+    _quote_ctx = None
+    logger.warning("[broker] quote_ctx reset, will reconnect on next call")
 
 
 def _is_dry_run() -> bool:
@@ -265,13 +305,20 @@ def place_order(signal: dict, qty: int = None) -> dict:
             "qty": qty, "price": limit_price,
         }
 
+    # ---- contract 预校验：避免 broker "Cannot find" 拒单（6/22 OSCR / 6/29 TEM/DRAM）
+    # 用 quote snapshot 试取一次，找不到直接返回 rejected 不走 broker。
+    # 节省一次 broker RTT，且错误消息更明确（运营能知道是 strike/expiry 不存在）。
+    valid = validate_option_codes([option_code])
+    if not valid.get(option_code):
+        msg = f"option contract not found on OPRA: {option_code} (check strike/expiry exists)"
+        logger.error(f"[broker] pre-validate rejected: {msg}")
+        return {
+            "success": False, "message": msg,
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+
     # ---- 真实下单 ----
-    # TODO: 6/23 OSCR 260626 $30 call broker 拒单 "Cannot find ... in US Stocks"。
-    # 可能原因：(a) 这个 strike+expiry 组合根本不存在；(b) option_code 编码格式问题。
-    # 防御方案：调 quote_ctx.get_option_chain(SYMBOL, expiry, expiry) 验证 strike
-    # 存在再下单。代价：每单多 1 次 API + 等待 quote_ctx 单例落地（见
-    # docs/realtime_quote_design.md）。当前先靠 broker 拒单 + TG 告警，等
-    # quote_ctx 上线后再加预校验。
     try:
         ctx = _get_ctx()
         acc_id = _ensure_account()
@@ -452,53 +499,167 @@ def query_order_status(order_id: str) -> dict:
                 "status": None, "filled_qty": 0, "filled_avg_price": 0.0}
 
 
-def get_last_price(option_code: str):
-    """查期权最新成交价。SL / EOD watcher 用。
+def _snapshot(codes: list) -> "tuple[int, object]":
+    """单层 wrapper：处理 lock、限频 backoff、异常 reset。返回 (ret, df_or_msg)。
 
-    返回:
+    设计见 docs/realtime_quote_design.md (PR 1)。
+    """
+    global _quote_backoff_until
+    now = time.monotonic()
+    if now < _quote_backoff_until:
+        return -1, f"backoff (limit/quota) for another {_quote_backoff_until - now:.0f}s"
+
+    try:
+        with _quote_lock:
+            ctx = _get_quote_ctx()
+            ret, df = ctx.get_market_snapshot(codes)
+    except Exception as e:
+        logger.exception("[broker] snapshot exception")
+        _reset_quote_ctx()
+        return -1, f"exception: {type(e).__name__}"
+
+    if ret != RET_OK:
+        msg = str(df)
+        if "quota" in msg.lower() or "limit" in msg.lower():
+            _quote_backoff_until = time.monotonic() + 60.0
+            logger.warning(f"[broker] snapshot quota/limit exceeded, backoff 60s: {msg[:120]}")
+    return ret, df
+
+
+def get_last_prices(codes: list) -> dict:
+    """批量取期权最新价。SL/TP/EOD watcher 应每 tick 调用一次（而非 N×get_last_price）。
+
+    Returns:
+        {code: float | None}，找不到/stale/无成交 一律 None
+    """
+    out = {c: None for c in codes}
+    if not codes:
+        return out
+
+    if _is_dry_run():
+        for c in codes:
+            per = os.getenv(f"MOCK_LAST_PRICE_{c}")
+            if per:
+                out[c] = float(per)
+                continue
+            fixed = os.getenv("MOCK_LAST_PRICE")
+            if fixed:
+                out[c] = float(fixed)
+        return out
+
+    ret, df = _snapshot(codes)
+    if ret != RET_OK or df is None:
+        return out
+    if not hasattr(df, "iterrows") or len(df) == 0:
+        return out
+
+    import pandas as pd  # 仅 SDK 路径需要，pandas 是 moomoo 必装依赖
+    now_ts = time.time()
+    for _, row in df.iterrows():
+        code = row.get("code")
+        if code not in out:
+            continue
+        last = row.get("last_price")
+        if pd.isna(last) or last is None or last <= 0:
+            continue
+        # freshness check：避免 OpenD 持旧 cache 或延迟数据账户。
+        # 注意：pandas 把 naive 字符串当 UTC，跟 time.time() (UTC epoch) 对齐。
+        # TODO：上真盘实际收数据后，验证 moomoo update_time 是 UTC 还是 ET / 服务器本地。
+        # 如果是非 UTC，要在 parse 时显式带 tz 再 .timestamp()。
+        try:
+            ts = pd.to_datetime(row["update_time"]).timestamp()
+            if now_ts - ts > QUOTE_FRESHNESS_SEC:
+                continue
+        except Exception:
+            pass  # update_time 缺失时仍信任 snapshot（少见）
+        out[code] = float(last)
+    return out
+
+
+def get_last_price(option_code: str):
+    """查单个期权最新成交价。SL / EOD watcher 用。
+
+    内部走 get_last_prices([code])，统一一条码路径。
+
+    Returns:
         float 最新价；None 表示拿不到（watcher 应跳过该仓位）
 
     DRY_RUN 路径：
         - 默认返回 None（不误触发 SL）
-        - 设 MOCK_LAST_PRICE=0.5 强制固定价，方便联调 SL 阈值
+        - 设 MOCK_LAST_PRICE=0.5 强制固定价
         - 设 MOCK_LAST_PRICE_<CODE>=0.5 针对单 option_code 设价
-
-    TODO（实测调整）：
-    - 上真盘换 OpenQuoteContext.get_market_snapshot([code])，取 last_price 字段
-    - quote_ctx 单独维护（和 trade_ctx 分开），同样懒加载 + reset 策略
-    - 批量查询：watcher 一次拿一批 code 比 N 次单查省 N 倍 RTT
-    - 行情订阅 vs 快照：snapshot 简单，但延迟高；订阅推送实时但要状态管理
-
-    TODO（Discord 重连相关）：
-    6/18 出现 29 次 Discord 重连（vs 之前 2-4 次/天）。
-    怀疑 moomoo SDK 在 OPRA 拒绝路径下偶尔挂线程，间接占住 event loop。
-    待 6/19 起 on_disconnect 日志收集数据后，若仍异常：
-    - 给真盘路径加 asyncio.wait_for(timeout=2.0)
-    - 给 broker 调用统一加 timeout，避免 SDK 卡死拖垮 watcher
     """
-    if _is_dry_run():
-        per_code = os.getenv(f"MOCK_LAST_PRICE_{option_code}")
-        if per_code:
-            return float(per_code)
-        fixed = os.getenv("MOCK_LAST_PRICE")
-        if fixed:
-            return float(fixed)
-        return None
+    return get_last_prices([option_code]).get(option_code)
 
-    # TODO: 真盘走 quote_ctx.get_market_snapshot
-    # 日志去重：每个 code 只 warn 一次（避免 watcher tick 每 5s 刷屏）
-    # 同时首次进入真盘路径时打一次响亮警告，说明 SL/TP/EOD 在真盘不会触发
-    global _real_quote_warned_once
-    if not _real_quote_warned_once:
-        _real_quote_warned_once = True
-        logger.error(
-            "[broker] ⚠️  真盘 get_last_price 未实现：SL / TP / EOD watcher 将无法触发！"
-            " 0DTE 仓位会持有到 expire，请手动监控。详见 TODO。"
+
+def _validate_one(code: str) -> bool:
+    """单 code 校验。返回 True=可下单（含权限不足时的"未知放行"），False=确认不存在。"""
+    ret, df = _snapshot([code])
+    if ret != RET_OK:
+        msg_lower = str(df).lower()
+        # 账户没 OPRA 期权行情订阅 → 不能当作 contract 不存在，让 broker 自己判
+        if "no permission" in msg_lower or "quote permission" in msg_lower:
+            return True
+        # "Unknown stock" / "Cannot find" 类 → 真不存在
+        return False
+    if df is None or not hasattr(df, "iterrows") or len(df) == 0:
+        return False
+    return any(row.get("code") == code for _, row in df.iterrows())
+
+
+def validate_option_codes(codes: list) -> dict:
+    """下单前预校验 option_code 是否存在于 OPRA 链上。
+
+    策略：
+    1. 先一次性 batch snapshot（最省 RTT）
+    2. batch 失败时若是"no permission"，全部降级返 True（让 broker 自己判）
+    3. batch 失败时若是"unknown stock"类（某个 code 让整 batch 挂掉），
+       拆成 per-code 重试 —— 隔离坏 code，让好的能正常 validate
+    4. batch 成功，按 snapshot 出现与否标 True/False
+
+    Returns:
+        {code: True/False}。True = 存在/未知（可让 broker 试）；False = 确认不存在
+    """
+    out = {c: False for c in codes}
+    if not codes:
+        return out
+    if _is_dry_run():
+        return {c: True for c in codes}
+
+    ret, df = _snapshot(codes)
+
+    if ret == RET_OK and df is not None and hasattr(df, "iterrows"):
+        # 正常：只把出现在 snapshot 的标 True
+        for _, row in df.iterrows():
+            code = row.get("code")
+            if code in out:
+                out[code] = True
+        return out
+
+    # batch 失败处理
+    msg_lower = str(df).lower()
+    if "no permission" in msg_lower or "quote permission" in msg_lower:
+        logger.warning(
+            "[broker] validate skipped: no US options quote permission "
+            f"({str(df)[:120]}). 让 broker 自行判断 contract 存在性。"
+            " 要启用预校验，请在 moomoo app 订阅 US MarketOptions Lv1+。"
         )
-    if option_code not in _real_quote_warned_codes:
-        _real_quote_warned_codes.add(option_code)
-        logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
-    return None
+        return {c: True for c in codes}
+
+    # 其它失败（典型："Unknown stock. XXX" — 一个坏 code 拖累整 batch）
+    # 拆成 per-code 重查，隔离坏 code。代价 = N 次 RTT，但只在 batch 失败时才走
+    if len(codes) > 1:
+        logger.info(
+            f"[broker] batch validate failed ({str(df)[:80]}), "
+            f"falling back to per-code check for {len(codes)} codes"
+        )
+        for c in codes:
+            out[c] = _validate_one(c)
+        return out
+
+    # 单 code 也失败 → 真不存在
+    logger.warning(f"[broker] validate rejected {codes[0]}: {str(df)[:120]}")
+    return out
 
 
 def probe_broker() -> tuple[bool, str]:
@@ -594,8 +755,8 @@ def probe_broker() -> tuple[bool, str]:
 
 
 def close_ctx():
-    """优雅退出时调用。"""
-    global _ctx, _unlocked
+    """优雅退出时调用。同时关交易和行情两路。"""
+    global _ctx, _unlocked, _quote_ctx
     if _ctx is not None:
         try:
             _ctx.close()
@@ -603,4 +764,11 @@ def close_ctx():
             pass
         _ctx = None
         _unlocked = False
-        logger.info("[broker] ctx closed")
+        logger.info("[broker] trade ctx closed")
+    if _quote_ctx is not None:
+        try:
+            _quote_ctx.close()
+        except Exception:
+            pass
+        _quote_ctx = None
+        logger.info("[broker] quote ctx closed")
