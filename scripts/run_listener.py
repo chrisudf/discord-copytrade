@@ -27,7 +27,10 @@ from src.config.channel_loader import registry, validate_channels
 from src.listener.discord_client import handle_message
 from src.notifier.telegram_client import send_telegram, format_error
 from src.risk.risk_manager import get_daily_stats
-from src.broker.moomoo_client import probe_broker
+from src.broker.moomoo_client import (
+    probe_broker, probe_quote_access,
+    QUOTE_OK, QUOTE_DELAYED, QUOTE_NO_PERMISSION, QUOTE_ERROR,
+)
 
 
 # ============ 启动检查 ============
@@ -110,6 +113,19 @@ def preflight() -> str:
             sys.exit(1)
         else:
             logger.warning("DRY_RUN=True，broker 探测失败但允许继续（不会真下单）")
+
+    # 期权行情订阅探测：决定 SL/TP/EOD watcher 真盘是否真能工作
+    # 不阻塞启动，只 log；运营自己决定是否升级订阅
+    logger.info("🔍 OPRA 行情订阅探测...")
+    quote_status, quote_msg = probe_quote_access()
+    if quote_status == QUOTE_OK:
+        logger.info(f"  ✅ {quote_msg}")
+    elif quote_status == QUOTE_DELAYED:
+        logger.warning(f"  ⚠️  delayed-data tier:\n{quote_msg}")
+    elif quote_status == QUOTE_NO_PERMISSION:
+        logger.warning(f"  ⚠️  no permission:\n{quote_msg}")
+    else:  # QUOTE_ERROR
+        logger.error(f"  ❌ {quote_msg}")
     
     stats = get_daily_stats()
     from src.risk.risk_manager import _effective_max_cost_per_order

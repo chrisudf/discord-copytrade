@@ -754,6 +754,108 @@ def probe_broker() -> tuple[bool, str]:
     )
 
 
+# Probe quote access tier，状态码用于 banner 着色和后续判断
+QUOTE_OK = "ok"                # 期权 snapshot 真返价 + 新鲜
+QUOTE_DELAYED = "delayed"      # snapshot 通了但行情滞后（疑似 delayed-data tier）
+QUOTE_NO_PERMISSION = "no_perm"  # 账户没 US MarketOptions 订阅
+QUOTE_ERROR = "error"          # 其它失败（OpenD 连不上 / chain 取不到 / etc.）
+
+
+def probe_quote_access() -> tuple[str, str]:
+    """探测期权行情订阅状态，决定 SL/TP/EOD watcher 真盘是否能工作。
+
+    步骤：
+      1. quote_ctx 连得上吗
+      2. 个股 snapshot（US.SPY）能拿到吗 —— 这个不要 OPRA 权限
+      3. 拿一个真实存在的 SPY 期权 code（via get_option_chain）
+      4. 对该 code 调 snapshot —— "No permission" 返 NO_PERMISSION
+      5. 检查报价新鲜度 —— age > 15min 视为 DELAYED
+
+    不阻塞启动，调用方根据返回决定 banner / warn / 是否启动 watcher。
+
+    Returns:
+        (status, message) where status ∈ {OK, DELAYED, NO_PERMISSION, ERROR}
+    """
+    if _is_dry_run():
+        return QUOTE_OK, "DRY_RUN: 跳过期权行情探测"
+    if not SDK_AVAILABLE:
+        return QUOTE_ERROR, "moomoo SDK 未安装"
+
+    # 1. quote ctx 连得通
+    try:
+        ctx = _get_quote_ctx()
+    except Exception as e:
+        return QUOTE_ERROR, f"quote_ctx 连接失败: {type(e).__name__}: {e}"
+
+    # 2. 个股 snapshot —— 基本 quote 连通性 + tier 探测
+    try:
+        ret, df = ctx.get_market_snapshot(["US.SPY"])
+    except Exception as e:
+        _reset_quote_ctx()
+        return QUOTE_ERROR, f"个股 snapshot 抛异常: {type(e).__name__}: {e}"
+    if ret != RET_OK:
+        return QUOTE_ERROR, f"个股 snapshot 失败（基本 quote 都不通）: {str(df)[:120]}"
+
+    # 3. 取一个真实期权 code（任何 SPY 近月 ATM 附近都行，列表第一个）
+    from datetime import date as _date, timedelta as _timedelta
+    today = _date.today()
+    # 下周三 → 让 weekly/monthly 大概率都覆盖；不论今天是周几
+    target = today + _timedelta(days=(2 - today.weekday()) % 7 + 7)
+    try:
+        ret, chain = ctx.get_option_chain(
+            code="US.SPY", start=target.isoformat(), end=target.isoformat(),
+        )
+    except Exception as e:
+        return QUOTE_ERROR, f"get_option_chain 抛异常: {type(e).__name__}: {e}"
+    if ret != RET_OK:
+        # get_option_chain 本身也吃 OPRA 权限（实测 6/30）
+        msg_lower = str(chain).lower()
+        if "no permission" in msg_lower or "quote permission" in msg_lower:
+            return QUOTE_NO_PERMISSION, (
+                "账户缺 US MarketOptions Lv1+ 行情订阅（get_option_chain 失败）。\n"
+                "  影响：SL / TP / EOD watcher 真盘下 no-op；validate_option_codes "
+                "降级到不预校验（让 broker 拒）。\n"
+                "  开通方法：moomoo app → 我的 → 行情订阅 → US MarketOptions Lv1。"
+            )
+        return QUOTE_ERROR, f"无法获取 SPY {target} 期权链: {str(chain)[:120]}"
+    if chain is None or len(chain) == 0:
+        return QUOTE_ERROR, f"SPY {target} 期权链为空（可能无该到期日，换一天试）"
+    sample_code = chain.iloc[0]["code"]
+
+    # 4. 对真实期权 code 试 snapshot —— 触发 OPRA 权限检查
+    try:
+        ret, opt_df = ctx.get_market_snapshot([sample_code])
+    except Exception as e:
+        return QUOTE_ERROR, f"OPRA snapshot 抛异常: {type(e).__name__}: {e}"
+    if ret != RET_OK:
+        msg_lower = str(opt_df).lower()
+        if "no permission" in msg_lower or "quote permission" in msg_lower:
+            return QUOTE_NO_PERMISSION, (
+                "账户缺 US MarketOptions Lv1+ 行情订阅。\n"
+                "  影响：SL / TP / EOD watcher 真盘下 no-op；validate_option_codes "
+                "降级到不预校验（让 broker 拒）。\n"
+                "  开通方法：moomoo app → 我的 → 行情订阅 → US MarketOptions Lv1。"
+            )
+        return QUOTE_ERROR, f"OPRA snapshot 异常: {str(opt_df)[:200]}"
+
+    # 5. 新鲜度（delayed-data tier 通常滞后 15 分钟）
+    try:
+        import pandas as pd
+        update_ts = pd.to_datetime(opt_df.iloc[0]["update_time"]).timestamp()
+        age = time.time() - update_ts
+        if age > 900:  # 15 分钟
+            return QUOTE_DELAYED, (
+                f"OPRA 行情可拿但滞后 {age:.0f}s（疑似 delayed-data tier）。\n"
+                f"  影响：watcher 的 60s 新鲜度过滤会把所有报价当 stale 丢弃 → "
+                f"实际 SL/TP/EOD 仍然 no-op。\n"
+                f"  开通方法：升级到 US MarketOptions Lv1 实时行情。"
+            )
+    except Exception:
+        pass  # 拿不到 update_time 时不阻断
+
+    return QUOTE_OK, f"OPRA 行情可用 + 实时（sample {sample_code}）"
+
+
 def close_ctx():
     """优雅退出时调用。同时关交易和行情两路。"""
     global _ctx, _unlocked, _quote_ctx

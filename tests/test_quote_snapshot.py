@@ -207,3 +207,105 @@ def test_snapshot_respects_backoff(monkeypatch):
     assert ret != bc.RET_OK
     assert "backoff" in str(msg).lower()
     assert ctx_called == []  # 完全没调 SDK
+
+
+# ===== probe_quote_access =====
+
+def _mock_ctx_for_probe(stock_ok=True, chain_ok=True, opt_ret=None, opt_df=None):
+    """构造一个 mock ctx，让 probe_quote_access 走完 5 步"""
+    import pandas as pd
+    ctx = MagicMock()
+
+    def snapshot_dispatch(codes):
+        if codes == ["US.SPY"]:
+            if not stock_ok:
+                return -1, "stock snapshot failed"
+            return bc.RET_OK, pd.DataFrame([_make_snapshot_row("US.SPY", 600.0)])
+        # 期权 snapshot
+        if opt_ret is not None:
+            return opt_ret, opt_df
+        return bc.RET_OK, pd.DataFrame([_make_snapshot_row(codes[0], 5.0)])
+
+    ctx.get_market_snapshot.side_effect = snapshot_dispatch
+
+    if chain_ok:
+        ctx.get_option_chain.return_value = (
+            bc.RET_OK,
+            pd.DataFrame([{"code": "US.SPY260710C600000", "strike_price": 600.0}]),
+        )
+    else:
+        ctx.get_option_chain.return_value = (-1, "chain failed")
+    return ctx
+
+
+def test_probe_quote_access_ok(monkeypatch):
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: _mock_ctx_for_probe())
+    status, msg = bc.probe_quote_access()
+    assert status == bc.QUOTE_OK
+
+
+def test_probe_quote_access_no_permission(monkeypatch):
+    """OPRA 拒绝 → NO_PERMISSION 状态码"""
+    ctx = _mock_ctx_for_probe(
+        opt_ret=-1,
+        opt_df="No permission to get quotes for US.SPY260710C600000. "
+               "Please check US MarketOptions quote permissions.",
+    )
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    status, msg = bc.probe_quote_access()
+    assert status == bc.QUOTE_NO_PERMISSION
+    assert "US MarketOptions" in msg
+
+
+def test_probe_quote_access_delayed(monkeypatch):
+    """update_time > 15 分钟旧 → DELAYED"""
+    import pandas as pd
+    delayed_row = _make_snapshot_row(
+        "US.SPY260710C600000", 5.0, update_offset_s=-1200,  # 20 分钟前
+    )
+    ctx = _mock_ctx_for_probe(
+        opt_ret=bc.RET_OK, opt_df=pd.DataFrame([delayed_row]),
+    )
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    status, msg = bc.probe_quote_access()
+    assert status == bc.QUOTE_DELAYED
+    assert "delayed" in msg.lower() or "滞后" in msg
+
+
+def test_probe_quote_access_chain_fail(monkeypatch):
+    """无法拿 SPY 期权链 → ERROR"""
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: _mock_ctx_for_probe(chain_ok=False))
+    status, _ = bc.probe_quote_access()
+    assert status == bc.QUOTE_ERROR
+
+
+def test_probe_quote_access_chain_no_permission_routes_to_no_perm(monkeypatch):
+    """get_option_chain 也吃 OPRA 权限——返 'no permission' 时归 NO_PERMISSION 而非 ERROR"""
+    import pandas as pd
+    ctx = MagicMock()
+    # stock snapshot 通过
+    ctx.get_market_snapshot.return_value = (
+        bc.RET_OK, pd.DataFrame([_make_snapshot_row("US.SPY", 600.0)]),
+    )
+    # chain 返 no permission
+    ctx.get_option_chain.return_value = (
+        -1, "No permission to get quotes for US.SPY. Please check US MarketOptions quote permissions.",
+    )
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    status, msg = bc.probe_quote_access()
+    assert status == bc.QUOTE_NO_PERMISSION
+    assert "US MarketOptions" in msg
+
+
+def test_probe_quote_access_stock_snapshot_fail(monkeypatch):
+    """连个股 quote 都不通 → ERROR"""
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: _mock_ctx_for_probe(stock_ok=False))
+    status, _ = bc.probe_quote_access()
+    assert status == bc.QUOTE_ERROR
+
+
+def test_probe_quote_access_dry_run_skipped(monkeypatch):
+    monkeypatch.setattr(bc, "_is_dry_run", lambda: True)
+    status, msg = bc.probe_quote_access()
+    assert status == bc.QUOTE_OK
+    assert "DRY_RUN" in msg
