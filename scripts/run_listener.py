@@ -229,6 +229,15 @@ _last_disconnect_ts: float = 0.0  # monotonic 秒
 _disconnect_in_progress: bool = False
 _last_close_code: str = ""  # 最近一次 WS 关闭码（由下面的 logging 捕获填充）
 
+# Storm 检测：60s 窗口内出现 >= 3 次真断线 → TG 告警一次
+# 背景：6/30 04:36-04:43 出现 7min identify-rate-limit storm，bot 实际离线 7min。
+# 这个窗口里若 KC 发信号会丢。debounce 只过滤成对 callback，storm 是更深层故障。
+_STORM_WINDOW_SEC = 60.0
+_STORM_THRESHOLD = 3
+_recent_disconnects: list = []   # monotonic 时间戳 list
+_storm_notified_at: float = 0.0  # 防止 storm 期间 TG 重复轰炸
+_STORM_NOTIFY_COOLDOWN_SEC = 300.0  # 5 分钟内只告警一次
+
 
 # 关闭码速查（来自 RFC 6455 + Discord）：
 #   1000 normal closure（干净，库主动 reconnect）
@@ -283,6 +292,7 @@ _install_gateway_log_capture()
 @client.event
 async def on_disconnect():
     global _last_disconnect_ts, _disconnect_in_progress, _last_close_code
+    global _storm_notified_at
     now = _time.monotonic()
     if _disconnect_in_progress and (now - _last_disconnect_ts) < _DISCONNECT_DEBOUNCE_SEC:
         # 同一次断线的成对回调，抑制重复日志
@@ -291,7 +301,31 @@ async def on_disconnect():
     _disconnect_in_progress = True
     code_suffix = f" code={_last_close_code}" if _last_close_code else ""
     logger.warning(f"⚠️  Discord on_disconnect fired (websocket dropped){code_suffix}")
-    _last_close_code = ""  # 用完即清，下次 disconnect 才是新的
+    _last_close_code = ""
+
+    # storm 检测：60s 窗口里累计 >= 3 次 → TG 告警一次
+    _recent_disconnects.append(now)
+    cutoff = now - _STORM_WINDOW_SEC
+    while _recent_disconnects and _recent_disconnects[0] < cutoff:
+        _recent_disconnects.pop(0)
+    if len(_recent_disconnects) >= _STORM_THRESHOLD:
+        if now - _storm_notified_at >= _STORM_NOTIFY_COOLDOWN_SEC:
+            _storm_notified_at = now
+            n = len(_recent_disconnects)
+            logger.error(
+                f"🌀 Discord storm: {n} disconnects in last "
+                f"{_STORM_WINDOW_SEC:.0f}s — bot may be offline soon"
+            )
+            try:
+                # 用 plain text 避免 markdown 转义出意外
+                await send_telegram(
+                    f"🌀 Discord 重连风暴：{_STORM_WINDOW_SEC:.0f}s 内 {n} 次断线。\n"
+                    f"可能进入 identify-rate-limit 退避（最长 ~3min）。"
+                    f"建议盯一下盘，必要时手动重启 listener。",
+                    parse_mode=None,
+                )
+            except Exception as e:
+                logger.warning(f"storm TG notify failed: {e}")
 
 
 def _log_reconnect_time(label: str):

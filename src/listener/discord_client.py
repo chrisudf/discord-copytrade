@@ -561,13 +561,39 @@ async def _handle_close_signal(raw: str, msg_id: int):
     pct = parsed["pct"]
     any_executed = False
 
+    hint_strike = parsed.get("hint_strike")
+    hint_side = parsed.get("hint_side")
+
     for symbol in targets:
-        # 同 symbol 可能多 strike，全部按 pct 卖
-        # TODO：v1 全部对待；后续可能要按 strike/expiry 匹配 close 信号里的细节
         positions = position_mgr.find_by_symbol(symbol)
         if not positions:
             logger.warning(f"[CLOSE] {symbol} not found in open positions")
             continue
+
+        # strike-aware filter：close 文本里显式给了 strike+side 时只关匹配的仓位。
+        # 背景见 [docs/lessons.md](docs/lessons.md) #11：6/30 KC 平 TSLA 420c
+        # 触发我们平 TSLA 425c，这次运气好两个 strike 价差小，下次未必。
+        if hint_strike is not None and hint_side is not None:
+            matched = [
+                p for p in positions
+                if p["strike"] == hint_strike and p["side"] == hint_side
+            ]
+            if not matched:
+                logger.warning(
+                    f"[CLOSE] {symbol} {hint_strike}{hint_side[0]} hinted but "
+                    f"no matching position (have: "
+                    f"{[(p['strike'], p['side'][0]) for p in positions]}). Skipping."
+                )
+                await _safe_notify(format_close_skipped(
+                    f"strike 不匹配（KC 平 {symbol} {hint_strike}{hint_side[0]} 但我们持仓不同 strike）",
+                    raw,
+                ))
+                continue
+            logger.info(
+                f"[CLOSE] strike-filter: {symbol} {hint_strike}{hint_side[0]} → "
+                f"{len(matched)}/{len(positions)} positions selected"
+            )
+            positions = matched
 
         for pos in positions:
             qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)

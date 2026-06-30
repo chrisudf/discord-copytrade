@@ -456,3 +456,76 @@ def test_zh_verb_adjacent_symbol():
     assert r is not None
     assert r["symbols"] == ["GOOGL"]
     assert r["signal_price"] == 7.25
+
+
+# === 6/30 strike-aware close hint regression ===
+# 背景：KC 平 TSLA 420c 时我们持仓是 TSLA 425c。新 parser 抽 hint_strike+side，
+# listener 用来 filter，避免错平不同 strike 的仓位。
+
+TSLA_OPEN_SET = OPEN_NOW_SET | {"TSLA"}
+
+
+def test_en_strike_hint_extracted():
+    """'closed TSLA 420c runner @ 15.35' → hint_strike=420 hint_side=CALL
+
+    (实测 6/30 log 里 KC EN 用的是 'all out TSLA 420c' — 'all out' 不在 ACTION_VERBS
+    列表，EN parser 漏接，但 ZH '全部平仓 TSLA 420c' 接住了。'all out' 是单独 gap，
+    不在本次 strike-hint feature 范围内。这里用 'closed' 测 strike 抽取本身。)
+    """
+    r = parse_close(
+        "@everyone\nKC Trades Bot:closed TSLA 420c runner @ 15.35 "
+        "for +$1,000 per contract gain 🚀💰",
+        TSLA_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["TSLA"]
+    assert r["hint_strike"] == 420.0
+    assert r["hint_side"] == "CALL"
+    assert r["signal_price"] == 15.35
+
+
+def test_zh_strike_hint_extracted():
+    """'全部平仓 TSLA 420c 持仓 @ 15.35' → hint_strike=420 hint_side=CALL"""
+    r = parse_close(
+        "@everyone\nKC交易机器人：全部平仓 TSLA 420c 持仓 @ 15.35，"
+        "每张合约获利+$1,000 🚀💰",
+        TSLA_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["TSLA"]
+    assert r["hint_strike"] == 420.0
+    assert r["hint_side"] == "CALL"
+
+
+def test_no_strike_hint_returns_none():
+    """普通 trim 信号没 strike → hint_strike/hint_side 为 None，保持 symbol-only 旧行为"""
+    r = parse_close(
+        "@everyone\nKC Trades Bot:trimmed SPY @ 3.00 💰",
+        OPEN_NOW_SET | {"SPY"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["hint_strike"] is None
+    assert r["hint_side"] is None
+
+
+def test_strike_hint_put_side():
+    """'closed TSLA 425p @ 8.50' → side=PUT"""
+    r = parse_close(
+        "trimmed TSLA 425p @ 8.50",
+        TSLA_OPEN_SET,
+    )
+    assert r is not None
+    assert r["hint_strike"] == 425.0
+    assert r["hint_side"] == "PUT"
+
+
+def test_strike_hint_calls_word():
+    """'closed AMZN 255 calls @ 2.30' → strike=255, side=CALL (用 'calls' 词)"""
+    r = parse_close(
+        "closed AMZN 255 calls @ 2.30",
+        OPEN_NOW_SET,
+    )
+    assert r is not None
+    assert r["hint_strike"] == 255.0
+    assert r["hint_side"] == "CALL"

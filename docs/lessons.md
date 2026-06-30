@@ -214,6 +214,79 @@ unambiguous result, properly distinguishes the two failure modes.
 
 ---
 
+## 11. CLOSE matching on symbol alone can wrong-close a multi-strike position
+
+**Symptom**: 6/30 overnight, enrich posted `$TSLA 7/1 $425 calls for $1.55` —
+we opened TSLA 425c. KC (independently, on his own pre-existing position)
+posted `all out TSLA 420c runner @ 15.35` ~3 hours later. Our close parser
+extracted `symbols=['TSLA']`, the listener applied that to all open TSLA
+positions, and we closed our 425c at $14.58. The trade was lucky (420c and
+425c had near-identical ITM intrinsic on expiry day) — we netted ~+770%.
+
+**Why non-obvious**:
+- The close parser was designed with the explicit comment "almost all
+  close signals don't carry strike → symbol-level match". For most KC
+  trims that's still true.
+- The danger only surfaces when two unrelated signals on the same symbol
+  (different strike or even side) exist simultaneously. Easy to miss in
+  unit tests because each test sets up a single position.
+- The reward (we made money) hides the wrongness of the mechanism.
+- Next time the same pattern could close a winning position when KC
+  was closing a losing one, or close our call when KC closes a put.
+
+**Defense**: `_extract_strike_hint` in close_parser now extracts an
+optional `(strike, side)` when the close text contains an explicit
+strike like `TSLA 420c` or `AMZN 255 calls`. The listener filters
+positions by `(strike, side)` whenever the hint is set; when no hint is
+present (most casual trims), behavior is unchanged. If hint is set and
+no position matches, the close is **skipped** and a TG warning fires.
+See `_handle_close_signal` in [src/listener/discord_client.py](../src/listener/discord_client.py).
+
+Tests in [tests/test_listener_close.py](../tests/test_listener_close.py):
+strike mismatch → skip, strike match → execute, no hint → legacy
+behavior.
+
+---
+
+## 12. `discord.py-self` IDENTIFY rate-limit produces ~7-minute outages with exponential backoff
+
+**Symptom**: 6/30 04:36 — single `on_disconnect`, followed by
+`Attempting reconnect in 1.90s`, then 0.29s, 6.23s, 14.72s, 3.92s,
+32.68s, 82.51s, 117.86s, 138.85s. Each retry triggered another
+`on_disconnect` callback. After ~7 minutes total, full
+`Discord logged in as ...` (fresh login, not session resume). During
+the 7-min window the bot was completely offline — any KC signal arriving
+then would be missed.
+
+**Why non-obvious**:
+- Looks like our bot is broken (10+ rapid disconnects in 7 minutes).
+- Actually it's Discord's IDENTIFY rate-limit: too many connect
+  attempts in a short window trigger increasing backoff (`Retry-After`
+  on the IDENTIFY response, library obeys it).
+- Underlying cause is usually a single brief network blip or Mac
+  partial wake, but the visible symptom looks catastrophic.
+- `caffeinate -i` reduced normal-state reconnects from 17/night to 4-5,
+  but it doesn't prevent the occasional storm — Discord's rate-limit
+  kicks in regardless.
+
+**Defense**: Storm detector in [scripts/run_listener.py](../scripts/run_listener.py)
+`on_disconnect`: 60s sliding window, threshold 3 disconnects → loud
+`logger.error` + Telegram alert (with 5-min cooldown to prevent
+spam during the storm itself). The bot stays running; the operator
+gets a heads-up that we're in a degraded window and may need to
+manually restart. Documented `1006 / EOF` close codes already get
+captured by `_DiscordGatewayLogCapture` so the storm log line carries
+context.
+
+Open question for future: when the storm hits, should we auto-restart
+the process (forfeit any in-flight state but reset the rate-limit
+clock)? Currently no — restart loses the SQLite dedup state for a few
+seconds and could double-execute a close signal that arrived mid-restart.
+Leaving as manual decision until we see this fail in a way the alert
+doesn't catch.
+
+---
+
 ## Format guidelines for adding new lessons
 
 Keep entries focused on **gotchas that weren't documented or

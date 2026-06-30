@@ -251,6 +251,46 @@ def _action_sentences(text: str) -> str:
     return " ".join(hit) if hit else text
 
 
+def _extract_strike_hint(scope: str, symbols: list) -> tuple:
+    """从 close 文本里抽 strike + side hint。
+
+    场景背景：6/30 KC 发 "all out TSLA 420c @ 15.35"，但我们持仓是 TSLA 425c
+    （我们抄的 enrich 信号）。旧 parser 只看 symbol → 抽到 TSLA → 关掉我们 425c。
+    这次因为 420c/425c 同方向同到期日同 ITM，价差很小，意外赚了大钱。
+    下次未必有这种运气：KC 平 TSLA put 时我们的 TSLA call 也会被错平。
+
+    策略：只在文本里**显式给出 strike** 时返回 hint。无 strike → None，
+    保持旧"symbol-only"语义不变（不破坏没 strike 的 trim 消息行为）。
+
+    支持的写法（symbol 在前，strike+side 紧邻）：
+      "TSLA 420c", "SPY 748c", "AMZN 255 calls", "MSFT 420put"
+      ZH: "TSLA 420c" (KC ZH 翻译里 strike 通常保留 Latin)
+
+    Args:
+        scope: 含 close action 的句子片段
+        symbols: 已抽出的 symbols 列表（用于"靠近"判断）
+
+    Returns:
+        (strike: float, side: "CALL"|"PUT") 或 (None, None)
+    """
+    if not symbols:
+        return (None, None)
+    # 第一个 symbol 是主对象
+    sym = symbols[0]
+    # 匹配 "SYM 数字 c/p" 或 "SYM 数字 call(s)/put(s)"，最多隔 3 个空白字符
+    pat = re.compile(
+        rf"\b{re.escape(sym)}\s+(\d+(?:\.\d+)?)\s*(c\b|p\b|calls?|puts?)",
+        re.IGNORECASE,
+    )
+    m = pat.search(scope)
+    if not m:
+        return (None, None)
+    strike = float(m.group(1))
+    side_raw = m.group(2).lower()
+    side = "CALL" if side_raw.startswith("c") else "PUT"
+    return (strike, side)
+
+
 def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
     """抽 symbol。优先 $SYMBOL；只有完全没有 $ 标记时才 fallback 到裸 SYMBOL。
 
@@ -331,7 +371,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
         if pct == 33:
             pct = 50
         logger.info(f"[close_parser] EN BULK_TRIM pct={pct}")
-        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
+        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "en"}
 
@@ -339,11 +379,14 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if not symbols:
         return None
     pct = _extract_pct(text, text_lower)
+    hint_strike, hint_side = _extract_strike_hint(scope_en, symbols)
     logger.info(
         f"[close_parser] EN CLOSE symbols={symbols} pct={pct} "
+        f"strike={hint_strike} side={hint_side} "
         f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
     )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "matched": text[:120], "lang": "en"}
 
@@ -439,7 +482,7 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         if pct == 33:
             pct = 50
         logger.info(f"[close_parser] ZH BULK_TRIM pct={pct}")
-        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
+        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "zh"}
 
@@ -451,11 +494,14 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         )
         return None
     pct = _extract_zh_pct(text)
+    hint_strike, hint_side = _extract_strike_hint(scope_zh, symbols)
     logger.info(
         f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} "
+        f"strike={hint_strike} side={hint_side} "
         f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
     )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "matched": text[:120], "lang": "zh"}
 
