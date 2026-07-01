@@ -147,12 +147,17 @@ async def test_strike_hint_match_executes_close():
 
 @pytest.mark.asyncio
 async def test_no_strike_hint_keeps_legacy_symbol_only_behavior():
-    """普通 trim 信号（无 strike）→ 按 symbol 关全部，保留旧行为"""
+    """普通 trim 信号（无 strike）→ 按 symbol 关全部，保留旧行为。
+
+    注：qty=2 而非 1，因为 v2 起 1 张 + trim<100% 会触发 runner-preserve 跳过
+    （见 test_calc_qty_to_sell_single_contract_runner_preserve）。这里测的是
+    strike-filter 的旧回落行为，跟 runner 规则解耦。
+    """
     os.environ["DRY_RUN"] = "true"
     code = _uniq_code("LEG")
     positions_db.open_or_add(
         option_code=code, symbol="SPYZ", strike=748.0, side="CALL",
-        expiry=date(2026, 7, 6), qty=1, fill_price=2.59,
+        expiry=date(2026, 7, 6), qty=2, fill_price=2.59,
         category="weekly", apply_sl=True, eod_force_close=False, tags=[],
         channel_name="ut", msg_id="m_strike_3",
     )
@@ -174,7 +179,7 @@ async def test_no_strike_hint_keeps_legacy_symbol_only_behavior():
             "trimmed SPYZ @ 2.85", msg_id=66666,
         )
 
-    # 旧行为：symbol 匹配即关
+    # 旧行为：symbol 匹配即关（qty=2 时 33% ceil = 1 张，卖单会挂）
     assert len(sell_called) == 1, "无 strike hint 应保持旧 symbol-only 行为"
 
-    positions_db.record_close(code, 1, 2.71, "manual", note="ut cleanup")
+    positions_db.record_close(code, 2, 2.71, "manual", note="ut cleanup")

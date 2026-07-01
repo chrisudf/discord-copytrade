@@ -287,6 +287,58 @@ doesn't catch.
 
 ---
 
+## 13. `math.ceil` on 1-contract positions turns every trim into a full close
+
+**Symptom**: When we hold exactly 1 contract and KC posts a `trimmed X%`
+signal, `calc_qty_to_sell` computes `max(1, math.ceil(1 * pct / 100))` =
+1 for any pct in `[1, 100]`. So a 33% trim intended to preserve most of
+the position closes the whole thing. Then KC's actual runner (the
+remaining part *KC* is holding) keeps climbing and we miss it.
+
+Concrete misses on record:
+- 6/30 SPY 748c: opened @ $2.59, 33% trim signal → we sold @ $2.71.
+  KC's runner went to $4.00 (+40%). Missed ~$130/contract.
+- 7/1 MSFT 390c: opened @ $2.48, 33% trim signal → we sold @ $2.56.
+  KC's runner went to $4.60 (+85%). Missed ~$200/contract.
+
+**Why non-obvious**:
+- The old comment on `calc_qty_to_sell` said "trim 33% but only 1 left
+  → sell 1 is more reasonable than keeping". That intuition breaks
+  down when the signal source (KC) is also holding partial runners:
+  the "trim" *means* "sell some, keep the rest for higher"—not "close
+  because it might drop".
+- Numerically the calculation is correct (`ceil(0.33) = 1`), so no
+  test failure signals the problem.
+- Small P&L (+$8, +$3) makes it look like the system worked, hiding
+  the massive opportunity cost.
+- Two overnights before the pattern became obvious enough to name.
+
+**Defense (strategy A, 2026-07-02)**: `calc_qty_to_sell` now returns
+`0` when `remaining == 1 and pct < 100`, so trim signals on
+single-contract positions are ignored while the position rides. The
+100% path is untouched — explicit `closed all` / `out full` / KC
+clearly finishing still gets executed. See
+[src/position/manager.py](../src/position/manager.py) and tests in
+[tests/test_positions.py](../tests/test_positions.py)
+(`test_calc_qty_to_sell_single_contract_runner_preserve`).
+
+**Strategy B, blocked on OPRA subscription**: The right answer is
+quote-aware — early in a trade (say < +50% PnL) match KC's trims for
+risk management, then transition to runner-hold after we've de-risked.
+Requires `get_last_prices` to actually return prices, which requires
+US MarketOptions Lv1 subscription. Filed as P0 in
+[docs/TODO.md](TODO.md) "Runner mode B". Until then, strategy A holds.
+
+**Trade-off strategy A carries**: If KC's early trim signal (e.g., at
++9%) is a genuine reversal warning, we now hold instead of exiting.
+Accepting this asymmetry deliberately: past data shows KC's early
+trims are usually profit-taking, not reversal calls; the reversal
+calls are worded as `closed`, `out full`, `stop hit` (which parse as
+100%). If evidence changes, drop strategy A back to the old ceil
+behavior.
+
+---
+
 ## Format guidelines for adding new lessons
 
 Keep entries focused on **gotchas that weren't documented or

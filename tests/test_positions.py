@@ -154,6 +154,28 @@ def test_calc_qty_to_sell():
     assert manager.calc_qty_to_sell(pos, 100) == 4
     assert manager.calc_qty_to_sell(pos, 50) == 2
     assert manager.calc_qty_to_sell(pos, 25) == 1
-    # 向上取整保证至少 1 张
+
+
+def test_calc_qty_to_sell_single_contract_runner_preserve():
+    """规则 v2 (7/2 起): 1 张持仓 + pct<100 → 不卖，保留 runner
+
+    历史损失驱动改动：6/30 SPY 748c、7/1 MSFT 390c 都是 1 张持仓被 KC 33% trim
+    信号直接全平，然后 KC 后续走到 +100%~+150% 我们没吃到。
+    """
     pos = {"qty_remaining": 1}
-    assert manager.calc_qty_to_sell(pos, 33) == 1
+    # trim 系列全部跳过
+    assert manager.calc_qty_to_sell(pos, 25) == 0
+    assert manager.calc_qty_to_sell(pos, 33) == 0
+    assert manager.calc_qty_to_sell(pos, 50) == 0
+    assert manager.calc_qty_to_sell(pos, 75) == 0
+    assert manager.calc_qty_to_sell(pos, 99) == 0
+    # 但 100% 明确清仓仍执行
+    assert manager.calc_qty_to_sell(pos, 100) == 1
+
+
+def test_calc_qty_to_sell_multi_contract_unchanged():
+    """规则 v2 只影响 qty=1；qty>=2 时保持向上取整行为"""
+    pos = {"qty_remaining": 2}
+    assert manager.calc_qty_to_sell(pos, 25) == 1  # ceil(0.5) = 1
+    assert manager.calc_qty_to_sell(pos, 50) == 1  # ceil(1.0) = 1
+    assert manager.calc_qty_to_sell(pos, 100) == 2

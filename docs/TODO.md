@@ -4,6 +4,17 @@
 - [ ] Connect real moomoo API (uncomment broker block, test on account)
 - [ ] Validate option code format on OpenD
 - [ ] Securely store Discord token (consider keyring)
+- [ ] **Runner mode B (quote-driven trim decision)**
+  - 前置依赖：OPRA subscription (US MarketOptions Lv1+)
+  - 背景：当前策略 A（qty==1 且 pct<100 → skip trim）粗暴保 runner。
+    真实场景更精细：早期跟 KC trim（+9%~40% 该出），中后期变 runner
+    （+50% 以上留一张）。见 lessons.md #13。
+  - 实现：在 close 流程里查 get_last_price(pos.code)，算 (last / avg_entry - 1) * 100 = 当前 PnL%。
+    * PnL% < 50 → 正常跟 KC 的 pct 卖（对齐早期风险管理）
+    * PnL% >= 50 且 qty==1 → 跳过 <100% trim（保 runner）
+    * 100% close 信号总是执行
+  - 需求：get_last_prices 真返价（等 OPRA），以及一个可调阈值（.env 里 RUNNER_MIN_PNL_PCT，默认 50）
+  - 替换掉 calc_qty_to_sell 里的策略 A 分支
 
 ## P1 - position sizing
 - [ ] Calculate qty based on account balance %
