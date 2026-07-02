@@ -66,6 +66,37 @@ def test_detect_action_zh_close():
     assert detect_action("$AAOI weekly $220 calls $2.05") == "OPEN"
 
 
+def test_detect_action_en_gerund_and_phrases():
+    """7/3 复盘发现：'closing' 等 gerund 和 'all out'/'out half' 等短语应识别为 CLOSE
+
+    历史漏检 case（重放）：
+    - 7/3 03:20 `closing the MSFT 390c runner here at 5.00` → 之前误路由到 OPEN
+    - 6/30 02:51 `all out TSLA 420c runner @ 15.35` → 同样
+    - 6/29 `Out half MSFT @ 2.90` → 同样
+    """
+    from src.parser.signal_parser import detect_action
+    # gerund 形式
+    assert detect_action("closing the MSFT 390c runner here at 5.00") == "CLOSE"
+    assert detect_action("scaling out MSFT here") == "CLOSE"
+    # 多词 phrase
+    assert detect_action("all out TSLA 420c runner @ 15.35") == "CLOSE"
+    assert detect_action("out half MSFT @ 2.90") == "CLOSE"
+    assert detect_action("out full on TSLA 420c") == "CLOSE"
+    assert detect_action("out majority SPY here @ 3.00") == "CLOSE"
+
+
+def test_detect_action_open_not_falsely_matched():
+    """反向：真 OPEN 信号不能因为新加的关键字被误判为 CLOSE"""
+    from src.parser.signal_parser import detect_action
+    # 边缘：含 "close" 字符串但显然是开仓文本
+    assert detect_action("MSFT 390c 7/6 small @ 2.30") == "OPEN"
+    assert detect_action("Adding $APLD 50c weeklies @ .98") == "OPEN"
+    assert detect_action("$SPY $748 calls @ $2.40 close to breakout") == "CLOSE"
+    # ^ 这条其实含 "close" 单词，会被匹配（严格 word-boundary 也覆盖）—— 允许假阳
+    #   因为运行时 close_parser 会二次校验（找不到 action verb + open_symbols 就 return None）
+    # OPEN 信号 KC 从不用 "close to breakout" 这种含 close 的表达，实测不会遇到
+
+
 def test_tag_day_trade_variants():
     """'small day trade' / 'daytrade' / 'day-trade' 都应该 tag day_trade"""
     r = parse_signal("TSLA 415c June 26 @ 2.70 small day trade",

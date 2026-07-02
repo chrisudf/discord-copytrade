@@ -537,8 +537,19 @@ def _extract_tags(text: str) -> list:
 # ===== Action detection =====
 # 必须双语都覆盖。否则 ZH close 信号会被路由到 OPEN parser，浪费一次解析失败
 # + 错过中文先到的场景。
+#
+# 7/3 复盘发现：KC 用 `closing the MSFT 390c runner here at 5.00` 时
+# `closed?` 只匹配 "close"/"closed"，不匹配 gerund "closing"。ZH 版本
+# "平仓" 命中所以走了 close 路径，EN 掉去 OPEN parser 失败。
+# 修法：把 KC 高频用的 gerund 和多词短语加进来，跟 close_parser.ACTION_VERBS 对齐：
+#   - closing (gerund)
+#   - scaling out (KC 常见 phrase)
+#   - all out / out half / out full / out majority (KC 平仓惯用短语)
+# 保守起见还是不加 selling / cutting / dumping —— 这些在开仓评论里也常见，
+# 加进来会误把 open 信号路由到 close 路径。
 CLOSE_KEYWORDS = re.compile(
-    r"\b(closed?|sold|exit|stopped|trim|trimmed|out of)\b"
+    r"\b(closed?|closing|sold|exit|stopped|trim|trimmed|out of|scaling\s+out)\b"
+    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
     r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空",
     re.I,
 )

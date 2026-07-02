@@ -65,6 +65,8 @@ BULK_MARKERS = [
 ]
 
 # 当前动作（gerund / 完成时）—— 真要动手的信号
+# 与 signal_parser.CLOSE_KEYWORDS 保持同步，否则 detect_action 说 CLOSE 但这里
+# _has_action_verb 说没动词 → close_parser 返回 None（7/3 "all out TSLA" 案例）
 ACTION_VERBS = [
     "trimming", "trimmed",
     "cutting", "cut ",        # "cut " 加空格避免匹配 "scout/circuit"
@@ -73,10 +75,13 @@ ACTION_VERBS = [
     "dumping", "dumped",
     "scaling out",
     "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
+    # KC 常用 "out" 短语（多词 phrase，双 layer 加入避免 false positive）
+    "all out", "out half", "out full", "out majority",
 ]
 
 # 全平动词（pct 缺省 → 100）
-FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
+FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping",
+                    "all out", "out full"]
 
 # 提取百分比："25%" / "20 %"
 # 排除 `-15%` `+30%` 这类 PnL 标注（前面有符号/数字 → 不是 trim 比例）
@@ -234,6 +239,7 @@ def _has_full_close_verb(text_lower: str) -> bool:
 _ACTION_RE = re.compile("|".join(re.escape(v) for v in [
     "trimming", "trimmed", "cutting", "cut ", "selling", "sold here",
     "closing", "closed", "dumping", "dumped", "scaling out", "bang!", "bang -",
+    "all out", "out half", "out full", "out majority",
 ]), re.IGNORECASE)
 
 

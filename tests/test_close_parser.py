@@ -529,3 +529,43 @@ def test_strike_hint_calls_word():
     assert r is not None
     assert r["hint_strike"] == 255.0
     assert r["hint_side"] == "CALL"
+
+
+# === 7/3 close verb-coverage 回归 ===
+# detect_action + close_parser 双 layer 都要认 "closing"/"all out"/"out half" 之类。
+
+def test_closing_gerund_routes_to_close():
+    """7/3 03:20 `closing the MSFT 390c runner here at 5.00` case"""
+    r = parse_close(
+        "closing the MSFT 390c runner here at 5.00 💰",
+        OPEN_NOW_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["MSFT"]
+    assert r["pct"] == 33
+    assert r["hint_strike"] == 390.0
+    assert r["hint_side"] == "CALL"
+    assert r["signal_price"] == 5.0
+
+
+def test_all_out_recognized_as_100pct():
+    """'all out TSLA 420c @ 15.35' → pct=100 (FULL_CLOSE_VERBS)"""
+    r = parse_close(
+        "all out TSLA 420c runner @ 15.35 for +$1,000 per contract gain 🚀💰",
+        OPEN_NOW_SET | {"TSLA"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["TSLA"]
+    assert r["pct"] == 100
+    assert r["hint_strike"] == 420.0
+
+
+def test_out_half_recognized_as_close():
+    """'out half MSFT @ 2.90' → CLOSE 路径命中"""
+    r = parse_close(
+        "out half MSFT @ 2.90 💰 stop at entry on the rest",
+        OPEN_NOW_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["MSFT"]
+    assert r["signal_price"] == 2.9
