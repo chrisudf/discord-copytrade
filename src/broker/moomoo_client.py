@@ -367,6 +367,29 @@ def place_order(signal: dict, qty: int = None) -> dict:
         }
 
 
+def _get_long_qty(option_code: str) -> int:
+    """查 broker 里持有的 long qty。用于 naked-short 防护。
+
+    Returns:
+        long qty（>= 0）。broker 无此 code 或 qty 为 SHORT → 返 0。
+    """
+    ctx = _get_ctx()
+    ret, df = ctx.position_list_query(
+        code=option_code,
+        trd_env=_get_trd_env(),
+        acc_id=_ensure_account(),
+    )
+    if ret != RET_OK or df is None or len(df) == 0:
+        return 0
+    # position_side: LONG / SHORT
+    row = df.iloc[0]
+    side = str(row.get("position_side", "")).upper()
+    qty = int(row.get("qty", 0))
+    if side != "LONG" or qty <= 0:
+        return 0
+    return qty
+
+
 def place_sell_order(
     option_code: str,
     qty: int,
@@ -408,6 +431,31 @@ def place_sell_order(
             "success": True, "message": "DRY_RUN sell",
             "order_id": f"MOCK_SELL_{option_code[-6:]}",
             "code": option_code, "qty": qty, "price": limit_price,
+        }
+
+    # ---- Naked-short 防护 ----
+    # 系统只允许卖出已持有的 long option。不能挂 SELL 让 broker 视作开裸空仓。
+    # 背景：7/2 发现本地 DB 与 broker 严重脱钩（自动 exercise 后本地仍 OPEN），
+    # 如果后续 close 信号误触发 SELL，broker 会当"开裸空 call/put"处理 —— 无限风险。
+    # 见 docs/lessons.md #15。
+    try:
+        available = _get_long_qty(option_code)
+    except Exception as e:
+        logger.exception(f"[broker] naked-check position_list_query failed for {option_code}")
+        return {
+            "success": False,
+            "message": f"naked-short check failed (position_list_query exception): {e}",
+            "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
+        }
+    if available < qty:
+        msg = (
+            f"naked-short refused: broker has only {available} long of {option_code}, "
+            f"asked to sell {qty}. This would open a naked short — refusing."
+        )
+        logger.error(f"[broker] {msg}")
+        return {
+            "success": False, "message": msg,
+            "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
         }
 
     try:

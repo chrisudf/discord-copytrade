@@ -4,6 +4,15 @@
 - [ ] Connect real moomoo API (uncomment broker block, test on account)
 - [ ] Validate option code format on OpenD
 - [ ] Securely store Discord token (consider keyring)
+- [ ] **Tests must use tmp DB, not data/trades.db** (added 2026-07-03)
+  - 7/3 sync 发现 130 个 OPEN 记录，大部分是 tests 里
+    `positions_db.open_or_add(...)` 直接写生产 DB 的残留（symbol=ADD/EOD/MGR/SL/BRJ/STK/LEG 等）
+  - 修法：在 `tests/conftest.py` 里加 autouse fixture，`monkeypatch.setattr(positions_db, "DB_PATH", tmp_path/"test.db")` + `positions_db._init_db()`
+  - 参考已有的 `tests/test_risk_cost_cap.py::_isolate_env` fixture
+- [ ] **Position sync as preflight step in run_listener.py**
+  - 手工跑 `python scripts/sync_positions.py` 太容易漏
+  - 加进 preflight，在 broker probe 之后跑一次，把本地 stale 全清
+  - 顺便：sync 里若 broker 有本地没的期权 → 建议 record 到本地 DB（stray 变已知）
 - [ ] **Runner mode B (quote-driven trim decision)**
   - 前置依赖：OPRA subscription (US MarketOptions Lv1+)
   - 背景：当前策略 A（qty==1 且 pct<100 → skip trim）粗暴保 runner。

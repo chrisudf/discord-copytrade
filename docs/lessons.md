@@ -339,6 +339,88 @@ behavior.
 
 ---
 
+## 14. Long ITM options auto-exercise into shares at expiry (OCC/moomoo standard behavior)
+
+**Symptom**: 7/2 → 7/3 morning, moomoo SIMULATE 持仓 showed HOOD 100 shares
+($10,800 cost), IBM 200 shares ($57,000), TSLA 100 shares ($42,500), plus
+some option positions we didn't recognize. Local DB still marked HOOD 108c,
+IBM 285c ×2, TSLA 425c, RKLB 108c etc as `status='OPEN'`. RKLB 108c that had
+just been bought a few hours earlier was gone from broker but present in local
+DB.
+
+`history_order_list_query` showed a burst of auto-generated orders at 20:40
+UTC (post-market close ET) with pattern:
+```
+20:40:04 US.HOOD BUY 100 @ 108     dealt=0 status=N/A
+20:40:03 US.HOOD260702C108000 SELL qty=1 dealt=0 status=N/A
+20:40:02 US.IBM  BUY 200 @ 285     dealt=0 status=N/A
+20:40:01 US.IBM260702C285000 SELL qty=2 dealt=0 status=N/A
+20:40:00 US.TSLA BUY 100 @ 425     dealt=0 status=N/A
+20:40:00 US.TSLA260701C425000 SELL qty=1 dealt=0 status=N/A
+```
+
+Every expired ITM long call generated a synthetic SELL (of the option) +
+BUY (of underlying × strike × 100). Some assignments succeeded earlier
+(HOOD/IBM/TSLA shares are actually held), others left the account with
+just cash movement.
+
+**Why non-obvious**:
+- This is standard OCC/exchange behavior, not moomoo-specific. Any long
+  option ITM by at least $0.01 at expiration auto-exercises.
+- No documentation flag on the position that says "will auto-exercise
+  Friday if ITM." moomoo just silently processes it.
+- We had zero exercise/assignment code in the repo — expiry handling
+  happened server-side without notifying us.
+- Result was silent — the sold option position vanished from
+  `position_list_query`, our local DB was never touched by anything.
+
+**Defense**:
+- `scripts/sync_positions.py`: queries broker, compares to local DB
+  OPEN, marks stale entries as CLOSED with `trigger_source=broker_sync`.
+  Recommend running before each `run_listener.py` session (potentially
+  as a preflight step in a future PR).
+- Ongoing: EOD watcher should force-close ITM positions before market
+  close on expiry day. Currently no-op because OPRA subscription is
+  missing. Filed under `docs/TODO.md` P0.
+- The stray stock positions (HOOD/IBM/TSLA shares) still sit in the
+  account — they're outside our system's execution scope (we only place
+  option orders). Need to close them manually in moomoo.
+
+---
+
+## 15. `SELL` on an option we don't hold opens a naked short (broker accepts, we didn't intend)
+
+**Symptom**: Direct consequence of #14. Once the local DB was out of sync
+with broker, our close pipeline could easily fire `place_sell_order` for
+an option the account no longer holds. moomoo would happily accept that
+as **opening a new naked short position**, not "closing existing long"
+— because we ran out of long inventory. Naked short calls have unlimited
+loss; naked short puts are limited but still large.
+
+Nothing in the pipeline would have caught this before 7/3:
+- `place_sell_order` submitted straight to `ctx.place_order` with
+  `TrdSide.SELL`. If broker accepted, we logged "success" and moved on.
+- No pre-check that we actually owned the option we were selling.
+
+**Why non-obvious**:
+- On the surface, a SELL order looks like "close position." The broker
+  semantics are actually "sell N contracts, however you want to source
+  them" — long-close and open-short use the same trade side.
+- The failure mode requires the local DB to be wrong first (#14). If
+  the local DB were always correct, we'd never call sell on something
+  we don't hold. But #14 shows the DB *does* go stale.
+
+**Defense**: `_get_long_qty(option_code)` in
+[src/broker/moomoo_client.py](../src/broker/moomoo_client.py) queries
+`position_list_query(code=...)` and returns 0 if we don't hold `LONG`
+inventory. `place_sell_order` calls it before submitting. If broker
+`long qty < requested sell qty`, we refuse and return an explicit
+"naked-short refused" message — no order goes out. Costs one extra RTT
+per sell (probably ~50ms) but prevents unbounded downside from a state
+mismatch. Applies to real-env only (`DRY_RUN` short-circuits earlier).
+
+---
+
 ## Format guidelines for adding new lessons
 
 Keep entries focused on **gotchas that weren't documented or
