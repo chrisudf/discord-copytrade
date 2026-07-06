@@ -655,3 +655,26 @@ def test_date_not_mistaken_for_fraction():
     assert r is not None
     assert r["symbols"] == ["SPY"]
     assert r["pct"] == 33
+
+
+# === "out" 短语词边界回归（review 0012）===
+
+def test_overall_does_not_escalate_to_full_close():
+    """回归：'overall outlook' 跨词边界含 'all out' 子串，
+    旧 substring 匹配把普通 trim 升级成 100% 全平。"""
+    r = parse_close("Trimmed SPY here @ 3.00, overall outlook still bullish", {"SPY"})
+    assert r is not None
+    assert r["pct"] == 33  # trim 默认，绝不能是 100
+
+
+def test_out_half_sells_fifty_pct():
+    """'out half' 应该卖 50%，不是默认 33%。"""
+    r = parse_close("out half TSLA @ 8.05", {"TSLA"})
+    assert r is not None
+    assert r["pct"] == 50
+
+
+def test_out_full_is_full_close():
+    r = parse_close("out full TSLA @ 8.05", {"TSLA"})
+    assert r is not None
+    assert r["pct"] == 100

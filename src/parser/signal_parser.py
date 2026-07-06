@@ -553,29 +553,45 @@ def _extract_tags(text: str) -> list:
 # 必须双语都覆盖。否则 ZH close 信号会被路由到 OPEN parser，浪费一次解析失败
 # + 错过中文先到的场景。
 #
-# 7/3 复盘发现：KC 用 `closing the MSFT 390c runner here at 5.00` 时
-# `closed?` 只匹配 "close"/"closed"，不匹配 gerund "closing"。ZH 版本
-# "平仓" 命中所以走了 close 路径，EN 掉去 OPEN parser 失败。
-# 修法：把 KC 高频用的 gerund 和多词短语加进来，跟 close_parser.ACTION_VERBS 对齐：
-#   - closing (gerund)
-#   - scaling out (KC 常见 phrase)
-#   - all out / out half / out full / out majority (KC 平仓惯用短语)
-# 保守起见还是不加 selling / cutting / dumping —— 这些在开仓评论里也常见，
-# 加进来会误把 open 信号路由到 close 路径。
+# 双层结构（7/6 review 修复，替代旧的单一 CLOSE_KEYWORDS）：
+# - 强关键词：几乎只出现在平仓语境（closed/sold/trimmed/平仓...），命中即 CLOSE
+# - 弱关键词：在开仓语境同样常见，只有文本里**没有**明确开仓动词时才按 CLOSE 路由
+#   实测踩坑（弱词直接进 CLOSE_KEYWORDS 的后果）：
+#     "Buying $QQQ 560c into the closing bell @ 1.35" → 'closing' 误路由 CLOSE
+#       → close_parser 抽到 QQQ+strike hint → **反向卖出**
+#     "Going all out on $NVDA 200c here @ 3.50"      → 'all out' 同上
+#   'selling' 旧版被排除在外（怕误伤开仓评论），代价是
+#     "Selling $MSFT 390c here @ 5.20" 走 OPEN parser → Pattern C 把它当**买入**。
+#     现在作为弱关键词：无开仓动词 → CLOSE；有 → OPEN。
 #
-# 7/6 复盘补充：
-#   - "Scaling down to 1/2 position sizing"（EN）没进 close 路径 → 加 scaling down
-#   - ZH 翻译版 "减持1/3" / "缩减至 1/2" 同样漏 → 加 减持 / 缩减至|缩减到
+# 7/6 复盘补充（并入双层结构）：
+#   - "Scaling down to 1/2 position sizing" → scaling down 放弱词层
+#     （"adding..., scaling down size" 类开仓语境靠 OPEN_INTENT 豁免）
+#   - ZH "减持1/3" / "缩减至 1/2" → 减持 / 缩减至|缩减到 放强词层
 #     （不加裸 "缩减"：会误伤 "缩减购债" 类宏观评论）
-CLOSE_KEYWORDS = re.compile(
-    r"\b(closed?|closing|sold|exit|stopped|trim|trimmed|out of|scaling\s+(?:out|down))\b"
-    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
+STRONG_CLOSE_RE = re.compile(
+    r"\b(closed?|sold|exit|stopped|trim|trimmed|out of|scaling\s+out)\b"
     r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到",
+    re.I,
+)
+WEAK_CLOSE_RE = re.compile(
+    r"\bclosing\b(?!\s+bell)"          # 'closing bell' 是时间状语不是动作
+    r"|(?<!going\s)\ball\s+out\b"      # 'going all out' 是开仓情绪不是平仓
+    r"|\bout\s+(?:half|full|majority)\b"
+    r"|\bselling\b"
+    r"|\bscaling\s+down\b",
+    re.I,
+)
+OPEN_INTENT_RE = re.compile(
+    r"\b(buy(?:ing)?|bought|add(?:ing|ed)?|grab(?:bed|bing)?|"
+    r"load(?:ing|ed)?|bto|enter(?:ed|ing)?|entry|in at)\b",
     re.I,
 )
 
 
 def detect_action(text: str) -> str:
-    if CLOSE_KEYWORDS.search(text):
+    if STRONG_CLOSE_RE.search(text):
+        return "CLOSE"
+    if WEAK_CLOSE_RE.search(text) and not OPEN_INTENT_RE.search(text):
         return "CLOSE"
     return "OPEN"

@@ -240,3 +240,34 @@ def test_feb30_returns_none():
 def test_feb29_non_leap_skips_to_valid_year():
     """2/29 在 2026/2027/2025 都无效 → 三个候选年全跳过 → None（不炸）。"""
     assert parse_signal("$NVDA 150c 2/29 @ 2.00", msg_ts=FIXED_TODAY) is None
+
+
+# === detect_action 强/弱关键词回归 ===
+
+def test_detect_action_closing_bell_is_open():
+    """'closing bell' 是时间状语——带买入动词的消息必须路由 OPEN。
+    回归：旧版 'closing' 无条件命中 → 反向卖出。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action("Buying $QQQ 560c into the closing bell @ 1.35") == "OPEN"
+
+
+def test_detect_action_going_all_out_is_open():
+    from src.parser.signal_parser import detect_action
+    assert detect_action("Going all out on $NVDA 200c here @ 3.50") == "OPEN"
+
+
+def test_detect_action_closing_runner_still_close():
+    """7/3 案例：无开仓动词的 'closing ...' 仍然路由 CLOSE。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action("closing the MSFT 390c runner here at 5.00") == "CLOSE"
+
+
+def test_detect_action_all_out_still_close():
+    from src.parser.signal_parser import detect_action
+    assert detect_action("all out TSLA @ 8.05") == "CLOSE"
+
+
+def test_detect_action_selling_without_open_verb_is_close():
+    """回归：'Selling $MSFT 390c @ 5.20' 旧版走 OPEN parser → Pattern C 误买入。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action("Selling $MSFT 390c here @ 5.20") == "CLOSE"

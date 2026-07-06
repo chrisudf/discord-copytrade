@@ -65,8 +65,12 @@ BULK_MARKERS = [
 ]
 
 # 当前动作（gerund / 完成时）—— 真要动手的信号
-# 与 signal_parser.CLOSE_KEYWORDS 保持同步，否则 detect_action 说 CLOSE 但这里
-# _has_action_verb 说没动词 → close_parser 返回 None（7/3 "all out TSLA" 案例）
+# 与 signal_parser 的 STRONG/WEAK_CLOSE_RE 保持同步，否则 detect_action 说 CLOSE
+# 但这里 _has_action_verb 说没动词 → close_parser 返回 None（7/3 "all out TSLA" 案例）
+#
+# 多词 "out" 短语必须带词边界匹配——之前用 plain substring，
+# "overall outlook" 跨词边界含 "all out"（over[all out]look），
+# 把普通 trim 误升级成 100% 全平（实测 "Trimmed SPY ... overall outlook" 案例）。
 ACTION_VERBS = [
     "trimming", "trimmed",
     "cutting", "cut ",        # "cut " 加空格避免匹配 "scout/circuit"
@@ -76,13 +80,17 @@ ACTION_VERBS = [
     "scaling out",
     "scaling down",           # 7/6 "Scaling down to 1/2 position sizing"
     "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
-    # KC 常用 "out" 短语（多词 phrase，双 layer 加入避免 false positive）
-    "all out", "out half", "out full", "out majority",
 ]
 
+# "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
+# substring 匹配——见上方 "overall outlook" 案例）
+_OUT_PHRASE_RE = re.compile(
+    r"\ball\s+out\b|\bout\s+(?:half|full|majority)\b", re.IGNORECASE,
+)
+_OUT_FULL_CLOSE_RE = re.compile(r"\ball\s+out\b|\bout\s+full\b", re.IGNORECASE)
+
 # 全平动词（pct 缺省 → 100）
-FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping",
-                    "all out", "out full"]
+FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
 
 # 提取百分比："25%" / "20 %"
 # 排除 `-15%` `+30%` 这类 PnL 标注（前面有符号/数字 → 不是 trim 比例）
@@ -262,19 +270,26 @@ def _has_bulk_marker(text_lower: str) -> bool:
 
 
 def _has_action_verb(text_lower: str) -> bool:
-    return any(v in text_lower for v in ACTION_VERBS)
+    return (
+        any(v in text_lower for v in ACTION_VERBS)
+        or bool(_OUT_PHRASE_RE.search(text_lower))
+    )
 
 
 def _has_full_close_verb(text_lower: str) -> bool:
-    return any(v in text_lower for v in FULL_CLOSE_VERBS)
+    return (
+        any(v in text_lower for v in FULL_CLOSE_VERBS)
+        or bool(_OUT_FULL_CLOSE_RE.search(text_lower))
+    )
 
 
-_ACTION_RE = re.compile("|".join(re.escape(v) for v in [
-    "trimming", "trimmed", "cutting", "cut ", "selling", "sold here",
-    "closing", "closed", "dumping", "dumped", "scaling out", "scaling down",
-    "bang!", "bang -",
-    "all out", "out half", "out full", "out majority",
-]), re.IGNORECASE)
+# 分句 scope 用：单词动词加 \b 边界；"out" 短语与 _OUT_PHRASE_RE 同边界规则
+_ACTION_RE = re.compile(
+    r"\b(?:trimming|trimmed|cutting|selling|closing|closed|dumping|dumped)\b"
+    r"|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
+    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b",
+    re.IGNORECASE,
+)
 
 
 def _action_sentences(text: str) -> str:
@@ -409,6 +424,13 @@ def _extract_pct(text: str, text_lower: str) -> int:
     if pct_m:
         n = int(pct_m.group(1))
         return max(1, min(100, n))
+
+    # 显式份额短语：比 33% 默认值语义更强，但弱于明确的数字 %
+    # "out half" = 卖一半；"out majority/most" = 卖大部分（75% 经验值，实测调整）
+    if re.search(r"\bout\s+half\b", scope, re.I):
+        return 50
+    if re.search(r"\bout\s+(?:majority|most)\b", scope, re.I):
+        return 75
 
     return 100 if _has_full_close_verb(text_lower) else 33
 
