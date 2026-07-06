@@ -271,3 +271,48 @@ def test_detect_action_selling_without_open_verb_is_close():
     """回归：'Selling $MSFT 390c @ 5.20' 旧版走 OPEN parser → Pattern C 误买入。"""
     from src.parser.signal_parser import detect_action
     assert detect_action("Selling $MSFT 390c here @ 5.20") == "CLOSE"
+
+
+# === Pattern C 收紧回归 ===
+
+def test_pattern_c_ignores_target_price_commentary():
+    """回归：裸 '$5' 目标价曾被 Pattern C 当 entry → 评论变买单。"""
+    assert parse_signal(
+        "Chart update: $MSFT 390c looking great, target $5", msg_ts=FIXED_TODAY
+    ) is None
+
+
+def test_pattern_c_half_size_not_expiry():
+    """回归：'1/2 size' 曾被当成 1 月 2 日 → 跨年推到下一年。"""
+    r = parse_signal("Adding $APLD 50c weeklies 1/2 size @ .98", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["price"] == 0.98
+    # weekly 默认下一个周五 6/19，Juneteenth 假日前移到 6/18
+    assert r["expiry_date"] == date(2026, 6, 18)
+
+
+def test_pattern_c_fill_style_still_works():
+    r = parse_signal("$APLD 50p 7/2 .85 fill", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["side"] == "PUT"
+    assert r["price"] == 0.85
+    assert r["expiry_date"] == date(2026, 7, 2)
+
+
+# === holding 状态贴回归 ===
+
+def test_holding_dollar_ticker_skipped():
+    r = parse_signal("Holding $APLD 50c weeklies @ .98 into CPI", msg_ts=FIXED_TODAY)
+    assert r == {"skip": "holding_or_remaining"}
+
+
+def test_holding_bare_ticker_skipped():
+    r = parse_signal("Holding TSLA 420c 7/11 from 2.50 now @ 4.20", msg_ts=FIXED_TODAY)
+    assert r == {"skip": "holding_or_remaining"}
+
+
+def test_holding_up_well_not_skipped():
+    """6/23 回归方向不变：'holding up well' 是走势评论，真信号仍要解析。"""
+    r = parse_signal("$APLD weekly $50 calls $.66 - holding up well", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "APLD"

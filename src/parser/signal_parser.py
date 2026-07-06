@@ -115,6 +115,12 @@ SKIP_KEYWORDS = [
     "holding into", "holding overnight", "holding tight",
 ]
 
+# "Holding <TICKER>" / "Holding $<TICKER>" —— 上面的短语清单接不住
+# 直接跟 ticker 的写法（"Holding TSLA 420c ... now @ 4.20" 是状态贴，
+# 不 skip 会被 Pattern A/C 当新买单）。ticker 要求全大写 2-5 位，
+# 所以 "holding up well" (up 小写) 不受影响。
+_HOLDING_TICKER_RE = re.compile(r"\b[Hh]olding\s+\$?[A-Z]{2,5}\b")
+
 PRICE_RANGE_PATTERN = re.compile(
     r"\$\.?\d+(?:\.\d+)?\s*(?:-|to|~)\s*\$?\.?\d+(?:\.\d+)?",
     re.IGNORECASE,
@@ -183,7 +189,7 @@ def parse_signal(text: str, msg_ts: date = None):
     if not text or len(text.strip()) < 5:
         return None
 
-    if _has_skip_keyword(text):
+    if _has_skip_keyword(text) or _HOLDING_TICKER_RE.search(text):
         logger.info(f"[parser] skip (holding/remaining): {text[:60]}")
         return {"skip": "holding_or_remaining"}
 
@@ -484,8 +490,15 @@ def _try_pattern_c(text: str, today: date):
     after_clean = re.sub(r"@role_\d+", " ", after)
 
     # 找 expiry
+    # M/D 后面跟 size/position 类词的是仓位描述不是日期（"1/2 size" 曾被
+    # 解析成 1 月 2 日 → smart_expiry 跨年推到下一年年初）；月份范围也要校验
     expiry_str = "weekly"
-    mmdd = re.search(r"\b(\d{1,2})/(\d{1,2})\b", after_clean[:80])
+    mmdd = re.search(
+        r"\b(\d{1,2})/(\d{1,2})\b(?!\s*(?:size|sized|position|pos\b|risk))",
+        after_clean[:80],
+    )
+    if mmdd and not (1 <= int(mmdd.group(1)) <= 12 and 1 <= int(mmdd.group(2)) <= 31):
+        mmdd = None
     dte = re.search(r"\b(\d+)\s*dte\b", after_clean[:80], re.I)
     if mmdd:
         mm, dd = int(mmdd.group(1)), int(mmdd.group(2))
@@ -498,14 +511,15 @@ def _try_pattern_c(text: str, today: date):
     else:
         expiry_date = _adjust_expiry(_next_friday(today), context="C weekly")
 
-    # 找价格：按从严到宽依次扫
+    # 找价格：只接受带明确"成交"语义的写法（@ 前缀 / fill 后缀）。
+    # 不再接受裸 "$N"——那是把评论/目标价当 entry 的主要来源
+    # （"$MSFT 390c looking great, target $5" 曾被解析成 @5 买入）。
     price = None
     for pattern in (
         r"@\s*\$\s*(\.?\d+(?:\.\d+)?)",         # @$.98 / @$ 0.98
         r"@\s*(\.?\d+(?:\.\d+)?)\b",            # @.98 / @0.98
         r"fill(?:ed)?\s*@\s*\$?\s*(\.?\d+(?:\.\d+)?)",  # filled @ .98
         r"(\.?\d+(?:\.\d+)?)\s*fill(?:ed)?\b",  # .98 fill (用户实际信号)
-        r"\$\s*(\.?\d+(?:\.\d+)?)\b",           # $.98 / $0.98
     ):
         m = re.search(pattern, after_clean, re.I)
         if m:
