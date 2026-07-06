@@ -228,20 +228,36 @@ def _extract_et_date(message) -> "date":
 # ============================================================
 # Discord events
 # ============================================================
+
+# on_ready 每次 gateway 重连都会触发（约 20-30 min 一次），
+# 频道校验 + TG 报警只做一次，避免重连刷屏 + REST 限流
+_channels_validated = False
+
+
 @client.event
 async def on_ready():
+    global _channels_validated
     logger.info(f"Discord logged in as: {client.user} (id={client.user.id})")
+    if _channels_validated:
+        return
+    _channels_validated = True
+
     failures = await validate_channels(client)
     if failures:
-        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        lines = "\n".join(
+            f"• {name} (id={cid}): {reason}" for cid, name, reason, _ in failures
+        )
         await _safe_notify(format_error(
             "频道配置校验失败",
             f"{len(failures)}/{len(registry.enabled_channel_ids())} 个频道无法解析:\n{lines}\n\n"
             f"请检查 config/channels.json 的 channel_id"
         ))
-        if len(failures) == len(registry.enabled_channel_ids()):
+        # 只有全部失败且**全部是确定性失败**（404/403 = 配置真的错了）才退出；
+        # 网络抖动/限流这类瞬时失败重连后会自愈，退出反而把 bot 干死在夜里
+        all_definitive = all(definitive for _, _, _, definitive in failures)
+        if len(failures) == len(registry.enabled_channel_ids()) and all_definitive:
             logger.error(
-                "❌ 所有 enabled 频道都校验失败，listener 没有任何消息源 — 退出。"
+                "❌ 所有 enabled 频道都确定性校验失败，listener 没有任何消息源 — 退出。"
                 " 修复 config/channels.json 后重启。"
             )
             await client.close()
@@ -805,8 +821,11 @@ async def _handle_close_signal(raw: str, msg_id: int):
 
 import re as _re
 
-# 现成的"开仓"句法特征：含 $TICKER + (Nc/p|calls/puts) + 价格-like 数字
-_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b")
+# 现成的"开仓"句法特征：含 TICKER + (Nc/p|calls/puts) + 价格-like 数字
+# ticker 同时接受 $ 前缀和裸大写（parser 的 Pattern A 本身就是裸 ticker 语法，
+# 只认 $ 会把 "TSLA 250c 7/11 @ 1.20 好像没接住" 这类真漏检静默掉）。
+# 裸大写词（BANG/OK 等）会带来一点过报，但这只是 TG 告警闸门，宁多勿漏。
+_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b")
 _OPEN_SIDE_RE = _re.compile(r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b", _re.I)
 # 价格写法：$X.XX / @X.XX / .98 fill / .98 filled
 _OPEN_PRICE_RE = _re.compile(

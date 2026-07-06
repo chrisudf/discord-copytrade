@@ -168,7 +168,9 @@ async def on_ready():
     enabled_count = len(registry.enabled_channel_ids())
 
     if failures:
-        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        lines = "\n".join(
+            f"• {name} (id={cid}): {reason}" for cid, name, reason, _ in failures
+        )
         try:
             await send_telegram(
                 f"⚠️ 频道配置校验失败\n"
@@ -178,9 +180,11 @@ async def on_ready():
             )
         except Exception as e:
             logger.warning(f"Telegram channel-failure notify failed: {e}")
-        if len(failures) == enabled_count:
+        # 只有全部失败且全部确定性（404/403）才退出；瞬时失败重连自愈
+        all_definitive = all(definitive for _, _, _, definitive in failures)
+        if len(failures) == enabled_count and all_definitive:
             logger.error(
-                "❌ 所有 enabled 频道都校验失败，listener 没有消息源 — 退出。"
+                "❌ 所有 enabled 频道都确定性校验失败，listener 没有消息源 — 退出。"
                 " 修复 config/channels.json 后重启。"
             )
             await client.close()
