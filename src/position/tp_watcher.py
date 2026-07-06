@@ -71,54 +71,63 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
         return
     _triggered_this_tick.add(key)
 
-    qty_to_sell = max(1, round(pos["qty_remaining"] * trim_pct / 100))
-    qty_to_sell = min(qty_to_sell, pos["qty_remaining"])
-    limit = round(last_price * (1 - sell_slip), 2)
-    if limit <= 0:
-        limit = 0.01
+    async with position_mgr.sell_lock(code):
+        # 锁内重读：等锁期间可能已被 SL/EOD/CLOSE 卖掉，或同档已被标记
+        pos = position_mgr.get(code) or pos
+        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+            logger.debug(f"[tp] {code} already closed while waiting for lock, skip")
+            return
+        if pos["tp_hits"] & tier_bit:
+            return
 
-    logger.info(
-        f"[tp] 🎯 T{tier_bit} HIT {code}: last={last_price:.2f} "
-        f">= entry*({1+threshold_pct:.2f})={pos['avg_entry_price']*(1+threshold_pct):.2f}, "
-        f"selling {qty_to_sell}/{pos['qty_remaining']} @ {limit}"
-    )
+        qty_to_sell = max(1, round(pos["qty_remaining"] * trim_pct / 100))
+        qty_to_sell = min(qty_to_sell, pos["qty_remaining"])
+        limit = round(last_price * (1 - sell_slip), 2)
+        if limit <= 0:
+            limit = 0.01
 
-    try:
-        result = await asyncio.to_thread(
-            place_sell_order,
-            option_code=code, qty=qty_to_sell,
-            limit_price=limit, remark=f"tp_t{tier_bit}",
+        logger.info(
+            f"[tp] 🎯 T{tier_bit} HIT {code}: last={last_price:.2f} "
+            f">= entry*({1+threshold_pct:.2f})={pos['avg_entry_price']*(1+threshold_pct):.2f}, "
+            f"selling {qty_to_sell}/{pos['qty_remaining']} @ {limit}"
         )
-    except Exception as e:
-        logger.exception("[tp] place_sell_order failed")
-        _triggered_this_tick.discard(key)
-        await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
-        return
 
-    if not result.get("success"):
-        err = result.get("message", "unknown")
-        logger.error(f"[tp] sell rejected: {err}")
-        _triggered_this_tick.discard(key)
-        await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
-        return
+        try:
+            result = await asyncio.to_thread(
+                place_sell_order,
+                option_code=code, qty=qty_to_sell,
+                limit_price=limit, remark=f"tp_t{tier_bit}",
+            )
+        except Exception as e:
+            logger.exception("[tp] place_sell_order failed")
+            _triggered_this_tick.discard(key)
+            await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
+            return
 
-    # 先持久化档位（即使下面 on_close_filled 出错也不会重复触发同档）
-    try:
-        positions_db.mark_tp_hit(code, tier_bit)
-    except Exception as e:
-        logger.error(f"[tp] mark_tp_hit failed: {e}")
+        if not result.get("success"):
+            err = result.get("message", "unknown")
+            logger.error(f"[tp] sell rejected: {err}")
+            _triggered_this_tick.discard(key)
+            await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
+            return
 
-    try:
-        position_mgr.on_close_filled(
-            option_code=code,
-            qty_sold=result.get("qty", qty_to_sell),
-            fill_price=result.get("price", limit),
-            trigger_source="tp_polling",
-            order_id=result.get("order_id"),
-            note=f"TP T{tier_bit} +{int(threshold_pct*100)}%: last={last_price:.2f}",
-        )
-    except Exception as e:
-        logger.error(f"[tp] on_close_filled failed: {e}")
+        # 先持久化档位（即使下面 on_close_filled 出错也不会重复触发同档）
+        try:
+            positions_db.mark_tp_hit(code, tier_bit)
+        except Exception as e:
+            logger.error(f"[tp] mark_tp_hit failed: {e}")
+
+        try:
+            position_mgr.on_close_filled(
+                option_code=code,
+                qty_sold=result.get("qty", qty_to_sell),
+                fill_price=result.get("price", limit),
+                trigger_source="tp_polling",
+                order_id=result.get("order_id"),
+                note=f"TP T{tier_bit} +{int(threshold_pct*100)}%: last={last_price:.2f}",
+            )
+        except Exception as e:
+            logger.error(f"[tp] on_close_filled failed: {e}")
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

@@ -4,6 +4,7 @@
 """
 import asyncio
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch, AsyncMock
 from zoneinfo import ZoneInfo
@@ -335,3 +336,51 @@ async def test_eod_skips_before_window():
     # 不清会被下一个 test 的 _eod_tick 一锅端
     positions_db.record_close(code, qty_sold=1, fill_price=1.0,
                               trigger_source="manual", note="ut cleanup")
+
+
+# ============ 卖出串行化 ============
+
+@pytest.mark.asyncio
+async def test_sell_lock_prevents_concurrent_double_sell():
+    """SL 与 EOD 并发触发同一仓位 → 只有一条卖单提交。
+
+    回归：之前四条卖出路径各自"读仓位 → await broker → 写 DB"，
+    两条路径可同时读到 qty_remaining=2 并各卖 2 张（broker 端超卖）。
+    现在 per-option_code 锁 + 锁内重读，后到者看到 CLOSED 直接跳过。
+    """
+    now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
+    while now_et.weekday() >= 5:
+        now_et = now_et - timedelta(days=1)
+    today_et = now_et.date()
+    code = _uniq_code("LCK")
+    positions_db.open_or_add(
+        option_code=code, symbol="LCKT", strike=10.0, side="CALL",
+        expiry=today_et, qty=2, fill_price=1.00,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+    sl_watcher._triggered.discard(code)
+    eod_watcher._skip_until.pop(code, None)
+
+    calls = []
+
+    def slow_sell(option_code, qty, limit_price, remark):
+        time.sleep(0.05)  # 模拟 broker RTT，制造并发窗口
+        calls.append((option_code, qty, remark))
+        return {"success": True, "qty": qty, "price": limit_price,
+                "order_id": f"ORD{len(calls)}", "code": option_code}
+
+    with patch("src.position.sl_watcher.place_sell_order", side_effect=slow_sell), \
+         patch("src.position.eod_watcher.place_sell_order", side_effect=slow_sell), \
+         patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.eod_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock), \
+         patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock):
+        pos = positions_db.get(code)
+        await asyncio.gather(
+            sl_watcher._trigger_sl(pos, 0.40, 0.50, 0.08),
+            eod_watcher._force_close(dict(pos), 0.10, now_et.timestamp()),
+        )
+
+    assert len(calls) == 1, f"expected exactly 1 sell order, got {calls}"
+    assert positions_db.get(code)["status"] == "CLOSED"

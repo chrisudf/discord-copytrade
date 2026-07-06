@@ -87,61 +87,68 @@ def _gc_skip(today_et: date_cls):
 async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     """单仓位强平。"""
     code = pos["option_code"]
-    qty = pos["qty_remaining"]
 
-    last = await asyncio.to_thread(get_last_price, code)
-    if last is None:
-        # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价
-        # backoff 30 分钟避免 30s tick 反复刷 TG
-        if _skip_until.get(code, 0) <= ts_now:
-            _skip_until[code] = ts_now + 1800
-            logger.warning(
-                f"[eod] no quote for {code}, refusing entry-fallback sell, "
-                f"manual close required"
+    async with position_mgr.sell_lock(code):
+        # 锁内重读：等锁期间可能已被 SL/TP/CLOSE 卖掉（部分或全部）
+        pos = position_mgr.get(code) or pos
+        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+            logger.debug(f"[eod] {code} already closed while waiting for lock, skip")
+            return
+        qty = pos["qty_remaining"]
+
+        last = await asyncio.to_thread(get_last_price, code)
+        if last is None:
+            # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价
+            # backoff 30 分钟避免 30s tick 反复刷 TG
+            if _skip_until.get(code, 0) <= ts_now:
+                _skip_until[code] = ts_now + 1800
+                logger.warning(
+                    f"[eod] no quote for {code}, refusing entry-fallback sell, "
+                    f"manual close required"
+                )
+                await send_telegram(format_error(
+                    "EOD 强平跳过：无报价",
+                    f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
+                    f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
+                    f"请在 moomoo 手动平仓"
+                ))
+            return
+
+        limit = max(0.01, round(last * (1 - sell_slip), 2))
+        logger.warning(
+            f"[eod] 🕒 force-close {code}: qty={qty} last={last:.2f} limit={limit}"
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                place_sell_order,
+                option_code=code, qty=qty,
+                limit_price=limit, remark="eod_force",
             )
-            await send_telegram(format_error(
-                "EOD 强平跳过：无报价",
-                f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
-                f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
-                f"请在 moomoo 手动平仓"
-            ))
-        return
+        except Exception as e:
+            logger.exception("[eod] place_sell_order failed")
+            _skip_until[code] = ts_now + 60  # 1 分钟后再试
+            await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
+            return
 
-    limit = max(0.01, round(last * (1 - sell_slip), 2))
-    logger.warning(
-        f"[eod] 🕒 force-close {code}: qty={qty} last={last:.2f} limit={limit}"
-    )
+        if not result.get("success"):
+            err = result.get("message", "unknown")
+            logger.error(f"[eod] sell rejected: {err}")
+            _skip_until[code] = ts_now + 60
+            await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
+            return
 
-    try:
-        result = await asyncio.to_thread(
-            place_sell_order,
-            option_code=code, qty=qty,
-            limit_price=limit, remark="eod_force",
-        )
-    except Exception as e:
-        logger.exception("[eod] place_sell_order failed")
-        _skip_until[code] = ts_now + 60  # 1 分钟后再试
-        await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
-        return
-
-    if not result.get("success"):
-        err = result.get("message", "unknown")
-        logger.error(f"[eod] sell rejected: {err}")
-        _skip_until[code] = ts_now + 60
-        await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
-        return
-
-    try:
-        position_mgr.on_close_filled(
-            option_code=code,
-            qty_sold=result.get("qty", qty),
-            fill_price=result.get("price", limit),
-            trigger_source="eod",
-            order_id=result.get("order_id"),
-            note=f"EOD force close (last={last:.2f})",
-        )
-    except Exception as e:
-        logger.error(f"[eod] on_close_filled failed: {e}")
+        try:
+            position_mgr.on_close_filled(
+                option_code=code,
+                qty_sold=result.get("qty", qty),
+                fill_price=result.get("price", limit),
+                trigger_source="eod",
+                order_id=result.get("order_id"),
+                note=f"EOD force close (last={last:.2f})",
+            )
+        except Exception as e:
+            logger.error(f"[eod] on_close_filled failed: {e}")
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

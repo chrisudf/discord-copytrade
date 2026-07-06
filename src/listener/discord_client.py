@@ -634,78 +634,91 @@ async def _handle_close_signal(raw: str, msg_id: int):
             positions = matched
 
         for pos in positions:
-            qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
-            if qty_to_sell <= 0:
-                # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
-                # 必须发专属 TG 并标记"已处理"——否则落到外层
-                # "no matching open positions" 兜底文案（7/6 IBM 两次实锤，
-                # 半夜看到会以为仓位状态错乱）
-                await _safe_notify(format_close_skipped(
-                    f"runner-preserve：{pos['symbol']} "
-                    f"{pos['strike']}{pos['side'][0]} 剩 1 张，"
-                    f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
-                    raw,
-                ))
-                any_executed = True
-                continue
-            limit = _calc_sell_limit(
-                pos["avg_entry_price"], parsed.get("signal_price"),
-            )
-            if limit is None:
-                # 信号没喊价 + OPRA 不可用 → 拒绝执行，TG 警报让人工接管
-                logger.warning(
-                    f"[CLOSE] no price ref for {pos['option_code']}, "
-                    f"skipping sell ({pct}%)"
+            # 卖出串行化：同一 option_code 上 SL/TP/EOD/CLOSE 四条路径互斥。
+            # 锁内重读仓位——等锁期间 watcher 可能已经卖过了。
+            async with position_mgr.sell_lock(pos["option_code"]):
+                fresh = position_mgr.get(pos["option_code"])
+                if fresh is not None:
+                    pos = fresh
+                if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+                    logger.info(
+                        f"[CLOSE] {pos['option_code']} already closed "
+                        f"while waiting for lock, skip"
+                    )
+                    any_executed = True  # 有人处理过了，不报 "no matching"
+                    continue
+                qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
+                if qty_to_sell <= 0:
+                    # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
+                    # 必须发专属 TG 并标记"已处理"——否则落到外层
+                    # "no matching open positions" 兜底文案（7/6 IBM 两次实锤，
+                    # 半夜看到会以为仓位状态错乱）
+                    await _safe_notify(format_close_skipped(
+                        f"runner-preserve：{pos['symbol']} "
+                        f"{pos['strike']}{pos['side'][0]} 剩 1 张，"
+                        f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
+                        raw,
+                    ))
+                    any_executed = True
+                    continue
+                limit = _calc_sell_limit(
+                    pos["avg_entry_price"], parsed.get("signal_price"),
                 )
-                await _safe_notify(format_error(
-                    "CLOSE 跳过：无价格参照",
-                    f"{pos['option_code']} qty={qty_to_sell} ({pct}%)\n"
-                    f"原因：信号无价 + OPRA 报价不可用\n"
-                    f"请在 moomoo 手动平仓\n\n"
-                    f"原文: {raw[:200]}"
-                ))
-                any_executed = True  # 算"处理过"，不让外层再发 "no matching" 提示
-                continue
-            logger.info(
-                f"[CLOSE] sell {pos['option_code']} qty={qty_to_sell} "
-                f"limit={limit} ({pct}%, ref=signal)"
-            )
-            try:
-                result = await asyncio.to_thread(
-                    place_sell_order,
-                    option_code=pos["option_code"],
-                    qty=qty_to_sell,
-                    limit_price=limit,
-                    remark=f"kc_close_{pct}pct",
+                if limit is None:
+                    # 信号没喊价 + OPRA 不可用 → 拒绝执行，TG 警报让人工接管
+                    logger.warning(
+                        f"[CLOSE] no price ref for {pos['option_code']}, "
+                        f"skipping sell ({pct}%)"
+                    )
+                    await _safe_notify(format_error(
+                        "CLOSE 跳过：无价格参照",
+                        f"{pos['option_code']} qty={qty_to_sell} ({pct}%)\n"
+                        f"原因：信号无价 + OPRA 报价不可用\n"
+                        f"请在 moomoo 手动平仓\n\n"
+                        f"原文: {raw[:200]}"
+                    ))
+                    any_executed = True  # 算"处理过"，不让外层再发 "no matching" 提示
+                    continue
+                logger.info(
+                    f"[CLOSE] sell {pos['option_code']} qty={qty_to_sell} "
+                    f"limit={limit} ({pct}%, ref=signal)"
                 )
-            except Exception as e:
-                logger.exception("place_sell_order failed")
-                await _safe_notify(format_error("Sell order error", str(e)))
-                any_executed = True  # 持仓找到了只是 broker 异常，不再报 "no matching"
-                continue
+                try:
+                    result = await asyncio.to_thread(
+                        place_sell_order,
+                        option_code=pos["option_code"],
+                        qty=qty_to_sell,
+                        limit_price=limit,
+                        remark=f"kc_close_{pct}pct",
+                    )
+                except Exception as e:
+                    logger.exception("place_sell_order failed")
+                    await _safe_notify(format_error("Sell order error", str(e)))
+                    any_executed = True  # 持仓找到了只是 broker 异常，不再报 "no matching"
+                    continue
 
-            if not result.get("success"):
-                err = result.get("message", "unknown")
-                logger.error(f"[CLOSE] sell rejected: {err}")
-                await _safe_notify(format_error(
-                    "Sell rejected by broker",
-                    f"{pos['option_code']} qty={qty_to_sell}\n{err}",
-                ))
-                any_executed = True  # 持仓找到了只是 broker 拒单，不再报 "no matching"
-                continue
+                if not result.get("success"):
+                    err = result.get("message", "unknown")
+                    logger.error(f"[CLOSE] sell rejected: {err}")
+                    await _safe_notify(format_error(
+                        "Sell rejected by broker",
+                        f"{pos['option_code']} qty={qty_to_sell}\n{err}",
+                    ))
+                    any_executed = True  # 持仓找到了只是 broker 拒单，不再报 "no matching"
+                    continue
 
-            try:
-                position_mgr.on_close_filled(
-                    option_code=pos["option_code"],
-                    qty_sold=result.get("qty", qty_to_sell),
-                    fill_price=result.get("price", limit),
-                    trigger_source="kc_signal",
-                    ref_msg_id=str(msg_id),
-                    order_id=result.get("order_id"),
-                    note=f"pct={pct} matched={parsed['matched'][:60]}",
-                )
-            except Exception as e:
-                logger.error(f"on_close_filled failed: {e}")
+                try:
+                    position_mgr.on_close_filled(
+                        option_code=pos["option_code"],
+                        qty_sold=result.get("qty", qty_to_sell),
+                        fill_price=result.get("price", limit),
+                        trigger_source="kc_signal",
+                        ref_msg_id=str(msg_id),
+                        order_id=result.get("order_id"),
+                        note=f"pct={pct} matched={parsed['matched'][:60]}",
+                    )
+                except Exception as e:
+                    logger.error(f"on_close_filled failed: {e}")
 
             await _safe_notify(format_close_filled(
                 pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

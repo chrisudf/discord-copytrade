@@ -66,51 +66,59 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         return
     _triggered.add(code)
 
-    qty = pos["qty_remaining"]
-    limit = round(last_price * (1 - sell_slip), 2)
-    if limit <= 0:
-        # 极低价兜底——0.01 起挂
-        limit = 0.01
+    async with position_mgr.sell_lock(code):
+        # 锁内重读：等锁期间可能已被 TP/EOD/CLOSE 卖掉（部分或全部）
+        pos = position_mgr.get(code) or pos
+        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+            logger.debug(f"[sl] {code} already closed while waiting for lock, skip")
+            _triggered.discard(code)  # 没有卖出发生，维持 set 只含"已卖未落库"的不变式
+            return
 
-    logger.warning(
-        f"[sl] 🛑 TRIGGER {code}: last={last_price:.2f} <= threshold={threshold:.2f} "
-        f"(entry={pos['avg_entry_price']:.2f}), selling {qty} @ {limit}"
-    )
+        qty = pos["qty_remaining"]
+        limit = round(last_price * (1 - sell_slip), 2)
+        if limit <= 0:
+            # 极低价兜底——0.01 起挂
+            limit = 0.01
 
-    try:
-        result = await asyncio.to_thread(
-            place_sell_order,
-            option_code=code, qty=qty,
-            limit_price=limit, remark="sl_polling",
+        logger.warning(
+            f"[sl] 🛑 TRIGGER {code}: last={last_price:.2f} <= threshold={threshold:.2f} "
+            f"(entry={pos['avg_entry_price']:.2f}), selling {qty} @ {limit}"
         )
-    except Exception as e:
-        logger.exception("[sl] place_sell_order failed")
-        await send_telegram(format_error("SL sell error", f"{code}\n{e}"))
-        _triggered.discard(code)  # 让下一轮重试
-        return
 
-    if not result.get("success"):
-        err = result.get("message", "unknown")
-        logger.error(f"[sl] sell rejected: {err}")
-        await send_telegram(format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
-        _triggered.discard(code)
-        return
+        try:
+            result = await asyncio.to_thread(
+                place_sell_order,
+                option_code=code, qty=qty,
+                limit_price=limit, remark="sl_polling",
+            )
+        except Exception as e:
+            logger.exception("[sl] place_sell_order failed")
+            await send_telegram(format_error("SL sell error", f"{code}\n{e}"))
+            _triggered.discard(code)  # 让下一轮重试
+            return
 
-    try:
-        position_mgr.on_close_filled(
-            option_code=code,
-            qty_sold=result.get("qty", qty),
-            fill_price=result.get("price", limit),
-            trigger_source="sl_polling",
-            order_id=result.get("order_id"),
-            note=f"SL: last={last_price:.2f} threshold={threshold:.2f} entry={pos['avg_entry_price']:.2f}",
-        )
-        # DB 已转 CLOSED —— 释放 code，同合约日后 reopen 时 SL 仍然有效
-        _triggered.discard(code)
-    except Exception as e:
-        # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
-        # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单
-        logger.error(f"[sl] on_close_filled failed: {e}")
+        if not result.get("success"):
+            err = result.get("message", "unknown")
+            logger.error(f"[sl] sell rejected: {err}")
+            await send_telegram(format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
+            _triggered.discard(code)
+            return
+
+        try:
+            position_mgr.on_close_filled(
+                option_code=code,
+                qty_sold=result.get("qty", qty),
+                fill_price=result.get("price", limit),
+                trigger_source="sl_polling",
+                order_id=result.get("order_id"),
+                note=f"SL: last={last_price:.2f} threshold={threshold:.2f} entry={pos['avg_entry_price']:.2f}",
+            )
+            # DB 已转 CLOSED —— 释放 code，同合约日后 reopen 时 SL 仍然有效
+            _triggered.discard(code)
+        except Exception as e:
+            # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
+            # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单
+            logger.error(f"[sl] on_close_filled failed: {e}")
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

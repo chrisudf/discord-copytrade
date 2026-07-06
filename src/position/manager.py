@@ -15,6 +15,7 @@ TODO（测试调整）：
   query_order_status 拿 dealt_avg_price，回填 avg_entry_price
 - on_close_filled 没算实际 PnL，等真实 fill 数据接入后补
 """
+import asyncio
 import math
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -28,6 +29,35 @@ ET_TZ = ZoneInfo("America/New_York")
 
 def _today_et() -> date:
     return datetime.now(timezone.utc).astimezone(ET_TZ).date()
+
+
+# ============ 卖出串行化 ============
+# 每个 option_code 一把 asyncio.Lock，序列化四条卖出路径
+# （kc_close / sl_polling / tp_polling / eod_force）。
+#
+# 背景：每条路径都是"读仓位 → await broker(to_thread) → 写 DB"，
+# 读与写之间有秒级窗口，两条路径可能同时读到 qty_remaining=N 并各卖 N 张。
+# DB 端 record_close 的 clamp 会把超卖藏起来，broker 端则可能变成重复卖单
+# （naked-short check 只在真盘生效，且自身是 check-then-act，拦不住并发）。
+#
+# 用法约定：拿到锁后必须用 manager.get(option_code) 重读仓位再决定卖多少，
+# 不能用锁外读到的旧 dict。
+#
+# dict 无界但 key 数 = 历史 option_code 数（个人跟单场景一天个位数），不做 GC。
+_sell_locks: dict[str, asyncio.Lock] = {}
+
+
+def sell_lock(option_code: str) -> asyncio.Lock:
+    """取（或创建）该 option_code 的卖出锁。单 event loop 下无竞态。"""
+    lock = _sell_locks.get(option_code)
+    if lock is None:
+        lock = _sell_locks.setdefault(option_code, asyncio.Lock())
+    return lock
+
+
+def get(option_code: str) -> Optional[dict]:
+    """按 option_code 取当前仓位（含 CLOSED）。卖出路径锁内重读用。"""
+    return positions_db.get(option_code)
 
 
 def on_order_filled(
