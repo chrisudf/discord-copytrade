@@ -268,6 +268,37 @@ async def test_eod_force_closes_matching_expiry():
 
 
 @pytest.mark.asyncio
+async def test_eod_force_closes_weekly_expiring_today():
+    """周初开的 weekly（eod_force_close=False）到期日当天也必须被强平。
+
+    回归：老逻辑要求 eod_force_close=True，而该 flag 只在开仓当天 DTE==0 时置位，
+    导致提前几天开的仓位在到期日直接过期（ITM 自动行权）。
+    """
+    now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
+    while now_et.weekday() >= 5:
+        now_et = now_et - timedelta(days=1)
+    today_et = now_et.date()
+    code = _uniq_code("EODW")
+    positions_db.open_or_add(
+        option_code=code, symbol="EODTW", strike=10.0, side="CALL",
+        expiry=today_et, qty=2, fill_price=1.00,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+
+    with patch("src.position.eod_watcher.get_last_price", return_value=0.30), \
+         patch("src.position.eod_watcher.place_sell_order",
+               return_value={"success": True, "qty": 2, "price": 0.27,
+                             "order_id": "EOD_ORD_W", "code": code}), \
+         patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock), \
+         patch("src.position.eod_watcher._is_eod_window", return_value=True):
+        await eod_watcher._eod_tick(now_et)
+
+    pos = positions_db.get(code)
+    assert pos["status"] == "CLOSED"
+
+
+@pytest.mark.asyncio
 async def test_eod_skips_future_expiry():
     """eod_force_close=True 但 expiry 不是今天 → 不动"""
     future = date(2026, 12, 19)

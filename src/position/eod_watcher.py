@@ -3,7 +3,9 @@
 职责：
 - 每 EOD_CHECK_INTERVAL 秒检查 ET 时间
 - 到 EOD_HOUR:EOD_MIN（默认 15:50 ET）后，平掉所有
-  eod_force_close=True 且 expiry==today_et 且 status IN (OPEN, PARTIAL) 的仓位
+  expiry==today_et 且 status IN (OPEN, PARTIAL) 的仓位
+  （不看 eod_force_close flag —— 该 flag 只反映开仓时刻 DTE==0，
+   周初开的 weekly 到周五到期时 flag 是 False，但同样必须在过期前平掉）
 - 是工作日才执行（避免周末本地测试误触发）
 
 设计：
@@ -158,10 +160,16 @@ async def _eod_tick(now_et: datetime):
     _gc_skip(now_et.date())
     ts_now = now_et.timestamp()
 
+    # 只看 expiry == today，不看 eod_force_close flag。
+    #
+    # 原因：eod_force_close 在**开仓时**由 categorize() 一次性算出（DTE==0 才 True），
+    # 之后不再重算。周一买的 weekly 周五到期时，它的 flag 还是 False —— 老逻辑
+    # 会让它在到期日直接过期（ITM 被自动行权，变成一笔没打算持有的正股/保证金头寸）。
+    # "0DTE 当天必过期，必须平"这个理由对**任何**到期日当天的仓位都成立，
+    # 所以这里用 expiry 本身判断。flag 保留在 DB 里仅作开仓时刻的信息性标注。
     positions = [
         p for p in position_mgr.get_open_positions()
-        if p.get("eod_force_close")
-        and p["expiry"] == today_iso
+        if p["expiry"] == today_iso
         and p["qty_remaining"] > 0
         and _skip_until.get(p["option_code"], 0) <= ts_now
     ]
