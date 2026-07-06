@@ -40,7 +40,11 @@ from src.utils.logger import logger
 
 
 def _cfg() -> dict:
-    """实时读取配置，便于 .env 改动不重启即生效（与 DRY_RUN 同策略）。"""
+    """每次调用重读 os.environ（方便测试 monkeypatch）。
+
+    注意：这**不是** .env 热更新——load_dotenv 只在 import 时跑一次，
+    运行中编辑 config/.env 不会生效，改配置需要重启进程。
+    """
     return {
         "sl_pct": float(os.getenv("STOP_LOSS_PCT", "0.50")),
         "interval": int(os.getenv("SL_POLL_INTERVAL", "5")),
