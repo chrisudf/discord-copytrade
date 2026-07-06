@@ -637,6 +637,10 @@ async def _handle_close_signal(raw: str, msg_id: int):
 
     hint_strike = parsed.get("hint_strike")
     hint_side = parsed.get("hint_side")
+    # hint 是从 symbols[0] 附近抽的（见 close_parser._extract_strike_hint），
+    # 只能约束**那一个** symbol。用 TSLA 的 420c 去过滤 MSFT 的持仓，
+    # 会把 MSFT 的平仓静默跳过（"Trimmed TSLA 420c and MSFT here" 案例）。
+    hint_source_symbol = (parsed.get("symbols") or [None])[0]
 
     for symbol in targets:
         positions = position_mgr.find_by_symbol(symbol)
@@ -647,7 +651,8 @@ async def _handle_close_signal(raw: str, msg_id: int):
         # strike-aware filter：close 文本里显式给了 strike+side 时只关匹配的仓位。
         # 背景见 [docs/lessons.md](docs/lessons.md) #11：6/30 KC 平 TSLA 420c
         # 触发我们平 TSLA 425c，这次运气好两个 strike 价差小，下次未必。
-        if hint_strike is not None and hint_side is not None:
+        # 只对 hint 所属的 symbol 生效（多 symbol close 的其余 symbol 不受约束）。
+        if hint_strike is not None and hint_side is not None and symbol == hint_source_symbol:
             matched = [
                 p for p in positions
                 if p["strike"] == hint_strike and p["side"] == hint_side

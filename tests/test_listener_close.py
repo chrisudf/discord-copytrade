@@ -372,3 +372,47 @@ async def test_deterministic_skip_registers_fp_no_twin_spam():
     )
 
     positions_db.record_close(code, 1, 2.0, "manual", note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_multi_symbol_close_hint_only_scopes_first_symbol():
+    """'Trimmed TSLA 420c and MSFT here' —— strike hint 来自 TSLA，
+    不能拿去过滤 MSFT 的持仓（回归：MSFT 平仓被静默跳过）。"""
+    os.environ["DRY_RUN"] = "true"
+    code_a = _uniq_code("MSA")
+    code_b = _uniq_code("MSB")
+    positions_db.open_or_add(
+        option_code=code_a, symbol="TSLAM", strike=420.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="ms1",
+    )
+    positions_db.open_or_add(
+        option_code=code_b, symbol="MSFTM", strike=390.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.5,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="ms2",
+    )
+    discord_client._close_fps.clear()
+
+    sold_codes = []
+
+    def fake_sell(*args, **kwargs):
+        sold_codes.append(kwargs["option_code"])
+        return {"success": True, "order_id": "MS", "code": kwargs["option_code"],
+                "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    async def noop_notify(msg):
+        pass
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop_notify), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "Trimmed $TSLAM 420c and $MSFTM here @ 7.00", msg_id=55555,
+        )
+
+    assert code_a in sold_codes, "hint 匹配的 TSLA 420c 应该卖"
+    assert code_b in sold_codes, "MSFT 不该被 TSLA 的 strike hint 过滤掉"
+
+    positions_db.record_close(code_a, 2, 7.0, "manual", note="ut cleanup")
+    positions_db.record_close(code_b, 2, 7.0, "manual", note="ut cleanup")
