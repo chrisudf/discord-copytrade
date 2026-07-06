@@ -139,6 +139,65 @@ async def test_sl_skips_when_quote_unavailable():
                               trigger_source="manual", note="ut cleanup")
 
 
+@pytest.mark.asyncio
+async def test_sl_triggered_set_released_after_success_allows_reopen():
+    """SL 成功落库后 _triggered 必须释放：同 code reopen 后 SL 要能再次触发。
+
+    旧实现 code 永久留在 set 里 → reopen 仓位在本进程内 SL 永久失效。
+    """
+    code = _uniq_code("SL5")
+    _open_weekly("SLT5", code, qty=1, entry=1.00)
+    sl_watcher._triggered.discard(code)
+
+    os.environ["STOP_LOSS_PCT"] = "0.50"
+    sell_ok = {"success": True, "qty": 1, "price": 0.37,
+               "order_id": "SL_ORD_5", "code": code}
+    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok), \
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
+        await sl_watcher._sl_tick()
+
+    assert positions_db.get(code)["status"] == "CLOSED"
+    assert code not in sl_watcher._triggered  # 关键：成功后释放
+
+    # reopen 同 code，再次深跌 → SL 必须再次触发
+    _open_weekly("SLT5", code, qty=1, entry=1.00)
+    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok), \
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
+        await sl_watcher._sl_tick()
+
+    assert positions_db.get(code)["status"] == "CLOSED"
+    sl_evts = [e for e in positions_db.get_events(code)
+               if e["trigger_source"] == "sl_polling"]
+    assert len(sl_evts) == 2
+
+
+@pytest.mark.asyncio
+async def test_sl_triggered_set_kept_when_record_close_fails():
+    """卖出成功但落库失败 → code 留在 _triggered，下轮不重复卖出。"""
+    code = _uniq_code("SL6")
+    _open_weekly("SLT6", code, qty=1, entry=1.00)
+    sl_watcher._triggered.discard(code)
+
+    os.environ["STOP_LOSS_PCT"] = "0.50"
+    sell_ok = {"success": True, "qty": 1, "price": 0.37,
+               "order_id": "SL_ORD_6", "code": code}
+    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok) as sell_mock, \
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock), \
+         patch.object(sl_watcher.position_mgr, "on_close_filled",
+                      side_effect=RuntimeError("db down")):
+        await sl_watcher._sl_tick()
+        assert code in sl_watcher._triggered
+        # 下轮：DB 仍 OPEN（落库失败）但绝不能再卖一次
+        await sl_watcher._sl_tick()
+        assert sell_mock.call_count == 1
+
+    # 清理进程级 set，避免污染其他测试
+    sl_watcher._triggered.discard(code)
+
+
 # ============ EOD watcher ============
 
 def test_eod_window_weekday_after_cutoff():

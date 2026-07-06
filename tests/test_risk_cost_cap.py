@@ -102,3 +102,41 @@ def test_check_order_real_rejects_5000_env_user_set(monkeypatch):
     r = rm.check_order(price=15.0, qty=1)
     assert not r.passed
     assert "成本超限" in r.reason
+
+
+def test_check_order_effective_price_closes_slippage_gap(monkeypatch):
+    """REAL 硬顶必须按实际挂单价（含 slippage）判断，不能按信号价。
+
+    历史缺口：信号价 $9.90 → cost $990 过检，但 broker 实际挂
+    9.90 × 1.05 = $10.40 → 真实成本 $1040，穿透 $1000 硬顶。
+    listener 现在传 effective_price=calc_limit_price(signal_price)。
+    """
+    from src.broker.moomoo_client import calc_limit_price
+
+    monkeypatch.setenv("MOOMOO_TRD_ENV", "REAL")
+    monkeypatch.setattr(rm, "MAX_PRICE_PER_CONTRACT", 100.0)
+
+    # 不传 effective_price（老调用方兼容路径）：$990 过检
+    assert rm.check_order(price=9.90, qty=1).passed
+
+    # 传挂单价：9.90 → 10.40（5% 档），cost $1040 > $1000 → 拒
+    est = calc_limit_price(9.90)
+    assert est == 10.40
+    r = rm.check_order(price=9.90, qty=1, effective_price=est)
+    assert not r.passed
+    assert "成本超限" in r.reason
+
+
+def test_check_order_effective_price_low_price_12pct_band(monkeypatch):
+    """低价合约 12% 档同样生效：$0.98 lotto × 10 张边界验证。"""
+    from src.broker.moomoo_client import calc_limit_price
+
+    monkeypatch.setenv("MOOMOO_TRD_ENV", "REAL")
+    monkeypatch.setattr(rm, "MAX_PRICE_PER_CONTRACT", 100.0)
+
+    # 0.98 → 1.10（12% 档），10 张 cost $1100 > $1000 → 拒
+    # （按信号价算是 $980，会被放行——正是要堵的缺口）
+    est = calc_limit_price(0.98)
+    assert est == pytest.approx(1.10)
+    r = rm.check_order(price=0.98, qty=10, effective_price=est)
+    assert not r.passed

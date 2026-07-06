@@ -4,11 +4,16 @@
 - [ ] Connect real moomoo API (uncomment broker block, test on account)
 - [ ] Validate option code format on OpenD
 - [ ] Securely store Discord token (consider keyring)
-- [ ] **Tests must use tmp DB, not data/trades.db** (added 2026-07-03)
+- [x] **Tests must use tmp DB, not data/trades.db** (added 2026-07-03, done 2026-07-06)
   - 7/3 sync 发现 130 个 OPEN 记录，大部分是 tests 里
     `positions_db.open_or_add(...)` 直接写生产 DB 的残留（symbol=ADD/EOD/MGR/SL/BRJ/STK/LEG 等）
-  - 修法：在 `tests/conftest.py` 里加 autouse fixture，`monkeypatch.setattr(positions_db, "DB_PATH", tmp_path/"test.db")` + `positions_db._init_db()`
-  - 参考已有的 `tests/test_risk_cost_cap.py::_isolate_env` fixture
+  - 已修：`tests/conftest.py` autouse fixture 把 positions_db / logger_db /
+    risk_manager 三个 DB_PATH 全部 patch 到 tmp_path + 重跑 _init_db()。
+    验证过：重跑全套测试生产 DB 行数 0 增长。
+  - 历史残留已清（2026-07-06）：删除 840 行测试 positions + 1832 行 events，
+    备份在 data/trades.db.bak-before-test-cleanup-20260706。
+    剩 12 行真实仓位（全 CLOSED）+ 25 events；orders/raw_signals/risk.db
+    本来就无污染。
 - [ ] **Position sync as preflight step in run_listener.py**
   - 手工跑 `python scripts/sync_positions.py` 太容易漏
   - 加进 preflight，在 broker probe 之后跑一次，把本地 stale 全清

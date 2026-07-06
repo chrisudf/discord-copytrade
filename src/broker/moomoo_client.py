@@ -154,9 +154,12 @@ def _get_slippage_pct(price: float) -> float:
         return 0.05
 
 
-def _calc_limit_price(price: float) -> float:
+def calc_limit_price(price: float) -> float:
     """
     计算挂单限价 = entry_price * (1 + slippage_pct)，2 位小数。
+
+    公开导出：listener 风控前也要调它——Layer 2/3/4 的成本必须按
+    实际挂单价算，否则 REAL $1000 硬顶会被 slippage 突破最多 12%。
 
     TODO: 加入 Penny Pilot tick 档位对齐
     - Penny Pilot (IREN/SPY/QQQ/HOOD 等)：tick = $0.01，当前 round(2) 已对齐
@@ -287,7 +290,7 @@ def place_order(signal: dict, qty: int = None) -> dict:
         signal["strike"], signal["side"],
     )
     entry_price = signal["price"]
-    limit_price = _calc_limit_price(entry_price)
+    limit_price = calc_limit_price(entry_price)
     slip_pct = _get_slippage_pct(entry_price)
 
     dry_run = _is_dry_run()

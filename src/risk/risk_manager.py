@@ -201,23 +201,29 @@ def _trigger_circuit_breaker(reason: str):
 
 # ============ 核心检查 ============
 
-def check_order(price: float, qty: int, 
+def check_order(price: float, qty: int,
                 symbol: str = "", strike: float = 0,
                 side: str = "", expiry: str = "",
                 channel_name: str = "",
-                max_price_override: float = None) -> RiskCheckResult:
+                max_price_override: float = None,
+                effective_price: float = None) -> RiskCheckResult:
     """
     下单前风控检查（不记录订单，只检查）
-    
+
     Args:
-        price: 单张合约价格（每股美元）
+        price: 单张合约价格（每股美元，信号价）—— Layer 1 用它比 max_price
         qty: 下单张数
-    
+        effective_price: 实际挂单价（含 slippage，见 broker.calc_limit_price）。
+            Layer 2/3/4 的成本按它算——broker 会挂 price × (1+5~12%)，
+            若按信号价算成本，REAL $1000 硬顶实际能被突破到 ~$1120。
+            不传时退回用 price（兼容老调用方/测试，但会低估成本）。
+
     Returns:
         RiskCheckResult
     """
     trading_date = get_trading_date()
-    cost = price * 100 * qty
+    cost_price = effective_price if effective_price is not None else price
+    cost = cost_price * 100 * qty
     
     # ---------- Layer 0: 当日已熔断 ----------
     if is_circuit_broken(trading_date):
@@ -247,7 +253,10 @@ def check_order(price: float, qty: int,
         return RiskCheckResult(
             passed=False,
             reason="单笔订单成本超限",
-            detail=f"本笔成本 ${cost:.0f} > 上限 ${effective_max_cost:.0f} (env={trd_env})"
+            detail=(
+                f"本笔成本 ${cost:.0f} (挂单价 ${cost_price} × 100 × {qty}) "
+                f"> 上限 ${effective_max_cost:.0f} (env={trd_env})"
+            )
         )
     
     # ---------- Layer 3 & 4: 当日累计 ----------

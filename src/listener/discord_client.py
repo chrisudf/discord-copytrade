@@ -35,7 +35,12 @@ load_dotenv(Path(__file__).resolve().parents[2] / "config" / ".env", override=Tr
 
 from src.parser.signal_parser import parse_signal, detect_action
 from src.parser.close_parser import parse_close
-from src.broker.moomoo_client import place_order, place_sell_order, breakeven_exit_price
+from src.broker.moomoo_client import (
+    place_order,
+    place_sell_order,
+    breakeven_exit_price,
+    calc_limit_price,
+)
 from src.config.channel_loader import registry, validate_channels
 from src.risk.risk_manager import check_order, record_order
 from src.notifier.telegram_client import (
@@ -394,6 +399,8 @@ async def handle_message(message):
     # 关键参数说明：
     # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
     # - qty 来自 channel 配置，不同 channel 可以设不同张数
+    # - effective_price: broker 实际会挂 signal_price × (1+5~12% slippage)，
+    #   成本类风控（单笔/当日累计）必须按挂单价算，否则 REAL $1000 硬顶被滑点穿透
     qty = cfg.default_qty
     risk_result = check_order(
         price=signal["price"],
@@ -404,6 +411,7 @@ async def handle_message(message):
         expiry=signal.get("expiry", ""),
         channel_name=cfg.name,
         max_price_override=cfg.max_price,
+        effective_price=calc_limit_price(signal["price"]),
     )
 
     if not risk_result.passed:

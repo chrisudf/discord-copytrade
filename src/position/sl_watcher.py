@@ -7,8 +7,9 @@
 - 触发即全平（激进限价确保成交），调 on_close_filled + TG
 
 设计权衡：
-- 用 in-memory `_triggered` 防止单 tick 内重复触发同 code；
-  on_close_filled 后 position 转 CLOSED，下轮自然不会再被选上
+- 用 in-memory `_triggered` 防止"卖出成功但落库失败"时下轮重复卖出；
+  on_close_filled 成功后即释放（position 已 CLOSED，下轮不会再被选上，
+  且同 code reopen 后 SL 需要重新生效——见 _triggered 定义处注释）
 - 不做"先 UPDATE 占位再卖"——broker fail 后还想重试时反而麻烦
 - Bot 崩溃 → in-memory set 丢失。但若 SL 已实际成交，position 也已 CLOSED；
   若 SL 卖单还在挂着没成交，重启会再发一次 sell——可接受（broker 会拒重复 or 多卖一份）
@@ -46,8 +47,14 @@ def _cfg() -> dict:
     }
 
 
-# 单 tick 内已触发的 option_code，避免在等待 broker 返回期间被下一轮重复触发
-# 同进程生命周期，bot 重启清空（接受这个 trade-off）
+# 已触发但尚未确认落库的 option_code。
+# 生命周期（非进程级！）：
+#   add    → 卖单提交前（挡住 on_close_filled 失败后 DB 仍 OPEN 时下轮重复卖出）
+#   discard→ 卖单失败/异常（允许下轮重试）
+#   discard→ on_close_filled 成功（DB 已 CLOSED，下轮自然不会选中；
+#            必须移除，否则同 code 未来 reopen 后 SL 永久失效）
+# 只有"卖出成功但落库失败"会让 code 留在 set 里——此时故意冻结该 code 的 SL，
+# 人工修完 DB 后重启进程恢复。
 _triggered: set[str] = set()
 
 
@@ -98,7 +105,11 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
             order_id=result.get("order_id"),
             note=f"SL: last={last_price:.2f} threshold={threshold:.2f} entry={pos['avg_entry_price']:.2f}",
         )
+        # DB 已转 CLOSED —— 释放 code，同合约日后 reopen 时 SL 仍然有效
+        _triggered.discard(code)
     except Exception as e:
+        # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
+        # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单
         logger.error(f"[sl] on_close_filled failed: {e}")
 
     await send_telegram(format_close_filled(

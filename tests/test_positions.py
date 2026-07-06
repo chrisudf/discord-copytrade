@@ -149,6 +149,48 @@ def test_manager_on_order_filled_routes_correctly():
     assert pos["avg_entry_price"] == pytest.approx(1.10)
 
 
+def test_reopen_resets_position_and_refreshes_flags():
+    """reopen（CLOSED 后同 code 再开）必须按新信号刷新全部元数据。
+
+    场景：DTE=5 开 weekly（eod_force_close=False）→ 全平 → 到期日当天
+    KC 重开同一合约 → categorize 判 0dte / eod_force_close=True。
+    旧实现沿用旧 flag → EOD watcher 不强平 → ITM 自动行权（lessons #14）。
+    """
+    code = _uniq("REO")
+    first = positions_db.open_or_add(
+        option_code=code, symbol="REOTEST", strike=10.0, side="CALL",
+        expiry=date(2026, 6, 25), qty=2, fill_price=1.00,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="chan_a", msg_id="m1",
+    )
+    positions_db.mark_tp_hit(code, 1)  # 旧仓位 T1 已触发过
+    positions_db.record_close(code, qty_sold=2, fill_price=2.00,
+                              trigger_source="kc_signal")
+
+    pos = positions_db.open_or_add(
+        option_code=code, symbol="REOTEST", strike=10.0, side="CALL",
+        expiry=date(2026, 6, 25), qty=1, fill_price=3.00,
+        category="0dte", apply_sl=False, eod_force_close=True, tags=["lotto"],
+        channel_name="chan_b", msg_id="m9",
+    )
+    # 数量/均价重置为本次数据（不与旧仓位加权平均）
+    assert pos["qty_total"] == 1
+    assert pos["qty_remaining"] == 1
+    assert pos["avg_entry_price"] == pytest.approx(3.00)
+    assert pos["status"] == "OPEN"
+    assert pos["closed_at"] is None
+    # 元数据按新信号刷新（本次修复的核心）
+    assert pos["category"] == "0dte"
+    assert pos["apply_sl"] is False
+    assert pos["eod_force_close"] is True
+    assert pos["tags"] == ["lotto"]
+    assert pos["channel_name"] == "chan_b"
+    assert pos["open_msg_id"] == "m9"
+    assert pos["opened_at"] != first["opened_at"]
+    # TP 档位清零，watcher 不会误跳过 T1
+    assert pos["tp_hits"] == 0
+
+
 def test_calc_qty_to_sell():
     pos = {"qty_remaining": 4}
     assert manager.calc_qty_to_sell(pos, 100) == 4

@@ -218,6 +218,11 @@ def open_or_add(
             #     并且 tp_hits 不清零会让 TP watcher 误以为档位已经触发过、跳过。
             #     → 视作全新开仓：重置 qty_total/avg = 本次数据，清 tp_hits，
             #       event_type='OPEN'，closed_at = NULL。
+            #     category/apply_sl/eod_force_close/tags/channel/msg_id/opened_at
+            #     也必须一起刷新——caller 按"当前 DTE"重算过。若沿用旧值：
+            #     DTE=5 开的 weekly 平掉后在到期日 reopen，本地仍是
+            #     eod_force_close=False → EOD watcher 不强平 → ITM 自动行权
+            #     （lessons.md #14 的事故链）。反向场景会丢 SL。
             #
             # (2) add-on：仓位还活着（PARTIAL 或 OPEN+qty_remaining>0），同 KC 加仓。
             #     → 加权平均，保留 tp_hits（如果 T1 已 hit，加仓后 T1 仍算 hit 过），
@@ -235,10 +240,17 @@ def open_or_add(
                 conn.execute("""
                     UPDATE positions
                     SET qty_total = ?, qty_remaining = ?, avg_entry_price = ?,
-                        last_action_at = ?, status = ?, closed_at = NULL,
-                        tp_hits = 0
+                        category = ?, apply_sl = ?, eod_force_close = ?,
+                        tags = ?, channel_name = ?, open_msg_id = ?,
+                        opened_at = ?, last_action_at = ?, status = ?,
+                        closed_at = NULL, tp_hits = 0
                     WHERE option_code = ?
-                """, (qty, qty, fill_price, now, "OPEN", option_code))
+                """, (
+                    qty, qty, fill_price,
+                    category, int(apply_sl), int(eod_force_close),
+                    json.dumps(tags), channel_name, str(msg_id),
+                    now, now, "OPEN", option_code,
+                ))
                 event_type = "OPEN"  # 流水语义：这是新开仓不是加仓
                 logger.info(
                     f"[positions] reopen {option_code}: prev status={existing_status} "
