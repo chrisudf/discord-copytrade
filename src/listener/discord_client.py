@@ -65,6 +65,10 @@ ET_TZ = ZoneInfo("America/New_York")
 
 client = discord.Client()
 
+# OPEN 链路串行锁：check_order → place_order → record_order 必须原子，
+# 否则两条几乎同时到达的信号都会用"旧配额"通过风控（见 handle_message 内注释）
+_order_flow_lock = asyncio.Lock()
+
 # ============================================================
 # Dedup: bounded deque + set 查重，避免无限增长
 # ============================================================
@@ -425,77 +429,83 @@ async def _handle_message_inner(message):
         tags=signal.get("tags") or None,
     ))
 
-    # ---- 风控 ----
-    # 关键参数说明：
-    # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
-    # - qty 来自 channel 配置，不同 channel 可以设不同张数
-    # - effective_price: broker 实际会挂 signal_price × (1+5~12% slippage)，
-    #   成本类风控（单笔/当日累计）必须按挂单价算，否则 REAL $1000 硬顶被滑点穿透
-    qty = cfg.default_qty
-    risk_result = check_order(
-        price=signal["price"],
-        qty=qty,
-        symbol=signal["symbol"],
-        strike=signal["strike"],
-        side=signal["side"],
-        expiry=signal.get("expiry", ""),
-        channel_name=cfg.name,
-        max_price_override=cfg.max_price,
-        effective_price=calc_limit_price(signal["price"]),
-    )
-
-    if not risk_result.passed:
-        logger.warning(
-            f"🛡️  Risk blocked: {risk_result.reason} - {risk_result.detail}"
-        )
-        await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
-        return
-
-    # ---- 下单 ----
-    # 下单（broker.place_order 是同步函数，必须 to_thread 包装）
-    try:
-        order_result = await asyncio.to_thread(place_order, signal, qty)
-    except Exception as e:
-        logger.exception("place_order failed")
-        await _safe_notify(format_error("Order error", str(e)))
-        return
-
-    # 落库订单（成功失败都记，作为业务日志）
-    try:
-        log_order(message.id, signal, order_result)
-    except Exception as e:
-        logger.error(f"log_order failed: {e}")
-
-    # === [改动 Bug A] 只有 success=True 才 record_order ===
-    # 实测背景：6/16 QCOM/IREN 期权代码错误（Juneteenth 未处理），
-    # broker 返回 success=False，但旧逻辑仍 record_order 污染配额，
-    # 导致 daily_orders 表出现"成功记录"但订单实际未成交。
-    # 现在失败 → 发 TG 提示用户 + 不污染配额。
-    if not order_result.get("success"):
-        err_msg = order_result.get("message", "unknown error")
-        logger.error(f"Order rejected by broker: {err_msg}")
-        await _safe_notify(format_error(
-            "Order rejected by broker",
-            f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
-            f"{signal.get('expiry', '')}\n{err_msg}"
-        ))
-        return
-
-    try:
-        # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
-        effective_price = order_result.get("price", signal["price"])
-        record_order(
-            price=effective_price,
+    # ---- 风控 + 下单 + 配额记录：整段串行 ----
+    # check_order 与 record_order 之间隔着 broker RTT（await），没有锁的话
+    # 两条几乎同时到达的信号会都用"旧配额"通过 Layer 3/4 检查，
+    # MAX_DAILY_COST / MAX_DAILY_ORDERS 可以被双双突破。
+    # 信号频率是每天个位数，串行化整个下单段的延迟代价可以忽略。
+    async with _order_flow_lock:
+        # ---- 风控 ----
+        # 关键参数说明：
+        # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
+        # - qty 来自 channel 配置，不同 channel 可以设不同张数
+        # - effective_price: broker 实际会挂 signal_price × (1+5~12% slippage)，
+        #   成本类风控（单笔/当日累计）必须按挂单价算，否则 REAL $1000 硬顶被滑点穿透
+        qty = cfg.default_qty
+        risk_result = check_order(
+            price=signal["price"],
             qty=qty,
             symbol=signal["symbol"],
             strike=signal["strike"],
             side=signal["side"],
             expiry=signal.get("expiry", ""),
-            channel_id=str(cid),
             channel_name=cfg.name,
+            max_price_override=cfg.max_price,
+            effective_price=calc_limit_price(signal["price"]),
         )
-    except Exception as e:
-        logger.error(f"record_order failed: {e}")
+
+        if not risk_result.passed:
+            logger.warning(
+                f"🛡️  Risk blocked: {risk_result.reason} - {risk_result.detail}"
+            )
+            await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
+            return
+
+        # ---- 下单 ----
+        # 下单（broker.place_order 是同步函数，必须 to_thread 包装）
+        try:
+            order_result = await asyncio.to_thread(place_order, signal, qty)
+        except Exception as e:
+            logger.exception("place_order failed")
+            await _safe_notify(format_error("Order error", str(e)))
+            return
+
+        # 落库订单（成功失败都记，作为业务日志）
+        try:
+            log_order(message.id, signal, order_result)
+        except Exception as e:
+            logger.error(f"log_order failed: {e}")
+
+        # === [改动 Bug A] 只有 success=True 才 record_order ===
+        # 实测背景：6/16 QCOM/IREN 期权代码错误（Juneteenth 未处理），
+        # broker 返回 success=False，但旧逻辑仍 record_order 污染配额，
+        # 导致 daily_orders 表出现"成功记录"但订单实际未成交。
+        # 现在失败 → 发 TG 提示用户 + 不污染配额。
+        if not order_result.get("success"):
+            err_msg = order_result.get("message", "unknown error")
+            logger.error(f"Order rejected by broker: {err_msg}")
+            await _safe_notify(format_error(
+                "Order rejected by broker",
+                f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+                f"{signal.get('expiry', '')}\n{err_msg}"
+            ))
+            return
+
+        try:
+            # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
+            effective_price = order_result.get("price", signal["price"])
+            record_order(
+                price=effective_price,
+                qty=qty,
+                symbol=signal["symbol"],
+                strike=signal["strike"],
+                side=signal["side"],
+                expiry=signal.get("expiry", ""),
+                channel_id=str(cid),
+                channel_name=cfg.name,
+            )
+        except Exception as e:
+            logger.error(f"record_order failed: {e}")
 
     # ---- 持仓追踪（用于后续 close 信号匹配 / SL polling / EOD 强平） ----
     try:
