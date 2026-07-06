@@ -106,6 +106,8 @@ def _utc_iso() -> str:
 def _init_db():
     """初始化数据库表"""
     with sqlite3.connect(DB_PATH) as conn:
+        # WAL：读写不互斥 + 崩溃恢复更稳（并发访问见 logger_db 同注释）
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

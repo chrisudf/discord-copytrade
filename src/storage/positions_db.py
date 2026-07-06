@@ -105,6 +105,8 @@ def categorize(
 
 def _init_db():
     with sqlite3.connect(DB_PATH) as conn:
+        # WAL：读写不互斥 + 崩溃恢复更稳（并发访问见 logger_db 同注释）
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS positions (
                 option_code      TEXT PRIMARY KEY,

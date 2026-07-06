@@ -7,7 +7,10 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
-DB_PATH = Path("data/trades.db")
+# 绝对路径（跟 positions_db 一致）。之前是相对路径 Path("data/trades.db")，
+# 从非 repo 根目录启动时会在 CWD 下另建一个 trades.db，
+# 与 positions_db 写的库分裂成两个文件。
+DB_PATH = Path(__file__).resolve().parents[2] / "data" / "trades.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -30,6 +33,9 @@ def _utc_iso(dt: datetime = None) -> str:
 
 def _init_db():
     with sqlite3.connect(DB_PATH) as conn:
+        # WAL：读写不互斥 + 崩溃恢复更稳。listener/watcher 从事件循环和
+        # to_thread 线程并发访问同一库，默认 journal 模式易出 'database is locked'
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS raw_signals (
                 msg_id TEXT PRIMARY KEY,
