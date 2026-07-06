@@ -122,8 +122,16 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
             _triggered.discard(code)
         except Exception as e:
             # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
-            # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单
+            # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单。
+            # 必须 TG 告警——冻结意味着该合约失去自动止损，且 DB 与 broker
+            # 已脱钩，只写日志半夜没人看得到。
             logger.error(f"[sl] on_close_filled failed: {e}")
+            await send_telegram(format_error(
+                "SL 记账失败，已冻结该合约的 SL 自动触发",
+                f"{code}: 卖单已提交（order={result.get('order_id')}）但 DB 更新失败。\n"
+                f"请核对 moomoo 持仓并跑 scripts/sync_positions.py 对账，"
+                f"然后重启 bot 恢复该合约的 SL。"
+            ))
 
         # 卖单成交确认：SL 场景价格在跌，限价单挂不上很常见——未成交必须告警
         fill_checker.spawn(fill_checker.confirm_sell_fill(
