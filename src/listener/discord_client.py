@@ -145,8 +145,14 @@ def _close_fingerprint(parsed: dict) -> tuple:
     return (parsed["kind"], syms, parsed["pct"])
 
 
-def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
-    """返回 (是否重复, 距上次秒数)。结构同 _is_duplicate_signal。"""
+def _check_duplicate_close(parsed: dict) -> tuple[bool, float]:
+    """只查重，不登记。返回 (是否重复, 距上次秒数)。
+
+    登记动作拆到 _record_close_fp，由调用方在**至少一笔卖单成功提交后**调用。
+    之前是查即登记：ZH 版先到但卖单失败（broker 异常/拒单）时，1-3s 后到的
+    EN 版会被当 dup 拦掉——天然的重试机会没了。现在失败不登记，EN 版正常重试。
+    代价：完全没匹配到持仓时两个语言版本各发一条 skip 通知（可接受）。
+    """
     fp = _close_fingerprint(parsed)
     now = datetime.now(timezone.utc)
 
@@ -154,16 +160,18 @@ def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
     for k in expired:
         _close_fps.pop(k, None)
 
-    if len(_close_fps) >= _CLOSE_FP_MAX:
-        oldest = min(_close_fps, key=_close_fps.get)
-        _close_fps.pop(oldest, None)
-
     prev_ts = _close_fps.get(fp)
     if prev_ts is not None:
         return True, (now - prev_ts).total_seconds()
-
-    _close_fps[fp] = now
     return False, 0.0
+
+
+def _record_close_fp(parsed: dict):
+    """登记 CLOSE 指纹（含硬上限保护）。仅在实际执行成功后调用。"""
+    if len(_close_fps) >= _CLOSE_FP_MAX:
+        oldest = min(_close_fps, key=_close_fps.get)
+        _close_fps.pop(oldest, None)
+    _close_fps[_close_fingerprint(parsed)] = datetime.now(timezone.utc)
 
 
 def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
@@ -591,7 +599,9 @@ async def _handle_close_signal(raw: str, msg_id: int):
         return
 
     # CLOSE dedup —— 双语双发 / 同信号重发拦截
-    is_dup, ago = _is_duplicate_close(parsed)
+    # 注意：这里只查重，指纹在下面"至少一笔卖单成功"后才登记（_record_close_fp），
+    # 让执行失败时 1-3s 后到达的另一语言版本天然充当重试。
+    is_dup, ago = _check_duplicate_close(parsed)
     if is_dup:
         logger.info(
             f"🔁 [CLOSE] dup skipped (lang={parsed.get('lang')}): "
@@ -608,6 +618,11 @@ async def _handle_close_signal(raw: str, msg_id: int):
 
     pct = parsed["pct"]
     any_executed = False
+    any_success = False  # 至少一笔卖单成功提交 → 登记 CLOSE 指纹
+    # broker 侧失败（异常/拒单）——这类失败是瞬时的，值得让 1-3s 后的
+    # 双语孪生版本重试；确定性跳过（runner-preserve / 无价格参照 /
+    # strike 不匹配）重试也是同样结果，不算在内
+    any_broker_failure = False
 
     hint_strike = parsed.get("hint_strike")
     hint_side = parsed.get("hint_side")
@@ -636,6 +651,7 @@ async def _handle_close_signal(raw: str, msg_id: int):
                     f"strike 不匹配（KC 平 {symbol} {hint_strike}{hint_side[0]} 但我们持仓不同 strike）",
                     raw,
                 ))
+                any_executed = True  # 已发专属 TG，不再让外层报 "no matching"
                 continue
             logger.info(
                 f"[CLOSE] strike-filter: {symbol} {hint_strike}{hint_side[0]} → "
@@ -705,6 +721,7 @@ async def _handle_close_signal(raw: str, msg_id: int):
                     logger.exception("place_sell_order failed")
                     await _safe_notify(format_error("Sell order error", str(e)))
                     any_executed = True  # 持仓找到了只是 broker 异常，不再报 "no matching"
+                    any_broker_failure = True
                     continue
 
                 if not result.get("success"):
@@ -715,6 +732,7 @@ async def _handle_close_signal(raw: str, msg_id: int):
                         f"{pos['option_code']} qty={qty_to_sell}\n{err}",
                     ))
                     any_executed = True  # 持仓找到了只是 broker 拒单，不再报 "no matching"
+                    any_broker_failure = True
                     continue
 
                 try:
@@ -736,6 +754,18 @@ async def _handle_close_signal(raw: str, msg_id: int):
                 pct, "kc_signal", result.get("order_id", "N/A"),
             ))
             any_executed = True
+            any_success = True
+
+    if any_success or not any_broker_failure:
+        # 登记指纹拦掉 1-3s 后的双语孪生版本，两种情况：
+        #   1. 至少一笔卖单成功——正常路径
+        #   2. 全部是确定性结果（runner-preserve / 无价格参照 / strike 不匹配 /
+        #      no matching）——孪生版本重试也是同样结果，只会重复刷 TG
+        #      （7/6 实测：runner-preserve 和"无价格参照"各触发一次时，
+        #      ZH/EN 双发若不去重会连发 2-4 条相同告警）
+        # 唯一不登记的情况：零成交且出现过 broker 失败（异常/拒单）——
+        # 让另一语言版本充当天然重试（0005 补丁的核心目的）。
+        _record_close_fp(parsed)
 
     if not any_executed:
         await _safe_notify(format_close_skipped(

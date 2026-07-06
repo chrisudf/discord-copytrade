@@ -285,3 +285,90 @@ def test_addon_requires_add_keyword():
         "ADX4 holding the line @ 1.86 nicely"
     )
     assert got is None
+
+
+# === CLOSE 指纹登记时机回归（review 0005）===
+
+@pytest.mark.asyncio
+async def test_failed_close_allows_bilingual_retry():
+    """卖单失败时不登记指纹 → 1-3s 后到达的另一语言版本可以正常重试。
+
+    回归：之前查即登记，ZH 版先到但 broker 拒单后，EN 版被当 dup 拦掉，
+    天然的重试机会丢失。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("RTY")
+    positions_db.open_or_add(
+        option_code=code, symbol="RTYX", strike=100.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_rty_1",
+    )
+    discord_client._close_fps.clear()
+
+    async def noop_notify(msg):
+        pass
+
+    calls = []
+
+    def failing_then_ok_sell(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"success": False, "message": "transient broker error",
+                    "order_id": None, "code": code, "qty": 1, "price": 1.9}
+        return {"success": True, "order_id": "RTY_OK", "code": code,
+                "qty": 1, "price": 1.9}
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop_notify), \
+         patch.object(discord_client, "place_sell_order", side_effect=failing_then_ok_sell):
+        # 第一发（模拟 ZH 先到）：broker 拒单 → 不应登记指纹
+        await discord_client._handle_close_signal("减仓 RTYX @ 2.45", msg_id=1111)
+        # 第二发（模拟 EN 双发）：应被当作重试执行，而不是 dup 拦掉
+        await discord_client._handle_close_signal("trimmed RTYX @ 2.45", msg_id=1112)
+
+    assert len(calls) == 2, f"第二发应重试卖出，实际 broker 调用: {len(calls)}"
+
+    # 第二发成功后指纹已登记 → 第三发同信号应被 dup 拦掉
+    with patch.object(discord_client, "_safe_notify", side_effect=noop_notify), \
+         patch.object(discord_client, "place_sell_order", side_effect=failing_then_ok_sell):
+        await discord_client._handle_close_signal("trimmed RTYX @ 2.45", msg_id=1113)
+    assert len(calls) == 2, "成功后同指纹信号应被 dup 拦截"
+
+    positions_db.record_close(code, 2, 2.0, "manual", note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_deterministic_skip_registers_fp_no_twin_spam():
+    """确定性跳过（runner-preserve）也登记指纹 → 双语孪生不会重复刷 TG。
+
+    这是对 0005 "只在成功后登记" 的本地精修：runner-preserve / 无价格参照
+    这类结果是确定性的，孪生重试只会重复告警，应照常去重。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("DSK")
+    positions_db.open_or_add(
+        option_code=code, symbol="DSKX", strike=100.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=1, fill_price=2.0,  # qty=1 → runner-preserve
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_dsk_1",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order") as sell_mock:
+        await discord_client._handle_close_signal("trimmed DSKX @ 2.45", msg_id=2221)
+        await discord_client._handle_close_signal("减仓 DSKX @ 2.45", msg_id=2222)
+
+    sell_mock.assert_not_called()
+    runner_alerts = [n for n in notifications if "runner" in n.lower()]
+    assert len(runner_alerts) == 1, (
+        f"孪生版本应被指纹去重，只发一条 runner-preserve TG，实际 {len(runner_alerts)}",
+        notifications,
+    )
+
+    positions_db.record_close(code, 1, 2.0, "manual", note="ut cleanup")
