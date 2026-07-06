@@ -430,6 +430,39 @@ def find_by_symbol(symbol: str) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def adjust_entry_price(option_code: str, expect_qty_total: int, dealt_avg: float) -> bool:
+    """买单 fill 确认后，用真实成交均价回填 avg_entry_price。
+
+    仅当 qty_total 仍等于 expect_qty_total（提交到确认之间没有加仓/reopen）
+    且仓位还活着时更新；否则加权关系已变，保守跳过。
+
+    Returns:
+        True = 已更新；False = 条件不满足跳过
+    """
+    now = _utc_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            UPDATE positions
+            SET avg_entry_price = ?, last_action_at = ?
+            WHERE option_code = ? AND qty_total = ?
+              AND status IN ('OPEN', 'PARTIAL')
+        """, (dealt_avg, now, option_code, expect_qty_total))
+        if cur.rowcount == 0:
+            return False
+        conn.execute("""
+            INSERT INTO position_events (
+                option_code, event_type, qty_delta, price, pct,
+                trigger_source, ref_msg_id, ts, note
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+        """, (
+            option_code, "FILL_ADJUST", 0, dealt_avg, None,
+            "fill_checker", None, now,
+            f"avg_entry backfilled from dealt_avg (expect_qty={expect_qty_total})",
+        ))
+    logger.info(f"[positions] FILL_ADJUST {option_code}: avg_entry → {dealt_avg:.2f}")
+    return True
+
+
 def mark_tp_hit(option_code: str, tier_bit: int) -> None:
     """标记某档 TP 已触发。tier_bit 是位掩码（1=T1, 2=T2, 4=T3...）。
 

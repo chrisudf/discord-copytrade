@@ -29,6 +29,7 @@ from typing import Optional
 
 from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.storage import positions_db
 from src.notifier.telegram_client import (
     send_telegram, format_close_filled, format_error,
@@ -128,6 +129,12 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
             )
         except Exception as e:
             logger.error(f"[tp] on_close_filled failed: {e}")
+
+        # 卖单成交确认：未成交则 TG 告警（DB 已扣减，broker 端可能还持有）
+        fill_checker.spawn(fill_checker.confirm_sell_fill(
+            result.get("order_id") or "", code,
+            result.get("qty", qty_to_sell), f"tp_t{tier_bit}",
+        ))
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

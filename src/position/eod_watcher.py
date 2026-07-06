@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.notifier.telegram_client import (
     send_telegram, format_close_filled, format_error,
 )
@@ -149,6 +150,11 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
             )
         except Exception as e:
             logger.error(f"[eod] on_close_filled failed: {e}")
+
+        # 卖单成交确认：收盘前 spread 跳水，限价卖单挂不上必须立刻知道
+        fill_checker.spawn(fill_checker.confirm_sell_fill(
+            result.get("order_id") or "", code, result.get("qty", qty), "eod",
+        ))
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

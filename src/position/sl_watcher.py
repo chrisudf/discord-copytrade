@@ -32,6 +32,7 @@ from typing import Optional
 
 from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.notifier.telegram_client import (
     send_telegram, format_close_filled, format_error,
 )
@@ -119,6 +120,11 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
             # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
             # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单
             logger.error(f"[sl] on_close_filled failed: {e}")
+
+        # 卖单成交确认：SL 场景价格在跌，限价单挂不上很常见——未成交必须告警
+        fill_checker.spawn(fill_checker.confirm_sell_fill(
+            result.get("order_id") or "", code, result.get("qty", qty), "sl_polling",
+        ))
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],

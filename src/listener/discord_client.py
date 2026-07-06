@@ -55,6 +55,7 @@ from src.notifier.telegram_client import (
 )
 from src.storage.logger_db import log_raw_signal, log_order
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.position.sl_watcher import run_sl_watcher
 from src.position.eod_watcher import run_eod_watcher
 from src.position.tp_watcher import run_tp_watcher
@@ -526,6 +527,16 @@ async def _handle_message_inner(message):
     except Exception as e:
         logger.error(f"position_mgr.on_order_filled failed: {e}")
 
+    # ---- 成交确认（fire-and-forget）----
+    # broker success 只是"已提交"；确认成交后回填真实 avg_entry，
+    # 超时未成交则 TG 告警提示对账。见 fill_checker 模块 docstring。
+    fill_checker.spawn(fill_checker.confirm_buy_fill(
+        order_result.get("order_id") or "",
+        order_result.get("code") or "",
+        order_result.get("qty", qty),
+        order_result.get("price", 0.0) or 0.0,
+    ))
+
     # ---- 通知 + 延迟统计 ----
     elapsed = (datetime.now(timezone.utc) - t0).total_seconds() * 1000
     await _safe_notify(format_order_filled(
@@ -747,6 +758,12 @@ async def _handle_close_signal(raw: str, msg_id: int):
                     )
                 except Exception as e:
                     logger.error(f"on_close_filled failed: {e}")
+
+                # 卖单成交确认：DB 已按已平处理，若限价单实际没成交必须告警
+                fill_checker.spawn(fill_checker.confirm_sell_fill(
+                    result.get("order_id") or "", pos["option_code"],
+                    result.get("qty", qty_to_sell), "kc_close",
+                ))
 
             await _safe_notify(format_close_filled(
                 pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
