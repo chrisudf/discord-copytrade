@@ -226,3 +226,17 @@ def test_holding_up_well_with_no_signal_returns_none():
     """
     r = parse_signal("Stock is holding up well today, no setups yet", msg_ts=FIXED_TODAY)
     assert r is None  # 没法 parse 出 OPEN 信号
+
+
+def test_invalid_calendar_date_returns_none():
+    """6/31 不存在 → 按解析失败处理（返回 None），绝不能抛 ValueError 炸掉链路。"""
+    assert parse_signal("$TSLA 250c 6/31 @ 1.20", msg_ts=FIXED_TODAY) is None
+
+
+def test_feb30_returns_none():
+    assert parse_signal("SPY 600c 2/30 @ .55", msg_ts=FIXED_TODAY) is None
+
+
+def test_feb29_non_leap_skips_to_valid_year():
+    """2/29 在 2026/2027/2025 都无效 → 三个候选年全跳过 → None（不炸）。"""
+    assert parse_signal("$NVDA 150c 2/29 @ 2.00", msg_ts=FIXED_TODAY) is None

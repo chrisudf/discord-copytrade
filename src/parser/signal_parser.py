@@ -17,12 +17,21 @@ from src.utils.logger import logger
 
 # ===== 跨年容错 =====
 def smart_expiry(mm: int, dd: int, today: date = None) -> date:
+    """跨年取最近的有效日期。
+
+    无效的 月/日 组合（6/31、2/30，或非闰年的 2/29）逐年跳过；
+    三个候选年都无效时抛 ValueError —— parse_signal 会捕获并按
+    解析失败处理，而不是让异常炸掉整条消息链路。
+    """
     today = today or date.today()
-    candidates = [
-        date(today.year, mm, dd),
-        date(today.year + 1, mm, dd),
-        date(today.year - 1, mm, dd),
-    ]
+    candidates = []
+    for year in (today.year, today.year + 1, today.year - 1):
+        try:
+            candidates.append(date(year, mm, dd))
+        except ValueError:
+            continue
+    if not candidates:
+        raise ValueError(f"invalid month/day combination: {mm}/{dd}")
     future = [d for d in candidates if d >= today - timedelta(days=2)]
     if not future:
         return candidates[0]
@@ -182,7 +191,13 @@ def parse_signal(text: str, msg_ts: date = None):
         logger.info(f"[parser] skip (price range): {text[:60]}")
         return {"skip": "price_range"}
 
-    sig = _try_pattern_a(text, today) or _try_pattern_b(text, today) or _try_pattern_c(text, today)
+    try:
+        sig = _try_pattern_a(text, today) or _try_pattern_b(text, today) or _try_pattern_c(text, today)
+    except ValueError as e:
+        # smart_expiry 对 6/31 这类无效日期抛 ValueError → 按解析失败处理，
+        # 走 None 路径（listener 会 TG 报警），不让异常传出去
+        logger.warning(f"[parser] invalid date in signal: {e} | {text[:80]}")
+        return None
 
     if sig is None:
         logger.warning(f"[parser] no signal: {text[:80]}")

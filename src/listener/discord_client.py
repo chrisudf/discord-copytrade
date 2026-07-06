@@ -279,6 +279,22 @@ async def handle_message(message):
         message.embeds (list, optional)
         message.attachments (list, optional)
     """
+    try:
+        await _handle_message_inner(message)
+    except Exception as e:
+        # 最后防线：任何未预料的异常都不能让信号静默消失。
+        # discord.py 会把 event handler 的异常吞进默认 on_error（只写日志），
+        # TG 侧完全看不到 —— 模块 docstring 承诺的"一切异常都吞掉只 log"
+        # 在这里兑现，并显式报警让人工接管。
+        logger.exception("handle_message crashed")
+        raw = getattr(message, "content", "") or ""
+        await _safe_notify(format_error(
+            "handle_message crashed",
+            f"{type(e).__name__}: {e}\n\nraw: {raw[:200]}",
+        ))
+
+
+async def _handle_message_inner(message):
     t0 = datetime.now(timezone.utc)
 
     # ---- 过滤 1：忽略自己发的消息 ----
