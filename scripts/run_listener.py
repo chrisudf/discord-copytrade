@@ -31,6 +31,9 @@ from src.broker.moomoo_client import (
     probe_broker, probe_quote_access,
     QUOTE_OK, QUOTE_DELAYED, QUOTE_NO_PERMISSION, QUOTE_ERROR,
 )
+from src.position.sl_watcher import run_sl_watcher
+from src.position.eod_watcher import run_eod_watcher
+from src.position.tp_watcher import run_tp_watcher
 
 
 # ============ 启动检查 ============
@@ -370,7 +373,16 @@ async def main():
     token = preflight()
     loop = asyncio.get_running_loop()
     setup_signal_handlers(loop)
-    
+
+    # 保护性 watcher：SL 止损 / EOD 到期强平 / TP 分批止盈。
+    # 之前只有 src.main（start_listener）启动它们，而这个生产入口一直没起——
+    # src.main 又被硬卡禁止在 REAL 运行，等于真盘持仓完全没有自动保护。
+    # watcher 内部自带 try/except + DRY_RUN 无报价时 no-op，起在这里是安全的。
+    asyncio.create_task(run_sl_watcher(), name="sl_watcher")
+    asyncio.create_task(run_eod_watcher(), name="eod_watcher")
+    asyncio.create_task(run_tp_watcher(), name="tp_watcher")
+    logger.info("🛡️  watchers started: sl / eod / tp")
+
     try:
         await client.start(token)
     except discord.LoginFailure:
