@@ -31,6 +31,7 @@ import os
 import threading
 import time
 from datetime import date
+from zoneinfo import ZoneInfo
 from src.utils.logger import logger
 
 # ---- 配置（从 .env 读取） ----
@@ -83,6 +84,22 @@ _real_quote_warned_codes: set[str] = set()
 # 延迟数据账户拿到的报价 ~15min 旧，会全部被这个阈值过滤掉 → 启动 probe 时会暴露
 QUOTE_FRESHNESS_SEC = 60.0
 
+# moomoo snapshot 的 update_time 是**无时区的美东时间**字符串。
+# 之前 pd.to_datetime(...).timestamp() 把它当 UTC：ET 落后 UTC 4-5 小时，
+# 解析出来的 epoch 比真实值早 4-5h → 每条实时报价都被 60s 新鲜度检查
+# 判为 stale 丢弃 → 真盘 SL/TP/EOD 永远拿不到价、全部 no-op。
+# 若实测发现 OpenD 返回的是其它时区，用 MOOMOO_QUOTE_TZ 覆盖。
+QUOTE_TZ = ZoneInfo(os.getenv("MOOMOO_QUOTE_TZ", "America/New_York"))
+
+
+def _quote_epoch(update_time) -> float:
+    """update_time（无 tz 字符串/时间戳）→ POSIX epoch 秒，按 QUOTE_TZ 本地化。"""
+    import pandas as pd
+    ts = pd.to_datetime(update_time)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(QUOTE_TZ)
+    return ts.timestamp()
+
 
 def _reset_ctx():
     """连接异常后重置单例，下次调用会重连。
@@ -111,14 +128,16 @@ def _get_quote_ctx():
 
 def _reset_quote_ctx():
     """quote 链路异常时重置；下次调用会重连。
-    跟 _reset_ctx 解耦——交易和行情走两条独立 socket，互不影响。"""
+    跟 _reset_ctx 解耦——交易和行情走两条独立 socket，互不影响。
+    持 _quote_lock 执行，避免把并发 snapshot 正在用的 ctx 从脚下关掉。"""
     global _quote_ctx
-    if _quote_ctx is not None:
-        try:
-            _quote_ctx.close()
-        except Exception:
-            pass
-    _quote_ctx = None
+    with _quote_lock:
+        if _quote_ctx is not None:
+            try:
+                _quote_ctx.close()
+            except Exception:
+                pass
+        _quote_ctx = None
     logger.warning("[broker] quote_ctx reset, will reconnect on next call")
 
 
@@ -374,7 +393,12 @@ def _get_long_qty(option_code: str) -> int:
     """查 broker 里持有的 long qty。用于 naked-short 防护。
 
     Returns:
-        long qty（>= 0）。broker 无此 code 或 qty 为 SHORT → 返 0。
+        long qty（>= 0）。broker 确认无此 code 或方向为 SHORT → 返 0。
+
+    Raises:
+        RuntimeError: position_list_query 失败（含 stale-session 重试一次后仍失败）。
+        之前把查询失败静默当 qty=0 处理，会用误导性的 naked-short 拒单
+        挡掉所有卖出（含 SL 止损单），且绕过了 stale-session 恢复逻辑。
     """
     ctx = _get_ctx()
     ret, df = ctx.position_list_query(
@@ -382,7 +406,19 @@ def _get_long_qty(option_code: str) -> int:
         trd_env=_get_trd_env(),
         acc_id=_ensure_account(),
     )
-    if ret != RET_OK or df is None or len(df) == 0:
+    if ret != RET_OK and _is_stale_session(str(df)):
+        logger.warning(f"[broker] naked-check stale session ({df}), reset 后重试一次")
+        _reset_ctx()
+        ctx = _get_ctx()
+        _ensure_unlocked()
+        ret, df = ctx.position_list_query(
+            code=option_code,
+            trd_env=_get_trd_env(),
+            acc_id=_ensure_account(),
+        )
+    if ret != RET_OK:
+        raise RuntimeError(f"position_list_query failed: {df}")
+    if df is None or len(df) == 0:
         return 0
     # position_side: LONG / SHORT
     row = df.iloc[0]
@@ -614,11 +650,10 @@ def get_last_prices(codes: list) -> dict:
         if pd.isna(last) or last is None or last <= 0:
             continue
         # freshness check：避免 OpenD 持旧 cache 或延迟数据账户。
-        # 注意：pandas 把 naive 字符串当 UTC，跟 time.time() (UTC epoch) 对齐。
-        # TODO：上真盘实际收数据后，验证 moomoo update_time 是 UTC 还是 ET / 服务器本地。
-        # 如果是非 UTC，要在 parse 时显式带 tz 再 .timestamp()。
+        # update_time 是无 tz 的美东时间，必须按 QUOTE_TZ 本地化再转 epoch
+        # （当 UTC 解析会整体偏早 4-5h，所有实时报价都被误判 stale）。
         try:
-            ts = pd.to_datetime(row["update_time"]).timestamp()
+            ts = _quote_epoch(row["update_time"])
             if now_ts - ts > QUOTE_FRESHNESS_SEC:
                 continue
         except Exception:
@@ -643,16 +678,27 @@ def get_last_price(option_code: str):
     return get_last_prices([option_code]).get(option_code)
 
 
+# 明确表示"合约不存在"的错误关键字。只有命中这些才 fail-closed 拒单；
+# 其余失败（quota backoff / 网络抖动 / OpenD 重启中 / 未知错误）一律 fail-open
+# 放行给 broker 自己判 —— 预校验是优化不是闸门，它挂了不能把合法信号拒掉。
+_DEFINITELY_MISSING_HINTS = (
+    "unknown stock", "cannot find", "no such", "invalid stock", "stock not exist",
+)
+
+
+def _is_definitely_missing(msg: str) -> bool:
+    s = (msg or "").lower()
+    return any(h in s for h in _DEFINITELY_MISSING_HINTS)
+
+
 def _validate_one(code: str) -> bool:
-    """单 code 校验。返回 True=可下单（含权限不足时的"未知放行"），False=确认不存在。"""
+    """单 code 校验。返回 True=可下单（含权限不足/瞬时失败时的"未知放行"），
+    False=**确认**不存在。"""
     ret, df = _snapshot([code])
     if ret != RET_OK:
-        msg_lower = str(df).lower()
-        # 账户没 OPRA 期权行情订阅 → 不能当作 contract 不存在，让 broker 自己判
-        if "no permission" in msg_lower or "quote permission" in msg_lower:
-            return True
-        # "Unknown stock" / "Cannot find" 类 → 真不存在
-        return False
+        # 只有明确 "Unknown stock" 类才判不存在；quota backoff、超时等
+        # 瞬时失败一律放行，让 broker 做最终裁决
+        return not _is_definitely_missing(str(df))
     if df is None or not hasattr(df, "iterrows") or len(df) == 0:
         return False
     return any(row.get("code") == code for _, row in df.iterrows())
@@ -697,7 +743,17 @@ def validate_option_codes(codes: list) -> dict:
         )
         return {c: True for c in codes}
 
-    # 其它失败（典型："Unknown stock. XXX" — 一个坏 code 拖累整 batch）
+    # 瞬时失败（quota backoff / 超时 / OpenD 抖动）→ fail-open 全部放行。
+    # 之前 fail-closed：backoff 期间 60s 内所有合法买单都被
+    # "contract not found" 误拒 —— 预校验不能变成闸门。
+    if not _is_definitely_missing(str(df)):
+        logger.warning(
+            f"[broker] validate transient failure ({str(df)[:100]}), "
+            f"fail-open: 放行 {len(codes)} 个 code 让 broker 判定"
+        )
+        return {c: True for c in codes}
+
+    # 明确 "Unknown stock" 类（一个坏 code 拖累整 batch）
     # 拆成 per-code 重查，隔离坏 code。代价 = N 次 RTT，但只在 batch 失败时才走
     if len(codes) > 1:
         logger.info(
@@ -708,7 +764,7 @@ def validate_option_codes(codes: list) -> dict:
             out[c] = _validate_one(c)
         return out
 
-    # 单 code 也失败 → 真不存在
+    # 单 code 且明确不存在 → 拒
     logger.warning(f"[broker] validate rejected {codes[0]}: {str(df)[:120]}")
     return out
 
@@ -891,8 +947,7 @@ def probe_quote_access() -> tuple[str, str]:
 
     # 5. 新鲜度（delayed-data tier 通常滞后 15 分钟）
     try:
-        import pandas as pd
-        update_ts = pd.to_datetime(opt_df.iloc[0]["update_time"]).timestamp()
+        update_ts = _quote_epoch(opt_df.iloc[0]["update_time"])
         age = time.time() - update_ts
         if age > 900:  # 15 分钟
             return QUOTE_DELAYED, (
