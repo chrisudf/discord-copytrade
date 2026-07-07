@@ -239,6 +239,20 @@ def format_close_skipped(reason: str, raw: str) -> str:
     )
 
 
+def format_addon_alert(symbol: str, raw: str) -> str:
+    """疑似加仓信号未执行（parser 不支持无 strike 的 add-on 简写）→ 提醒人工。
+
+    背景 7/6：KC "small add SPY @ 1.86" ×4 全部静默 parse-fail，
+    加仓被漏掉且无任何提醒（裸 ticker 不满足 _looks_like_open_attempt）。
+    """
+    return (
+        f"➕ *疑似加仓信号未执行*\n"
+        f"标的: *{escape_md(symbol)}* \\(已持仓\\)\n"
+        f"parser 不支持无 strike 的加仓简写，如需跟加请手动下单\n"
+        f"原文: ```\n{escape_md((raw or '')[:300])}\n```"
+    )
+
+
 def format_daily_summary(orders: int, total_cost: float,
                          max_orders: int, max_cost: float) -> str:
     """格式化每日统计"""

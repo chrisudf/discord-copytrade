@@ -569,3 +569,89 @@ def test_out_half_recognized_as_close():
     assert r is not None
     assert r["symbols"] == ["MSFT"]
     assert r["signal_price"] == 2.9
+
+
+# === 7/6 fraction & scaling-down 回归 ===
+# 昨晚实测：KC 高频用分数表达仓位（scaling out 1/3 / down to 1/2），
+# 且 "Scaling down" / ZH "减持"/"缩减至" 完全不在 close 词表里，
+# 分数一律落到默认 33%（"down to 1/3" 语义还相反，该卖 67%）。
+
+from src.parser.signal_parser import detect_action
+
+
+def test_detect_action_scaling_down():
+    assert detect_action("$IBM - Scaling down to 1/2 position sizing.") == "CLOSE"
+
+
+def test_detect_action_zh_jianchi_and_suojian():
+    assert detect_action("$IBM - 我在这里减持1/3。") == "CLOSE"
+    assert detect_action("$IBM - 将头寸规模缩减至 1/2。") == "CLOSE"
+
+
+def test_scaling_out_fraction_sells_that_fraction():
+    """7/6 23:53 'I'm scaling out 1/3 here' → 卖 33%"""
+    r = parse_close(
+        "$IBM - Nice profit cushion to start the week. I'm scaling out 1/3 here.",
+        {"IBM"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 33
+
+
+def test_down_to_fraction_sells_complement():
+    """7/6 00:36 'Scaling out more. Down to 1/3 of my position' → 剩 1/3 卖 67%
+
+    分数在 action 句外（两句式），靠全文兜底抓到；
+    "scaling out"（卖出向）和 "down to"（剩余向）同时出现时剩余向优先。
+    旧版：默认 33%，语义反了。
+    """
+    r = parse_close(
+        "$IBM - Scaling out more. Down to 1/3 of my position. Almost runners.",
+        {"IBM"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 67
+
+
+def test_scaling_down_to_half():
+    """7/6 23:58 'Scaling down to 1/2 position sizing' → 卖 50%（旧版不进 close 路径）"""
+    r = parse_close(
+        "$IBM - Scaling down to 1/2 position sizing. HAPPY MONDAY",
+        {"IBM"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 50
+
+
+def test_zh_jianchi_fraction():
+    """7/6 23:53 ZH '我在这里减持1/3' → 卖 33%（旧版 减持 不在词表，parse-fail）"""
+    r = parse_close("$IBM - 开周的不错利润缓冲。我在这里减持1/3。", {"IBM"})
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 33
+    assert r["lang"] == "zh"
+
+
+def test_zh_suojian_zhi_fraction():
+    """7/6 23:58 ZH '将头寸规模缩减至 1/2' → 剩 1/2 卖 50%"""
+    r = parse_close("$IBM - 将头寸规模缩减至 1/2。", {"IBM"})
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 50
+    assert r["lang"] == "zh"
+
+
+def test_date_not_mistaken_for_fraction():
+    """'trimmed 7/13 SPY puts' —— 7/13 是到期日不是分数（分母>5 拒），回落默认 33%。
+
+    没有这个 guard，"trimmed 7/13" 会算成卖 54%。
+    （注：故意不用 'sold 7/13 ...'——裸 "sold" 本来就不在 ACTION_VERBS，
+    只有 "sold here"，那种文本根本进不了 close 路径。）
+    """
+    r = parse_close("trimmed 7/13 SPY puts here @ 1.90", {"SPY"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 33

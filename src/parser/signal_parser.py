@@ -547,10 +547,15 @@ def _extract_tags(text: str) -> list:
 #   - all out / out half / out full / out majority (KC 平仓惯用短语)
 # 保守起见还是不加 selling / cutting / dumping —— 这些在开仓评论里也常见，
 # 加进来会误把 open 信号路由到 close 路径。
+#
+# 7/6 复盘补充：
+#   - "Scaling down to 1/2 position sizing"（EN）没进 close 路径 → 加 scaling down
+#   - ZH 翻译版 "减持1/3" / "缩减至 1/2" 同样漏 → 加 减持 / 缩减至|缩减到
+#     （不加裸 "缩减"：会误伤 "缩减购债" 类宏观评论）
 CLOSE_KEYWORDS = re.compile(
-    r"\b(closed?|closing|sold|exit|stopped|trim|trimmed|out of|scaling\s+out)\b"
+    r"\b(closed?|closing|sold|exit|stopped|trim|trimmed|out of|scaling\s+(?:out|down))\b"
     r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
-    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空",
+    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到",
     re.I,
 )
 

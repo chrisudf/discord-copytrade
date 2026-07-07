@@ -51,6 +51,7 @@ from src.notifier.telegram_client import (
     format_error,
     format_close_filled,
     format_close_skipped,
+    format_addon_alert,
 )
 from src.storage.logger_db import log_raw_signal, log_order
 from src.position import manager as position_mgr
@@ -334,7 +335,20 @@ async def handle_message(message):
         # 真·没匹配任何模式。只对"含 $TICKER + 侧别 + 价格"三件套的发 TG，
         # 否则视为 KC 状态评论/行情解说，仅 log（避免每晚 10+ 条 TG 噪音，见 6/24 review）
         logger.warning("Parse failed")
-        if _looks_like_open_attempt(raw):
+        # 先查 add-on（更具体）：加已持仓标的 + @price → 提醒人工跟加（7/6 SPY 漏加实锤）
+        addon_sym = _looks_like_addon_attempt(raw)
+        if addon_sym:
+            now = datetime.now(timezone.utc)
+            prev = _addon_alerted.get(addon_sym)
+            if prev is None or now - prev > _ADDON_ALERT_WINDOW:
+                _addon_alerted[addon_sym] = now
+                await _safe_notify(format_addon_alert(addon_sym, raw))
+            else:
+                logger.info(
+                    f"🔁 addon alert dedup: {addon_sym} "
+                    f"(prev {(now - prev).total_seconds():.0f}s ago)"
+                )
+        elif _looks_like_open_attempt(raw):
             await _safe_notify(format_error("Parse failed (looks like signal)", raw))
         return
 
@@ -606,6 +620,17 @@ async def _handle_close_signal(raw: str, msg_id: int):
         for pos in positions:
             qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
             if qty_to_sell <= 0:
+                # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
+                # 必须发专属 TG 并标记"已处理"——否则落到外层
+                # "no matching open positions" 兜底文案（7/6 IBM 两次实锤，
+                # 半夜看到会以为仓位状态错乱）
+                await _safe_notify(format_close_skipped(
+                    f"runner-preserve：{pos['symbol']} "
+                    f"{pos['strike']}{pos['side'][0]} 剩 1 张，"
+                    f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
+                    raw,
+                ))
+                any_executed = True
                 continue
             limit = _calc_sell_limit(
                 pos["avg_entry_price"], parsed.get("signal_price"),
@@ -713,6 +738,53 @@ def _looks_like_open_attempt(text: str) -> bool:
         and _OPEN_SIDE_RE.search(text)
         and _OPEN_PRICE_RE.search(text)
     )
+
+
+# ============================================================
+# 启发：疑似加仓（add-on）信号检测
+# ============================================================
+# 背景 7/6：KC "small add SPY @ 1.86" ×4（EN×2 + ZH×2）全部 parse-fail 静默丢弃。
+# 无 strike/side 的 add-on 没法自动执行（需要"关联已有仓位"上下文，错配风险
+# 同 follow-up close，见 close_parser 顶部注释），但至少要提醒人工——
+# 裸 ticker 不满足 _looks_like_open_attempt 的 $TICKER 要求，之前连 TG 都没有。
+_ADDON_KEYWORD_RE = _re.compile(r"\badd(?:ing|ed)?\b", _re.I)
+_ZH_ADDON_KEYWORDS = ("加仓", "补仓")
+# KC 的 add-on 惯例带 @price；没喊价的 add 评论不值得吵醒人
+_ADDON_PRICE_RE = _re.compile(r"@\s*\$?\s*\.?\d+(?:\.\d+)?")
+
+# 双语双发 dedup：同 symbol 5 分钟内只提醒一次（7/6 场景是 4 连发）
+_ADDON_ALERT_WINDOW = timedelta(minutes=5)
+_addon_alerted: dict[str, datetime] = {}
+
+
+def _looks_like_addon_attempt(text: str) -> "str | None":
+    """检测"疑似加仓已持仓标的"的简写信号。返回命中的 symbol，未命中返回 None。
+
+    三件套（缺一不可，控制误报）：
+      1. add 关键词（EN add/adding/added；ZH 加仓/补仓）
+      2. @price 写法
+      3. 文本中出现**我们已持仓**的 symbol（裸写或 $ 前缀都认）——
+         白名单消歧是关键：add-on 的语义就是加已有仓位，
+         白名单外的 ticker + add 多半是新开仓评论/闲聊
+    """
+    if not text:
+        return None
+    has_kw = bool(_ADDON_KEYWORD_RE.search(text)) or any(
+        k in text for k in _ZH_ADDON_KEYWORDS
+    )
+    if not has_kw or not _ADDON_PRICE_RE.search(text):
+        return None
+    try:
+        open_symbols = position_mgr.get_open_symbols()
+    except Exception as e:
+        logger.error(f"addon-check get_open_symbols failed: {e}")
+        return None
+    for sym in open_symbols:
+        # 汉字-字母边界 \b 不触发（"小加仓SPY"），用显式 alnum lookaround
+        # （同 close_parser.BARE_SYM_PATTERN_ZH 的做法）
+        if _re.search(rf"(?<![A-Za-z0-9]){_re.escape(sym)}(?![A-Za-z0-9])", text):
+            return sym
+    return None
 
 
 # 常见的中文公司名 → 大致映射到 ticker 的兜底（仅用作"这段文本里含 ticker 提及"判断，

@@ -183,3 +183,105 @@ async def test_no_strike_hint_keeps_legacy_symbol_only_behavior():
     assert len(sell_called) == 1, "无 strike hint 应保持旧 symbol-only 行为"
 
     positions_db.record_close(code, 2, 2.71, "manual", note="ut cleanup")
+
+
+# === 7/6 runner-preserve TG 文案回归 ===
+
+@pytest.mark.asyncio
+async def test_runner_preserve_reports_truthfully():
+    """1 张持仓 + trim 信号 → 跳过卖单，TG 必须说 runner-preserve，
+    不能落到 'no matching open positions' 兜底（7/6 IBM 两次实锤误导）。"""
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("RUN")
+    positions_db.open_or_add(
+        option_code=code, symbol="RUNX", strike=305.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=1, fill_price=2.11,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_run_1",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    sell_called = []
+
+    def fake_sell(*args, **kwargs):
+        sell_called.append((args, kwargs))
+        return {"success": True}
+
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "trimmed RUNX @ 2.85", msg_id=55555,
+        )
+
+    assert sell_called == [], "runner-preserve 不应触发卖单"
+    text = "\n".join(notifications)
+    assert "runner" in text.lower(), ("TG 应说明 runner-preserve", text)
+    assert "no matching" not in text.lower(), (
+        "不应再报误导性的 'no matching open positions'", text,
+    )
+    # 仓位原样保留
+    pos = positions_db.get(code)
+    assert pos["status"] == "OPEN"
+    assert pos["qty_remaining"] == 1
+
+
+# === 7/6 add-on 检测 ===
+
+def _open_addon_pos(symbol: str) -> str:
+    code = _uniq_code("ADO")
+    positions_db.open_or_add(
+        option_code=code, symbol=symbol, strike=742.0, side="PUT",
+        expiry=date(2026, 7, 13), qty=1, fill_price=2.57,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_addon",
+    )
+    return code
+
+
+def test_addon_detected_en_bare_ticker():
+    """7/6 00:31 'small add SPY @ 1.86' —— 裸 ticker + 持仓白名单 → 命中"""
+    _open_addon_pos("ADX1")
+    got = discord_client._looks_like_addon_attempt(
+        "KC Trades Bot:small add ADX1 @ 1.86, my stop is right above this zone near 750"
+    )
+    assert got == "ADX1"
+
+
+def test_addon_detected_zh():
+    """ZH 版 '小加仓SPY @ 1.86'（汉字-字母边界无 \\b，用 lookaround）"""
+    _open_addon_pos("ADX2")
+    got = discord_client._looks_like_addon_attempt(
+        "KC Trades Bot: 小加仓ADX2 @ 1.86, 止损位于750附近区域上方。"
+    )
+    assert got == "ADX2"
+
+
+def test_addon_not_held_symbol_returns_none():
+    """add + @price 但 symbol 不在持仓白名单 → None（新开仓评论不提醒）"""
+    got = discord_client._looks_like_addon_attempt(
+        "small add ZZQQ @ 2.10 looks good here"
+    )
+    assert got is None
+
+
+def test_addon_requires_price():
+    """持仓 symbol + add 但没喊价 → None（'can add more later' 类评论）"""
+    _open_addon_pos("ADX3")
+    got = discord_client._looks_like_addon_attempt(
+        "might add more ADX3 if we reclaim the level"
+    )
+    assert got is None
+
+
+def test_addon_requires_add_keyword():
+    """持仓 symbol + @price 但无 add 词 → None（普通评论）"""
+    _open_addon_pos("ADX4")
+    got = discord_client._looks_like_addon_attempt(
+        "ADX4 holding the line @ 1.86 nicely"
+    )
+    assert got is None

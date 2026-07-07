@@ -74,6 +74,7 @@ ACTION_VERBS = [
     "closing", "closed",
     "dumping", "dumped",
     "scaling out",
+    "scaling down",           # 7/6 "Scaling down to 1/2 position sizing"
     "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
     # KC 常用 "out" 短语（多词 phrase，双 layer 加入避免 false positive）
     "all out", "out half", "out full", "out majority",
@@ -99,6 +100,33 @@ BARE_SYM_PATTERN_ZH = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,5})(?![A-Za-z0-9])")
 
 # "N% LEFT" / "down to N% runners" / "runners only" → 卖 (100-N)%
 LEFT_PATTERN = re.compile(r"(\d{1,3})\s*%\s*(?:left|remaining)", re.I)
+
+# === 分数仓位表达（7/6 夜实测 KC 高频用法）===
+# 两种语义方向，容易搞反：
+#   "scaling out 1/3" / "selling 1/3" / "trimmed 1/2"       → 卖出 X/Y
+#   "down to 1/3 (of my position)" / "scaling down to 1/2"  → 剩 X/Y，卖 (1 - X/Y)
+# 日期防误伤（"sold my 7/13 puts"）：_fraction_pct 只认分母 2-5 且分子<分母。
+FRACTION_DOWN_TO_PATTERN = re.compile(
+    r"\bdown\s+to\s+(\d{1,2})\s*/\s*(\d{1,2})", re.I,
+)
+FRACTION_OUT_PATTERN = re.compile(
+    r"\b(?:out|trim(?:med|ming)?|sell(?:ing)?|sold|scaling\s+out)\s+"
+    r"(\d{1,2})\s*/\s*(\d{1,2})",
+    re.I,
+)
+# ZH："缩减至 1/2" / "减持到 1/3" / "剩下 1/4" → 剩余语义
+ZH_FRACTION_TO_PATTERN = re.compile(r"(?:至|到|剩下?|降至)\s*(\d{1,2})\s*/\s*(\d{1,2})")
+# ZH："减持1/3" / "卖出1/3" → 卖出语义（动词后紧跟分数）
+ZH_FRACTION_OUT_PATTERN = re.compile(
+    r"(?:减持|减仓|卖出|卖了|砍掉|砍仓|抛出|抛了)\s*了?\s*(\d{1,2})\s*/\s*(\d{1,2})"
+)
+
+
+def _fraction_pct(num: int, den: int) -> "int | None":
+    """X/Y → 百分比整数。分母 2-5 且分子<分母才当分数，否则视为日期（7/13）返 None。"""
+    if den < 2 or den > 5 or num < 1 or num >= den:
+        return None
+    return round(num * 100 / den)
 
 # KC 喊出的卖出价 —— 用来挂卖单限价，避免按 entry × 0.95 倒挂
 # 场景：
@@ -205,12 +233,17 @@ ZH_RECAP_MARKERS = [
 ZH_BULK_MARKERS = ["所有持仓", "全部持仓", "全部仓位"]
 
 # 当前动作动词
+# 7/6 加 减持 / 缩减至|缩减到（KC ZH 翻译的 "scaling out/down" 惯用词）。
+# 不加裸 "缩减"——"缩减购债" 类宏观评论会误触。
+# "减持" 理论上也可能出现在 "巴菲特减持苹果" 类新闻转述里，但风险与既有
+# 的 卖出/砍掉 相同（channel 只有 KC bot 发言 + symbol 白名单双保险），接受。
 ZH_ACTION_VERBS = [
     "减仓", "平仓", "清仓", "全平", "清空",
     "卖出", "卖了",
     "砍掉", "砍仓",
     "抛出", "抛了",
     "止盈",
+    "减持", "缩减至", "缩减到",
 ]
 
 # 全平动词 / 短语（pct 缺省 → 100）
@@ -238,7 +271,8 @@ def _has_full_close_verb(text_lower: str) -> bool:
 
 _ACTION_RE = re.compile("|".join(re.escape(v) for v in [
     "trimming", "trimmed", "cutting", "cut ", "selling", "sold here",
-    "closing", "closed", "dumping", "dumped", "scaling out", "bang!", "bang -",
+    "closing", "closed", "dumping", "dumped", "scaling out", "scaling down",
+    "bang!", "bang -",
     "all out", "out half", "out full", "out majority",
 ]), re.IGNORECASE)
 
@@ -334,10 +368,13 @@ def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
 def _extract_pct(text: str, text_lower: str) -> int:
     """提取卖出百分比。
 
-    规则：
+    规则（优先级从上到下）：
     - "30% LEFT" / "30% remaining" → 卖 70%
+    - "down to 1/3" → 剩 1/3，卖 67%（剩余语义，先查——
+      "Scaling out more. Down to 1/3" 两个方向的词都在，剩余语义才是对的）
+    - "scaling out 1/3" / "sold 1/2" → 卖 33% / 50%
     - "Selling 25%" → 卖 25%
-    - 无 % 数字：FULL_CLOSE_VERBS → 100%，否则 33%（trim 默认）
+    - 无数字：FULL_CLOSE_VERBS → 100%，否则 33%（trim 默认）
 
     扫描范围限制在 action 句内，避免抓到 commentary 里的 PnL %。
     PCT_PATTERN 已经排除了 -N% / +N%（PnL 标注）。
@@ -350,6 +387,23 @@ def _extract_pct(text: str, text_lower: str) -> int:
     if left_m:
         n = int(left_m.group(1))
         return max(1, min(100, 100 - n))
+
+    # 分数：先 action 句 scope，没有再全文兜底。
+    # KC 惯用两句式 "Scaling out more. Down to 1/3 of my position."——
+    # 分数落在 action 句外，只扫 scope 会漏（7/6 实测误判成默认 33）。
+    # 全文兜底安全性：recap 已在上层整条过滤；symbols / signal_price
+    # 仍然严格限 scope（那两个扫全文才有错平/错价风险，pct 没有）。
+    for search_space in (scope, text):
+        m = FRACTION_DOWN_TO_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, 100 - frac))
+        m = FRACTION_OUT_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, frac))
 
     pct_m = PCT_PATTERN.search(scope)
     if pct_m:
@@ -456,13 +510,26 @@ def _extract_zh_symbols(text: str, open_symbols: set[str]) -> list[str]:
 
 
 def _extract_zh_pct(text: str) -> int:
-    """中文版百分比抽取。"""
+    """中文版百分比抽取。优先级同 EN：剩余% → 剩余分数 → 卖出分数 → N%。"""
     scope = _zh_action_sentences(text)
 
     left_m = ZH_LEFT_PATTERN.search(scope)
     if left_m:
         n = int(left_m.group(1))
         return max(1, min(100, 100 - n))
+
+    # 分数：先 scope 后全文兜底（同 EN 版 _extract_pct 的两句式问题）
+    for search_space in (scope, text):
+        m = ZH_FRACTION_TO_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, 100 - frac))
+        m = ZH_FRACTION_OUT_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, frac))
 
     pct_m = PCT_PATTERN.search(scope)
     if pct_m:
