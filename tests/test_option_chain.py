@@ -2,14 +2,29 @@
 测试 moomoo OpenD 期权权限和期权链获取
 分层测试：基础连接 → 期权链 → 报价 → 订阅
 
-用法：
-    python -m scripts.test_option_chain
+这是一个交互式集成诊断脚本，依赖本地运行的 OpenD + 真实 moomoo 连接。
+
+两种跑法：
+    python tests/test_option_chain.py                       # 直接当脚本跑（推荐）
+    INTEGRATION_TESTS=1 pytest tests/test_option_chain.py   # 在 pytest 下也想跑就设 env
+
+默认 pytest 会跳过这个文件，避免没 OpenD 时 CI 报错。
 """
 import os
 import sys
+
+# 仅在 pytest 收集时跳过；直接 `python file.py` 不应触发 pytest.skip
+# 否则会以 module-level Skipped exception 退出
+if __name__ != "__main__" and not os.getenv("INTEGRATION_TESTS"):
+    import pytest
+    pytest.skip(
+        "需要本地 OpenD + moomoo 连接；设 INTEGRATION_TESTS=1 强制跑",
+        allow_module_level=True,
+    )
+
 from datetime import datetime, timedelta
 from moomoo import (
-    OpenSecTradeContext, OpenQuoteContext, 
+    OpenSecTradeContext, OpenQuoteContext,
     TrdEnv, TrdMarket, SecurityFirm,
     Market, OptionType, OptionCondType,
     RET_OK, RET_ERROR,

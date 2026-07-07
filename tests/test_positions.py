@@ -127,9 +127,12 @@ def test_get_open_symbols_excludes_closed():
 
 def test_manager_on_order_filled_routes_correctly():
     code = _uniq("MGR")
+    # 用相对日期 today+30 而非硬编码：避免日历走过 2026-06-25 后
+    # categorize() 把信号判成 0DTE → category 变 "0dte_lotto"
+    from datetime import timedelta
     signal = {
         "symbol": "MGRTEST", "strike": 10.0, "side": "CALL",
-        "expiry_date": date(2026, 6, 25), "price": 1.0,
+        "expiry_date": date.today() + timedelta(days=30), "price": 1.0,
         "tags": ["lotto"],
     }
     order_result = {
@@ -146,11 +149,75 @@ def test_manager_on_order_filled_routes_correctly():
     assert pos["avg_entry_price"] == pytest.approx(1.10)
 
 
+def test_reopen_resets_position_and_refreshes_flags():
+    """reopen（CLOSED 后同 code 再开）必须按新信号刷新全部元数据。
+
+    场景：DTE=5 开 weekly（eod_force_close=False）→ 全平 → 到期日当天
+    KC 重开同一合约 → categorize 判 0dte / eod_force_close=True。
+    旧实现沿用旧 flag → EOD watcher 不强平 → ITM 自动行权（lessons #14）。
+    """
+    code = _uniq("REO")
+    first = positions_db.open_or_add(
+        option_code=code, symbol="REOTEST", strike=10.0, side="CALL",
+        expiry=date(2026, 6, 25), qty=2, fill_price=1.00,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="chan_a", msg_id="m1",
+    )
+    positions_db.mark_tp_hit(code, 1)  # 旧仓位 T1 已触发过
+    positions_db.record_close(code, qty_sold=2, fill_price=2.00,
+                              trigger_source="kc_signal")
+
+    pos = positions_db.open_or_add(
+        option_code=code, symbol="REOTEST", strike=10.0, side="CALL",
+        expiry=date(2026, 6, 25), qty=1, fill_price=3.00,
+        category="0dte", apply_sl=False, eod_force_close=True, tags=["lotto"],
+        channel_name="chan_b", msg_id="m9",
+    )
+    # 数量/均价重置为本次数据（不与旧仓位加权平均）
+    assert pos["qty_total"] == 1
+    assert pos["qty_remaining"] == 1
+    assert pos["avg_entry_price"] == pytest.approx(3.00)
+    assert pos["status"] == "OPEN"
+    assert pos["closed_at"] is None
+    # 元数据按新信号刷新（本次修复的核心）
+    assert pos["category"] == "0dte"
+    assert pos["apply_sl"] is False
+    assert pos["eod_force_close"] is True
+    assert pos["tags"] == ["lotto"]
+    assert pos["channel_name"] == "chan_b"
+    assert pos["open_msg_id"] == "m9"
+    assert pos["opened_at"] != first["opened_at"]
+    # TP 档位清零，watcher 不会误跳过 T1
+    assert pos["tp_hits"] == 0
+
+
 def test_calc_qty_to_sell():
     pos = {"qty_remaining": 4}
     assert manager.calc_qty_to_sell(pos, 100) == 4
     assert manager.calc_qty_to_sell(pos, 50) == 2
     assert manager.calc_qty_to_sell(pos, 25) == 1
-    # 向上取整保证至少 1 张
+
+
+def test_calc_qty_to_sell_single_contract_runner_preserve():
+    """规则 v2 (7/2 起): 1 张持仓 + pct<100 → 不卖，保留 runner
+
+    历史损失驱动改动：6/30 SPY 748c、7/1 MSFT 390c 都是 1 张持仓被 KC 33% trim
+    信号直接全平，然后 KC 后续走到 +100%~+150% 我们没吃到。
+    """
     pos = {"qty_remaining": 1}
-    assert manager.calc_qty_to_sell(pos, 33) == 1
+    # trim 系列全部跳过
+    assert manager.calc_qty_to_sell(pos, 25) == 0
+    assert manager.calc_qty_to_sell(pos, 33) == 0
+    assert manager.calc_qty_to_sell(pos, 50) == 0
+    assert manager.calc_qty_to_sell(pos, 75) == 0
+    assert manager.calc_qty_to_sell(pos, 99) == 0
+    # 但 100% 明确清仓仍执行
+    assert manager.calc_qty_to_sell(pos, 100) == 1
+
+
+def test_calc_qty_to_sell_multi_contract_unchanged():
+    """规则 v2 只影响 qty=1；qty>=2 时保持向上取整行为"""
+    pos = {"qty_remaining": 2}
+    assert manager.calc_qty_to_sell(pos, 25) == 1  # ceil(0.5) = 1
+    assert manager.calc_qty_to_sell(pos, 50) == 1  # ceil(1.0) = 1
+    assert manager.calc_qty_to_sell(pos, 100) == 2

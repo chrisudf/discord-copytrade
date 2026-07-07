@@ -15,6 +15,7 @@ TODO（测试调整）：
   query_order_status 拿 dealt_avg_price，回填 avg_entry_price
 - on_close_filled 没算实际 PnL，等真实 fill 数据接入后补
 """
+import math
 from datetime import date, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -128,15 +129,30 @@ def find_by_symbol(symbol: str) -> list[dict]:
 def calc_qty_to_sell(position: dict, pct: int) -> int:
     """根据 close 信号给的 % 算实际卖出张数。
 
-    规则（v1）：
-    - pct=100 → 全平剩余
-    - 否则向上取整，至少卖 1 张
-      （信号说"trim 33%"但只剩 1 张 → 卖掉 1 张比留着合理，反正是 trim 意图）
+    规则（v2, 2026-07-02 开始）：
+    - pct >= 100 → 全平剩余（"closed all" / "out full" / KC 明确清仓）
+    - remaining == 1 且 pct < 100 → **不卖，保留 runner**
+      理由：跟单单张持仓时，任何 <100% 的 trim 数学上都会被 math.ceil 拉到 1，
+      即等于全平。历史损失：
+        - 6/30 SPY 748c：$2.59 → 我们 33% 平在 $2.71，KC 后续 4.00 (+40%)
+        - 7/1 MSFT 390c：$2.48 → 我们 33% 平在 $2.56，KC 后续 4.60 (+100%)
+      合计放弃 ~$330+/合约。选项 A（保留 runner）优于全平退出。
+      100% 明确清仓仍然会正常执行——不影响真反转信号。
+    - remaining > 1 → 向上取整（math.ceil 而非 round，round 是 banker's rounding，
+      remaining=5/pct=50 会误算 2 而非 3）
 
-    TODO: 实测后看 33% 是否应该向下取整保留 runner
+    TODO（等 OPRA 权限）：升级到策略 B —— 用报价判断"我们已经到 +X%"再选择性
+    响应 trim 信号（早期跟单，中后期变 runner）。见 docs/TODO.md 中 P0。
     """
     remaining = position["qty_remaining"]
     if pct >= 100:
         return remaining
-    qty = max(1, round(remaining * pct / 100))
+    if remaining == 1:
+        # 策略 A：保留 runner，等真正的 100% close 信号
+        logger.info(
+            f"[calc_qty_to_sell] runner-preserve: remaining=1 pct={pct}, "
+            f"skipping trim (option={position.get('option_code', '?')})"
+        )
+        return 0
+    qty = max(1, math.ceil(remaining * pct / 100))
     return min(qty, remaining)

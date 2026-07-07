@@ -211,26 +211,72 @@ def open_or_add(
             ))
             event_type = "OPEN"
         else:
-            # 加权平均：(old_qty*old_avg + new_qty*new_price) / total
-            old_total = existing["qty_total"]
-            old_avg = existing["avg_entry_price"]
-            new_total = old_total + qty
-            new_avg = (old_total * old_avg + qty * fill_price) / new_total
-            new_remaining = existing["qty_remaining"] + qty
-            conn.execute("""
-                UPDATE positions
-                SET qty_total = ?, qty_remaining = ?, avg_entry_price = ?,
-                    last_action_at = ?, status = ?
-                WHERE option_code = ?
-            """, (
-                new_total, new_remaining, new_avg,
-                now, "OPEN", option_code,
-            ))
-            event_type = "ADD_ON"
-            logger.info(
-                f"[positions] add-on {option_code}: +{qty} @ {fill_price:.2f} "
-                f"new_avg={new_avg:.2f} qty_rem={new_remaining}"
-            )
+            # 区分两种"同 option_code"场景：
+            #
+            # (1) reopen：已经平仓过（status='CLOSED' 或 qty_remaining=0），现在 KC 又
+            #     发新开仓信号。如果按加权平均继续算，旧仓位的成本基会污染新均价，
+            #     并且 tp_hits 不清零会让 TP watcher 误以为档位已经触发过、跳过。
+            #     → 视作全新开仓：重置 qty_total/avg = 本次数据，清 tp_hits，
+            #       event_type='OPEN'，closed_at = NULL。
+            #     category/apply_sl/eod_force_close/tags/channel/msg_id/opened_at
+            #     也必须一起刷新——caller 按"当前 DTE"重算过。若沿用旧值：
+            #     DTE=5 开的 weekly 平掉后在到期日 reopen，本地仍是
+            #     eod_force_close=False → EOD watcher 不强平 → ITM 自动行权
+            #     （lessons.md #14 的事故链）。反向场景会丢 SL。
+            #
+            # (2) add-on：仓位还活着（PARTIAL 或 OPEN+qty_remaining>0），同 KC 加仓。
+            #     → 加权平均，保留 tp_hits（如果 T1 已 hit，加仓后 T1 仍算 hit 过），
+            #       event_type='ADD_ON'。
+            #
+            # 下游查询全部按 `status IN ('OPEN','PARTIAL')` 过滤（见 get_open_positions），
+            # closed_at = NULL 在这里清是为了让 status+closed_at 状态一致，避免出现
+            # status='OPEN' 但 closed_at 非空的矛盾。
+            # existing 是 sqlite3.Row，不支持 .get()，要用索引（schema 保证两列都存在）
+            existing_status = existing["status"]
+            existing_remaining = existing["qty_remaining"]
+            is_reopen = existing_status == "CLOSED" or existing_remaining == 0
+
+            if is_reopen:
+                conn.execute("""
+                    UPDATE positions
+                    SET qty_total = ?, qty_remaining = ?, avg_entry_price = ?,
+                        category = ?, apply_sl = ?, eod_force_close = ?,
+                        tags = ?, channel_name = ?, open_msg_id = ?,
+                        opened_at = ?, last_action_at = ?, status = ?,
+                        closed_at = NULL, tp_hits = 0
+                    WHERE option_code = ?
+                """, (
+                    qty, qty, fill_price,
+                    category, int(apply_sl), int(eod_force_close),
+                    json.dumps(tags), channel_name, str(msg_id),
+                    now, now, "OPEN", option_code,
+                ))
+                event_type = "OPEN"  # 流水语义：这是新开仓不是加仓
+                logger.info(
+                    f"[positions] reopen {option_code}: prev status={existing_status} "
+                    f"remaining={existing_remaining}, new qty={qty} @ {fill_price:.2f}"
+                )
+            else:
+                # 加权平均：(old_qty*old_avg + new_qty*new_price) / total
+                old_total = existing["qty_total"]
+                old_avg = existing["avg_entry_price"]
+                new_total = old_total + qty
+                new_avg = (old_total * old_avg + qty * fill_price) / new_total
+                new_remaining = existing_remaining + qty
+                conn.execute("""
+                    UPDATE positions
+                    SET qty_total = ?, qty_remaining = ?, avg_entry_price = ?,
+                        last_action_at = ?, status = ?, closed_at = NULL
+                    WHERE option_code = ?
+                """, (
+                    new_total, new_remaining, new_avg,
+                    now, "OPEN", option_code,
+                ))
+                event_type = "ADD_ON"
+                logger.info(
+                    f"[positions] add-on {option_code}: +{qty} @ {fill_price:.2f} "
+                    f"new_avg={new_avg:.2f} qty_rem={new_remaining}"
+                )
 
         conn.execute("""
             INSERT INTO position_events (

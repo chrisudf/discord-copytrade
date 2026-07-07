@@ -35,17 +35,23 @@ load_dotenv(Path(__file__).resolve().parents[2] / "config" / ".env", override=Tr
 
 from src.parser.signal_parser import parse_signal, detect_action
 from src.parser.close_parser import parse_close
-from src.broker.moomoo_client import place_order, place_sell_order, breakeven_exit_price
-from src.config.channel_loader import registry
+from src.broker.moomoo_client import (
+    place_order,
+    place_sell_order,
+    breakeven_exit_price,
+    calc_limit_price,
+)
+from src.config.channel_loader import registry, validate_channels
 from src.risk.risk_manager import check_order, record_order
 from src.notifier.telegram_client import (
-    send_telegram_sync,
+    send_telegram,
     format_signal_alert,
     format_order_filled,
     format_risk_blocked,
     format_error,
     format_close_filled,
     format_close_skipped,
+    format_addon_alert,
 )
 from src.storage.logger_db import log_raw_signal, log_order
 from src.position import manager as position_mgr
@@ -212,21 +218,21 @@ def _extract_et_date(message) -> "date":
 @client.event
 async def on_ready():
     logger.info(f"Discord logged in as: {client.user} (id={client.user.id})")
-
-    enabled = registry.enabled_channel_ids()
-    logger.info(f"Monitoring {len(enabled)} channel(s):")
-    for cid in enabled:
-        cfg = registry.get(cid)
-        ch = client.get_channel(cid)
-        if ch is None:
-            # 看不到说明：token 没那个频道权限 / 不在那个服务器 / 频道 ID 错
-            logger.error(f"  ❌ {cfg.name} ({cid}) NOT visible!")
-        else:
-            guild = ch.guild.name if ch.guild else "DM"
-            logger.info(
-                f"  ✅ {cfg.name} ({cid}) → #{ch.name} @ {guild} "
-                f"qty={cfg.default_qty} max_price={cfg.max_price}"
+    failures = await validate_channels(client)
+    if failures:
+        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        await _safe_notify(format_error(
+            "频道配置校验失败",
+            f"{len(failures)}/{len(registry.enabled_channel_ids())} 个频道无法解析:\n{lines}\n\n"
+            f"请检查 config/channels.json 的 channel_id"
+        ))
+        if len(failures) == len(registry.enabled_channel_ids()):
+            logger.error(
+                "❌ 所有 enabled 频道都校验失败，listener 没有任何消息源 — 退出。"
+                " 修复 config/channels.json 后重启。"
             )
+            await client.close()
+            return
 
 
 @client.event
@@ -326,9 +332,24 @@ async def handle_message(message):
 
     # === [改动 Bug B] 区分 intentional skip vs 真·解析失败 ===
     if signal is None:
-        # 真·没匹配任何模式（rare），值得报警关注
+        # 真·没匹配任何模式。只对"含 $TICKER + 侧别 + 价格"三件套的发 TG，
+        # 否则视为 KC 状态评论/行情解说，仅 log（避免每晚 10+ 条 TG 噪音，见 6/24 review）
         logger.warning("Parse failed")
-        await _safe_notify(format_error("Parse failed", raw))
+        # 先查 add-on（更具体）：加已持仓标的 + @price → 提醒人工跟加（7/6 SPY 漏加实锤）
+        addon_sym = _looks_like_addon_attempt(raw)
+        if addon_sym:
+            now = datetime.now(timezone.utc)
+            prev = _addon_alerted.get(addon_sym)
+            if prev is None or now - prev > _ADDON_ALERT_WINDOW:
+                _addon_alerted[addon_sym] = now
+                await _safe_notify(format_addon_alert(addon_sym, raw))
+            else:
+                logger.info(
+                    f"🔁 addon alert dedup: {addon_sym} "
+                    f"(prev {(now - prev).total_seconds():.0f}s ago)"
+                )
+        elif _looks_like_open_attempt(raw):
+            await _safe_notify(format_error("Parse failed (looks like signal)", raw))
         return
 
     if signal.get("skip"):
@@ -392,6 +413,8 @@ async def handle_message(message):
     # 关键参数说明：
     # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
     # - qty 来自 channel 配置，不同 channel 可以设不同张数
+    # - effective_price: broker 实际会挂 signal_price × (1+5~12% slippage)，
+    #   成本类风控（单笔/当日累计）必须按挂单价算，否则 REAL $1000 硬顶被滑点穿透
     qty = cfg.default_qty
     risk_result = check_order(
         price=signal["price"],
@@ -402,6 +425,7 @@ async def handle_message(message):
         expiry=signal.get("expiry", ""),
         channel_name=cfg.name,
         max_price_override=cfg.max_price,
+        effective_price=calc_limit_price(signal["price"]),
     )
 
     if not risk_result.passed:
@@ -534,7 +558,10 @@ async def _handle_close_signal(raw: str, msg_id: int):
     parsed = parse_close(raw, open_symbols)
     if parsed is None:
         logger.info(f"[CLOSE] parser skipped: {raw[:80]}")
-        await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
+        # 只对"含 ticker + 价格 hint"的发 TG：捕获真漏检（如 ZH 公司名映射失败）
+        # 过滤无 ticker 的 follow-up close（如 "trim runners here at 3.45"）
+        if _looks_like_close_attempt(raw):
+            await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 
     # CLOSE dedup —— 双语双发 / 同信号重发拦截
@@ -556,17 +583,54 @@ async def _handle_close_signal(raw: str, msg_id: int):
     pct = parsed["pct"]
     any_executed = False
 
+    hint_strike = parsed.get("hint_strike")
+    hint_side = parsed.get("hint_side")
+
     for symbol in targets:
-        # 同 symbol 可能多 strike，全部按 pct 卖
-        # TODO：v1 全部对待；后续可能要按 strike/expiry 匹配 close 信号里的细节
         positions = position_mgr.find_by_symbol(symbol)
         if not positions:
             logger.warning(f"[CLOSE] {symbol} not found in open positions")
             continue
 
+        # strike-aware filter：close 文本里显式给了 strike+side 时只关匹配的仓位。
+        # 背景见 [docs/lessons.md](docs/lessons.md) #11：6/30 KC 平 TSLA 420c
+        # 触发我们平 TSLA 425c，这次运气好两个 strike 价差小，下次未必。
+        if hint_strike is not None and hint_side is not None:
+            matched = [
+                p for p in positions
+                if p["strike"] == hint_strike and p["side"] == hint_side
+            ]
+            if not matched:
+                logger.warning(
+                    f"[CLOSE] {symbol} {hint_strike}{hint_side[0]} hinted but "
+                    f"no matching position (have: "
+                    f"{[(p['strike'], p['side'][0]) for p in positions]}). Skipping."
+                )
+                await _safe_notify(format_close_skipped(
+                    f"strike 不匹配（KC 平 {symbol} {hint_strike}{hint_side[0]} 但我们持仓不同 strike）",
+                    raw,
+                ))
+                continue
+            logger.info(
+                f"[CLOSE] strike-filter: {symbol} {hint_strike}{hint_side[0]} → "
+                f"{len(matched)}/{len(positions)} positions selected"
+            )
+            positions = matched
+
         for pos in positions:
             qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
             if qty_to_sell <= 0:
+                # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
+                # 必须发专属 TG 并标记"已处理"——否则落到外层
+                # "no matching open positions" 兜底文案（7/6 IBM 两次实锤，
+                # 半夜看到会以为仓位状态错乱）
+                await _safe_notify(format_close_skipped(
+                    f"runner-preserve：{pos['symbol']} "
+                    f"{pos['strike']}{pos['side'][0]} 剩 1 张，"
+                    f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
+                    raw,
+                ))
+                any_executed = True
                 continue
             limit = _calc_sell_limit(
                 pos["avg_entry_price"], parsed.get("signal_price"),
@@ -642,18 +706,123 @@ async def _handle_close_signal(raw: str, msg_id: int):
 
 
 # ============================================================
+# 启发：判断"看起来像信号"，控制 TG 噪音
+# ============================================================
+# 背景：6/24 夜里 11 条 "Parse failed" TG 全是 KC 闲聊（"$RKLB - Boom."、
+# "AMZN +50% who got paid?!" 之类），实际不是漏检信号，但每条都炸 TG。
+# 改为：parse 失败时 → 只在文本"看起来真的想发信号"才 TG，否则 log.warn 收尾。
+
+import re as _re
+
+# 现成的"开仓"句法特征：含 $TICKER + (Nc/p|calls/puts) + 价格-like 数字
+_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b")
+_OPEN_SIDE_RE = _re.compile(r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b", _re.I)
+# 价格写法：$X.XX / @X.XX / .98 fill / .98 filled
+_OPEN_PRICE_RE = _re.compile(
+    r"\$\.?\d+(?:\.\d+)?"
+    r"|@\s*\$?\.?\d+(?:\.\d+)?"
+    r"|\.?\d+(?:\.\d+)?\s*fill(?:ed)?",
+    _re.I,
+)
+
+
+def _looks_like_open_attempt(text: str) -> bool:
+    """三件套都有 → 大概率是想发开仓信号但 parser 没接住。值得 TG。
+
+    否则一律视为 KC 状态评论 / recap / 行情解说，silence 即可。
+    """
+    if not text:
+        return False
+    return bool(
+        _OPEN_TICKER_RE.search(text)
+        and _OPEN_SIDE_RE.search(text)
+        and _OPEN_PRICE_RE.search(text)
+    )
+
+
+# ============================================================
+# 启发：疑似加仓（add-on）信号检测
+# ============================================================
+# 背景 7/6：KC "small add SPY @ 1.86" ×4（EN×2 + ZH×2）全部 parse-fail 静默丢弃。
+# 无 strike/side 的 add-on 没法自动执行（需要"关联已有仓位"上下文，错配风险
+# 同 follow-up close，见 close_parser 顶部注释），但至少要提醒人工——
+# 裸 ticker 不满足 _looks_like_open_attempt 的 $TICKER 要求，之前连 TG 都没有。
+_ADDON_KEYWORD_RE = _re.compile(r"\badd(?:ing|ed)?\b", _re.I)
+_ZH_ADDON_KEYWORDS = ("加仓", "补仓")
+# KC 的 add-on 惯例带 @price；没喊价的 add 评论不值得吵醒人
+_ADDON_PRICE_RE = _re.compile(r"@\s*\$?\s*\.?\d+(?:\.\d+)?")
+
+# 双语双发 dedup：同 symbol 5 分钟内只提醒一次（7/6 场景是 4 连发）
+_ADDON_ALERT_WINDOW = timedelta(minutes=5)
+_addon_alerted: dict[str, datetime] = {}
+
+
+def _looks_like_addon_attempt(text: str) -> "str | None":
+    """检测"疑似加仓已持仓标的"的简写信号。返回命中的 symbol，未命中返回 None。
+
+    三件套（缺一不可，控制误报）：
+      1. add 关键词（EN add/adding/added；ZH 加仓/补仓）
+      2. @price 写法
+      3. 文本中出现**我们已持仓**的 symbol（裸写或 $ 前缀都认）——
+         白名单消歧是关键：add-on 的语义就是加已有仓位，
+         白名单外的 ticker + add 多半是新开仓评论/闲聊
+    """
+    if not text:
+        return None
+    has_kw = bool(_ADDON_KEYWORD_RE.search(text)) or any(
+        k in text for k in _ZH_ADDON_KEYWORDS
+    )
+    if not has_kw or not _ADDON_PRICE_RE.search(text):
+        return None
+    try:
+        open_symbols = position_mgr.get_open_symbols()
+    except Exception as e:
+        logger.error(f"addon-check get_open_symbols failed: {e}")
+        return None
+    for sym in open_symbols:
+        # 汉字-字母边界 \b 不触发（"小加仓SPY"），用显式 alnum lookaround
+        # （同 close_parser.BARE_SYM_PATTERN_ZH 的做法）
+        if _re.search(rf"(?<![A-Za-z0-9]){_re.escape(sym)}(?![A-Za-z0-9])", text):
+            return sym
+    return None
+
+
+# 常见的中文公司名 → 大致映射到 ticker 的兜底（仅用作"这段文本里含 ticker 提及"判断，
+# 不参与下单）。命中即认为 close skipped TG 有价值。
+_ZH_TICKER_HINTS = ("亚马逊", "微软", "特斯拉", "苹果", "英伟达", "谷歌", "脸书", "网飞")
+
+
+def _looks_like_close_attempt(text: str) -> bool:
+    """close_parser 返回 None 但文本里有 ticker + 价格-like → 值得 TG（可能漏接）
+
+    "can trim some runners here at 3.45" 这种没 ticker 的 follow-up → silence
+    """
+    if not text:
+        return False
+    has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
+    # 价格-like：$X / @X / 任何 d.dd（不用 \b 边界，因为中文+数字无 word boundary）
+    has_price_hint = bool(_re.search(r"\$\.?\d|@\s*\.?\d|\d+\.\d{1,2}", text))
+    return has_ticker and has_price_hint
+
+
+# ============================================================
 # 工具：Telegram 通知
 # ============================================================
 async def _safe_notify(msg: str):
+    """发 Telegram，失败只 log 不抛。
+
+    return 值打 log 是为了让运营在 log 里能确认 TG 链路是否工作
+    （send_telegram 成功只在 debug 级；6/23 OSCR 拒单 TG 是否发出去看不出）。
     """
-    发 Telegram，失败只 log 不抛。
-    用 to_thread 是因为 send_telegram_sync 内部用 httpx 同步调用，
-    不能在事件循环里阻塞。
-    """
+    head = msg.replace("\n", " ")[:60]
     try:
-        await asyncio.to_thread(send_telegram_sync, msg)
+        ok = await send_telegram(msg)
+        if ok:
+            logger.info(f"[notify] TG sent: {head}")
+        else:
+            logger.warning(f"[notify] TG send returned False: {head}")
     except Exception as e:
-        logger.error(f"telegram notify failed: {e}")
+        logger.error(f"[notify] TG raised: {type(e).__name__}: {e} (msg head: {head})")
 
 
 # ============================================================

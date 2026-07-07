@@ -90,9 +90,20 @@ MONTH_NAMES_RE = (
 
 
 # ===== Pre-filter =====
+# 注意：bare "holding" 之前会误伤 "holding up well" 这种描述价格走势的状态语，
+# 导致 6/23 APLD weekly $50 calls $.66 真信号被 skip。
+# 改为精确短语清单，只 skip 明确"我在持有/已持有"语境。
+# 风险：若 KC 出现 "Started holding AMZN 255c @ 2.25" 这种边缘写法，
+# 会被当真信号下单。实测样本里没出现，等真碰到再加。
 SKIP_KEYWORDS = [
-    "holding", "remaining", "into tomorrow",
-    "持仓", "i'm holding", "im holding",
+    "remaining", "into tomorrow", "持仓",
+    # 第一人称主语 + holding
+    "i'm holding", "im holding", "i am holding",
+    # 状语 + holding
+    "still holding", "currently holding", "just holding", "keep holding",
+    # holding + 明确的所有物/介词
+    "holding my", "holding the", "holding all", "holding our",
+    "holding into", "holding overnight", "holding tight",
 ]
 
 PRICE_RANGE_PATTERN = re.compile(
@@ -171,7 +182,7 @@ def parse_signal(text: str, msg_ts: date = None):
         logger.info(f"[parser] skip (price range): {text[:60]}")
         return {"skip": "price_range"}
 
-    sig = _try_pattern_a(text, today) or _try_pattern_b(text, today)
+    sig = _try_pattern_a(text, today) or _try_pattern_b(text, today) or _try_pattern_c(text, today)
 
     if sig is None:
         logger.warning(f"[parser] no signal: {text[:80]}")
@@ -427,6 +438,83 @@ def _try_pattern_b(text: str, today: date):
     return None
 
 
+def _try_pattern_c(text: str, today: date):
+    """Pattern C: 简写 `$SYMBOL <STRIKE><c|p> [weeklies|MM/DD] ... <PRICE>`
+
+    覆盖 6/22 漏接的 KC 风格简写，例如：
+        "Adding $APLD 50c weeklies here @role_1362xxx +alert .98 fill"
+        "$APLD 50p 7/2 .85 fill"
+
+    与 A/B 的关键差异：
+      - strike 用单字符 `c`/`p` 而非 `calls/puts`（A 是无 $，B 要求 `calls/puts`）
+      - expiry 缺省时默认 next Friday（信号文本通常含 weeklies 字样但非强制）
+      - 价格容忍多种写法：`.98 fill` / `@.98` / `$0.98` / `@$ 0.98`
+
+    为避免误伤：
+      - symbol 必须有 `$` 前缀
+      - 必须能找到至少一种合法价格写法（不接受裸数字 .98 没有上下文）
+    """
+    # 锚点：$SYMBOL N(c|p)，c/p 后要么是 word boundary，要么紧跟空白/标点
+    anchor = re.search(
+        r"\$([A-Z]{1,5})\s+(\d+(?:\.\d+)?)([cp])(?=\b|\s|$)",
+        text, re.IGNORECASE,
+    )
+    if anchor is None:
+        return None
+    symbol, strike, cp = anchor.groups()
+
+    # anchor 之后的窗口（限制范围避免跨段误匹配）
+    after = text[anchor.end(): anchor.end() + 200]
+    # Discord 角色提及 @role_数字 会被价格扫描误伤，先剔
+    after_clean = re.sub(r"@role_\d+", " ", after)
+
+    # 找 expiry
+    expiry_str = "weekly"
+    mmdd = re.search(r"\b(\d{1,2})/(\d{1,2})\b", after_clean[:80])
+    dte = re.search(r"\b(\d+)\s*dte\b", after_clean[:80], re.I)
+    if mmdd:
+        mm, dd = int(mmdd.group(1)), int(mmdd.group(2))
+        expiry_str = f"{mm}/{dd}"
+        expiry_date = _adjust_expiry(smart_expiry(mm, dd, today=today), context="C MM/DD")
+    elif dte:
+        n = int(dte.group(1))
+        expiry_str = f"{n}DTE"
+        expiry_date = _adjust_expiry(today + timedelta(days=n), context="C NDTE")
+    else:
+        expiry_date = _adjust_expiry(_next_friday(today), context="C weekly")
+
+    # 找价格：按从严到宽依次扫
+    price = None
+    for pattern in (
+        r"@\s*\$\s*(\.?\d+(?:\.\d+)?)",         # @$.98 / @$ 0.98
+        r"@\s*(\.?\d+(?:\.\d+)?)\b",            # @.98 / @0.98
+        r"fill(?:ed)?\s*@\s*\$?\s*(\.?\d+(?:\.\d+)?)",  # filled @ .98
+        r"(\.?\d+(?:\.\d+)?)\s*fill(?:ed)?\b",  # .98 fill (用户实际信号)
+        r"\$\s*(\.?\d+(?:\.\d+)?)\b",           # $.98 / $0.98
+    ):
+        m = re.search(pattern, after_clean, re.I)
+        if m:
+            try:
+                price = float(m.group(1))
+                break
+            except ValueError:
+                continue
+    if price is None:
+        return None
+
+    return {
+        "raw": text,
+        "matched": anchor.group(0).strip(),
+        "symbol": symbol.upper(),
+        "side": "CALL" if cp.lower() == "c" else "PUT",
+        "strike": float(strike),
+        "expiry": expiry_str,
+        "expiry_date": expiry_date,
+        "price": price,
+        "tags": _extract_tags(text),
+    }
+
+
 def _extract_tags(text: str) -> list:
     """从 KC 信号文本抽 tag，给后续 category/分析用。
 
@@ -449,9 +537,25 @@ def _extract_tags(text: str) -> list:
 # ===== Action detection =====
 # 必须双语都覆盖。否则 ZH close 信号会被路由到 OPEN parser，浪费一次解析失败
 # + 错过中文先到的场景。
+#
+# 7/3 复盘发现：KC 用 `closing the MSFT 390c runner here at 5.00` 时
+# `closed?` 只匹配 "close"/"closed"，不匹配 gerund "closing"。ZH 版本
+# "平仓" 命中所以走了 close 路径，EN 掉去 OPEN parser 失败。
+# 修法：把 KC 高频用的 gerund 和多词短语加进来，跟 close_parser.ACTION_VERBS 对齐：
+#   - closing (gerund)
+#   - scaling out (KC 常见 phrase)
+#   - all out / out half / out full / out majority (KC 平仓惯用短语)
+# 保守起见还是不加 selling / cutting / dumping —— 这些在开仓评论里也常见，
+# 加进来会误把 open 信号路由到 close 路径。
+#
+# 7/6 复盘补充：
+#   - "Scaling down to 1/2 position sizing"（EN）没进 close 路径 → 加 scaling down
+#   - ZH 翻译版 "减持1/3" / "缩减至 1/2" 同样漏 → 加 减持 / 缩减至|缩减到
+#     （不加裸 "缩减"：会误伤 "缩减购债" 类宏观评论）
 CLOSE_KEYWORDS = re.compile(
-    r"\b(closed?|sold|exit|stopped|trim|trimmed|out of)\b"
-    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空",
+    r"\b(closed?|closing|sold|exit|stopped|trim|trimmed|out of|scaling\s+(?:out|down))\b"
+    r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b"
+    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到",
     re.I,
 )
 

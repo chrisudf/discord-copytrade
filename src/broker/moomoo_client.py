@@ -28,23 +28,33 @@ TODO: 用 Polygon 回测后用真实 fill 数据校准这三档
 }
 """
 import os
+import threading
+import time
 from datetime import date
 from src.utils.logger import logger
 
 # ---- 配置（从 .env 读取） ----
 DEFAULT_QTY = int(os.getenv("DEFAULT_QTY", 1))
-TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE")
+# .strip().upper() 防止 .env 写成 "simulate" / " REAL " 之类导致下面所有 == 判断失效
+TRD_ENV_STR = os.getenv("MOOMOO_TRD_ENV", "SIMULATE").strip().upper()
 OPEND_HOST = os.getenv("MOOMOO_HOST", "127.0.0.1")
 OPEND_PORT = int(os.getenv("MOOMOO_PORT", 11111))
 # .env 里统一 MOOMOO_TRD_* 前缀（TRD_ENV / TRD_PWD），跟原 MOOMOO_TRADE_PWD 对齐
 # 模拟盘 SIMULATE 不需要密码所以历史没发现这个 typo，上真盘前必修
-TRADE_PWD = os.getenv("MOOMOO_TRD_PWD", "")
+# 兼容老 .env 里的 MOOMOO_TRADE_PWD：旧名字命中时打个 warn 提示迁移
+_legacy_pwd = os.getenv("MOOMOO_TRADE_PWD")
+TRADE_PWD = os.getenv("MOOMOO_TRD_PWD") or _legacy_pwd or ""
+if _legacy_pwd and not os.getenv("MOOMOO_TRD_PWD"):
+    logger.warning(
+        "[broker] 检测到旧 env 名 MOOMOO_TRADE_PWD，建议改为 MOOMOO_TRD_PWD（见 .env.example）"
+    )
 ACC_ID = int(os.getenv("MOOMOO_ACC_ID", 0))
 
 # ---- SDK 导入 ----
 try:
     from moomoo import (
-        OpenSecTradeContext, TrdMarket, SecurityFirm,
+        OpenSecTradeContext, OpenQuoteContext,
+        TrdMarket, SecurityFirm,
         TrdSide, OrderType, TrdEnv, RET_OK,
     )
     SDK_AVAILABLE = True
@@ -55,6 +65,23 @@ except ImportError:
 # ---- 模块级单例 ----
 _ctx = None
 _unlocked = False
+
+# Quote context（行情）独立单例：跟 trd_ctx 解耦避免互相干扰
+# 必须用 threading.Lock 而非 asyncio.Lock：SDK 同步调用通过 to_thread 跑，
+# 多个 watcher 并发调时是真线程并发，asyncio lock 不管用
+_quote_ctx = None
+_quote_lock = threading.Lock()
+
+# 真盘行情限频 backoff（snapshot 60 次/30s 命中后整段冷却）
+_quote_backoff_until: float = 0.0
+
+# get_last_price 真盘路径日志去重（早期未实现时用，保留作为 fallback warning）
+_real_quote_warned_once: bool = False
+_real_quote_warned_codes: set[str] = set()
+
+# 行情新鲜度阈值（秒）：snapshot.update_time 比 now 旧超过这个值视为 stale
+# 延迟数据账户拿到的报价 ~15min 旧，会全部被这个阈值过滤掉 → 启动 probe 时会暴露
+QUOTE_FRESHNESS_SEC = 60.0
 
 
 def _reset_ctx():
@@ -69,6 +96,30 @@ def _reset_ctx():
     _ctx = None
     _unlocked = False
     logger.warning("[broker] ctx reset, will reconnect on next call")
+
+
+def _get_quote_ctx():
+    """懒加载 quote_ctx 单例。失败抛异常由调用方 catch。"""
+    global _quote_ctx
+    if _quote_ctx is None:
+        if not SDK_AVAILABLE:
+            raise RuntimeError("moomoo SDK not installed")
+        logger.info(f"[broker] 连接 quote OpenD {OPEND_HOST}:{OPEND_PORT}")
+        _quote_ctx = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
+    return _quote_ctx
+
+
+def _reset_quote_ctx():
+    """quote 链路异常时重置；下次调用会重连。
+    跟 _reset_ctx 解耦——交易和行情走两条独立 socket，互不影响。"""
+    global _quote_ctx
+    if _quote_ctx is not None:
+        try:
+            _quote_ctx.close()
+        except Exception:
+            pass
+    _quote_ctx = None
+    logger.warning("[broker] quote_ctx reset, will reconnect on next call")
 
 
 def _is_dry_run() -> bool:
@@ -103,9 +154,12 @@ def _get_slippage_pct(price: float) -> float:
         return 0.05
 
 
-def _calc_limit_price(price: float) -> float:
+def calc_limit_price(price: float) -> float:
     """
     计算挂单限价 = entry_price * (1 + slippage_pct)，2 位小数。
+
+    公开导出：listener 风控前也要调它——Layer 2/3/4 的成本必须按
+    实际挂单价算，否则 REAL $1000 硬顶会被 slippage 突破最多 12%。
 
     TODO: 加入 Penny Pilot tick 档位对齐
     - Penny Pilot (IREN/SPY/QQQ/HOOD 等)：tick = $0.01，当前 round(2) 已对齐
@@ -140,20 +194,42 @@ def _ensure_account():
 
 
 def _ensure_unlocked():
-    """首次调用解锁交易。模拟盘可能不需要密码。"""
+    """首次调用解锁交易。
+
+    moomoo SIMULATE 模式 **不支持** unlock_trade —— 调它必返回
+    "ERROR. No one available account!"（即使 acc_status=ACTIVE）。
+    因此 SIMULATE 永远跳过，无论 TRADE_PWD 是否配置。
+    """
     global _unlocked
     if _unlocked:
         return
-    ctx = _get_ctx()
-    if TRD_ENV_STR == "SIMULATE" and not TRADE_PWD:
-        logger.info("[broker] 模拟盘且无密码，跳过 unlock_trade")
+    if TRD_ENV_STR == "SIMULATE":
+        logger.info("[broker] SIMULATE 模式，跳过 unlock_trade（moomoo 不支持）")
         _unlocked = True
         return
+    ctx = _get_ctx()
+    if not TRADE_PWD:
+        raise RuntimeError("REAL 模式但 MOOMOO_TRD_PWD 未配置，无法 unlock_trade")
     ret, data = ctx.unlock_trade(password=TRADE_PWD, is_unlock=True)
     if ret != RET_OK:
         raise RuntimeError(f"unlock_trade failed: {data}")
     _unlocked = True
-    logger.info("[broker] unlock_trade OK")
+    logger.info("[broker] unlock_trade OK (REAL)")
+
+
+# moomoo 会话/账户失效返回的关键字（小写匹配）。命中时 reset ctx + 重试一次。
+# 之所以放白名单：避免把"价格无效""超额"等业务拒单也当成 stale 反复重试。
+_STALE_SESSION_HINTS = (
+    "no one available account",   # SIMULATE 会话过期 / 账户挂起
+    "account is not unlock",      # 真盘 unlock 状态丢失
+    "session",                    # 通用 session 失效
+    "not login",                  # OpenD 失连
+)
+
+
+def _is_stale_session(msg: str) -> bool:
+    s = (msg or "").lower()
+    return any(h in s for h in _STALE_SESSION_HINTS)
 
 
 def breakeven_exit_price(entry_price: float, sell_slip: float = 0.05) -> tuple[float, float]:
@@ -214,7 +290,7 @@ def place_order(signal: dict, qty: int = None) -> dict:
         signal["strike"], signal["side"],
     )
     entry_price = signal["price"]
-    limit_price = _calc_limit_price(entry_price)
+    limit_price = calc_limit_price(entry_price)
     slip_pct = _get_slippage_pct(entry_price)
 
     dry_run = _is_dry_run()
@@ -232,13 +308,26 @@ def place_order(signal: dict, qty: int = None) -> dict:
             "qty": qty, "price": limit_price,
         }
 
+    # ---- contract 预校验：避免 broker "Cannot find" 拒单（6/22 OSCR / 6/29 TEM/DRAM）
+    # 用 quote snapshot 试取一次，找不到直接返回 rejected 不走 broker。
+    # 节省一次 broker RTT，且错误消息更明确（运营能知道是 strike/expiry 不存在）。
+    valid = validate_option_codes([option_code])
+    if not valid.get(option_code):
+        msg = f"option contract not found on OPRA: {option_code} (check strike/expiry exists)"
+        logger.error(f"[broker] pre-validate rejected: {msg}")
+        return {
+            "success": False, "message": msg,
+            "order_id": None, "code": option_code,
+            "qty": qty, "price": limit_price,
+        }
+
     # ---- 真实下单 ----
     try:
         ctx = _get_ctx()
         acc_id = _ensure_account()
         _ensure_unlocked()
 
-        ret, data = ctx.place_order(
+        order_args = dict(
             price=limit_price,
             qty=qty,
             code=option_code,
@@ -248,6 +337,14 @@ def place_order(signal: dict, qty: int = None) -> dict:
             acc_id=acc_id,
             remark="discord_auto",
         )
+        ret, data = ctx.place_order(**order_args)
+        # 中途 session 失效 → 重连 + 重试一次。避免昨晚 SNOW 那种"运行半夜忽然账户挂"丢信号
+        if ret != RET_OK and _is_stale_session(str(data)):
+            logger.warning(f"[broker] stale session ({data}), reset 后重试一次")
+            _reset_ctx()
+            ctx = _get_ctx()
+            _ensure_unlocked()
+            ret, data = ctx.place_order(**order_args)
         if ret == RET_OK:
             order_id = str(data["order_id"].iloc[0])
             logger.info(f"[broker] 下单成功 order_id={order_id}")
@@ -271,6 +368,29 @@ def place_order(signal: dict, qty: int = None) -> dict:
             "order_id": None, "code": option_code,
             "qty": qty, "price": limit_price,
         }
+
+
+def _get_long_qty(option_code: str) -> int:
+    """查 broker 里持有的 long qty。用于 naked-short 防护。
+
+    Returns:
+        long qty（>= 0）。broker 无此 code 或 qty 为 SHORT → 返 0。
+    """
+    ctx = _get_ctx()
+    ret, df = ctx.position_list_query(
+        code=option_code,
+        trd_env=_get_trd_env(),
+        acc_id=_ensure_account(),
+    )
+    if ret != RET_OK or df is None or len(df) == 0:
+        return 0
+    # position_side: LONG / SHORT
+    row = df.iloc[0]
+    side = str(row.get("position_side", "")).upper()
+    qty = int(row.get("qty", 0))
+    if side != "LONG" or qty <= 0:
+        return 0
+    return qty
 
 
 def place_sell_order(
@@ -316,12 +436,37 @@ def place_sell_order(
             "code": option_code, "qty": qty, "price": limit_price,
         }
 
+    # ---- Naked-short 防护 ----
+    # 系统只允许卖出已持有的 long option。不能挂 SELL 让 broker 视作开裸空仓。
+    # 背景：7/2 发现本地 DB 与 broker 严重脱钩（自动 exercise 后本地仍 OPEN），
+    # 如果后续 close 信号误触发 SELL，broker 会当"开裸空 call/put"处理 —— 无限风险。
+    # 见 docs/lessons.md #15。
+    try:
+        available = _get_long_qty(option_code)
+    except Exception as e:
+        logger.exception(f"[broker] naked-check position_list_query failed for {option_code}")
+        return {
+            "success": False,
+            "message": f"naked-short check failed (position_list_query exception): {e}",
+            "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
+        }
+    if available < qty:
+        msg = (
+            f"naked-short refused: broker has only {available} long of {option_code}, "
+            f"asked to sell {qty}. This would open a naked short — refusing."
+        )
+        logger.error(f"[broker] {msg}")
+        return {
+            "success": False, "message": msg,
+            "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
+        }
+
     try:
         ctx = _get_ctx()
         acc_id = _ensure_account()
         _ensure_unlocked()
 
-        ret, data = ctx.place_order(
+        order_args = dict(
             price=limit_price,
             qty=qty,
             code=option_code,
@@ -331,6 +476,13 @@ def place_sell_order(
             acc_id=acc_id,
             remark=remark,
         )
+        ret, data = ctx.place_order(**order_args)
+        if ret != RET_OK and _is_stale_session(str(data)):
+            logger.warning(f"[broker] sell stale session ({data}), reset 后重试一次")
+            _reset_ctx()
+            ctx = _get_ctx()
+            _ensure_unlocked()
+            ret, data = ctx.place_order(**order_args)
         if ret == RET_OK:
             order_id = str(data["order_id"].iloc[0])
             logger.info(f"[broker] 卖单成功 order_id={order_id}")
@@ -398,47 +550,366 @@ def query_order_status(order_id: str) -> dict:
                 "status": None, "filled_qty": 0, "filled_avg_price": 0.0}
 
 
-def get_last_price(option_code: str):
-    """查期权最新成交价。SL / EOD watcher 用。
+def _snapshot(codes: list) -> "tuple[int, object]":
+    """单层 wrapper：处理 lock、限频 backoff、异常 reset。返回 (ret, df_or_msg)。
 
-    返回:
+    设计见 docs/realtime_quote_design.md (PR 1)。
+    """
+    global _quote_backoff_until
+    now = time.monotonic()
+    if now < _quote_backoff_until:
+        return -1, f"backoff (limit/quota) for another {_quote_backoff_until - now:.0f}s"
+
+    try:
+        with _quote_lock:
+            ctx = _get_quote_ctx()
+            ret, df = ctx.get_market_snapshot(codes)
+    except Exception as e:
+        logger.exception("[broker] snapshot exception")
+        _reset_quote_ctx()
+        return -1, f"exception: {type(e).__name__}"
+
+    if ret != RET_OK:
+        msg = str(df)
+        if "quota" in msg.lower() or "limit" in msg.lower():
+            _quote_backoff_until = time.monotonic() + 60.0
+            logger.warning(f"[broker] snapshot quota/limit exceeded, backoff 60s: {msg[:120]}")
+    return ret, df
+
+
+def get_last_prices(codes: list) -> dict:
+    """批量取期权最新价。SL/TP/EOD watcher 应每 tick 调用一次（而非 N×get_last_price）。
+
+    Returns:
+        {code: float | None}，找不到/stale/无成交 一律 None
+    """
+    out = {c: None for c in codes}
+    if not codes:
+        return out
+
+    if _is_dry_run():
+        for c in codes:
+            per = os.getenv(f"MOCK_LAST_PRICE_{c}")
+            if per:
+                out[c] = float(per)
+                continue
+            fixed = os.getenv("MOCK_LAST_PRICE")
+            if fixed:
+                out[c] = float(fixed)
+        return out
+
+    ret, df = _snapshot(codes)
+    if ret != RET_OK or df is None:
+        return out
+    if not hasattr(df, "iterrows") or len(df) == 0:
+        return out
+
+    import pandas as pd  # 仅 SDK 路径需要，pandas 是 moomoo 必装依赖
+    now_ts = time.time()
+    for _, row in df.iterrows():
+        code = row.get("code")
+        if code not in out:
+            continue
+        last = row.get("last_price")
+        if pd.isna(last) or last is None or last <= 0:
+            continue
+        # freshness check：避免 OpenD 持旧 cache 或延迟数据账户。
+        # 注意：pandas 把 naive 字符串当 UTC，跟 time.time() (UTC epoch) 对齐。
+        # TODO：上真盘实际收数据后，验证 moomoo update_time 是 UTC 还是 ET / 服务器本地。
+        # 如果是非 UTC，要在 parse 时显式带 tz 再 .timestamp()。
+        try:
+            ts = pd.to_datetime(row["update_time"]).timestamp()
+            if now_ts - ts > QUOTE_FRESHNESS_SEC:
+                continue
+        except Exception:
+            pass  # update_time 缺失时仍信任 snapshot（少见）
+        out[code] = float(last)
+    return out
+
+
+def get_last_price(option_code: str):
+    """查单个期权最新成交价。SL / EOD watcher 用。
+
+    内部走 get_last_prices([code])，统一一条码路径。
+
+    Returns:
         float 最新价；None 表示拿不到（watcher 应跳过该仓位）
 
     DRY_RUN 路径：
         - 默认返回 None（不误触发 SL）
-        - 设 MOCK_LAST_PRICE=0.5 强制固定价，方便联调 SL 阈值
+        - 设 MOCK_LAST_PRICE=0.5 强制固定价
         - 设 MOCK_LAST_PRICE_<CODE>=0.5 针对单 option_code 设价
+    """
+    return get_last_prices([option_code]).get(option_code)
 
-    TODO（实测调整）：
-    - 上真盘换 OpenQuoteContext.get_market_snapshot([code])，取 last_price 字段
-    - quote_ctx 单独维护（和 trade_ctx 分开），同样懒加载 + reset 策略
-    - 批量查询：watcher 一次拿一批 code 比 N 次单查省 N 倍 RTT
-    - 行情订阅 vs 快照：snapshot 简单，但延迟高；订阅推送实时但要状态管理
 
-    TODO（Discord 重连相关）：
-    6/18 出现 29 次 Discord 重连（vs 之前 2-4 次/天）。
-    怀疑 moomoo SDK 在 OPRA 拒绝路径下偶尔挂线程，间接占住 event loop。
-    待 6/19 起 on_disconnect 日志收集数据后，若仍异常：
-    - 给真盘路径加 asyncio.wait_for(timeout=2.0)
-    - 给 broker 调用统一加 timeout，避免 SDK 卡死拖垮 watcher
+def _validate_one(code: str) -> bool:
+    """单 code 校验。返回 True=可下单（含权限不足时的"未知放行"），False=确认不存在。"""
+    ret, df = _snapshot([code])
+    if ret != RET_OK:
+        msg_lower = str(df).lower()
+        # 账户没 OPRA 期权行情订阅 → 不能当作 contract 不存在，让 broker 自己判
+        if "no permission" in msg_lower or "quote permission" in msg_lower:
+            return True
+        # "Unknown stock" / "Cannot find" 类 → 真不存在
+        return False
+    if df is None or not hasattr(df, "iterrows") or len(df) == 0:
+        return False
+    return any(row.get("code") == code for _, row in df.iterrows())
+
+
+def validate_option_codes(codes: list) -> dict:
+    """下单前预校验 option_code 是否存在于 OPRA 链上。
+
+    策略：
+    1. 先一次性 batch snapshot（最省 RTT）
+    2. batch 失败时若是"no permission"，全部降级返 True（让 broker 自己判）
+    3. batch 失败时若是"unknown stock"类（某个 code 让整 batch 挂掉），
+       拆成 per-code 重试 —— 隔离坏 code，让好的能正常 validate
+    4. batch 成功，按 snapshot 出现与否标 True/False
+
+    Returns:
+        {code: True/False}。True = 存在/未知（可让 broker 试）；False = 确认不存在
+    """
+    out = {c: False for c in codes}
+    if not codes:
+        return out
+    if _is_dry_run():
+        return {c: True for c in codes}
+
+    ret, df = _snapshot(codes)
+
+    if ret == RET_OK and df is not None and hasattr(df, "iterrows"):
+        # 正常：只把出现在 snapshot 的标 True
+        for _, row in df.iterrows():
+            code = row.get("code")
+            if code in out:
+                out[code] = True
+        return out
+
+    # batch 失败处理
+    msg_lower = str(df).lower()
+    if "no permission" in msg_lower or "quote permission" in msg_lower:
+        logger.warning(
+            "[broker] validate skipped: no US options quote permission "
+            f"({str(df)[:120]}). 让 broker 自行判断 contract 存在性。"
+            " 要启用预校验，请在 moomoo app 订阅 US MarketOptions Lv1+。"
+        )
+        return {c: True for c in codes}
+
+    # 其它失败（典型："Unknown stock. XXX" — 一个坏 code 拖累整 batch）
+    # 拆成 per-code 重查，隔离坏 code。代价 = N 次 RTT，但只在 batch 失败时才走
+    if len(codes) > 1:
+        logger.info(
+            f"[broker] batch validate failed ({str(df)[:80]}), "
+            f"falling back to per-code check for {len(codes)} codes"
+        )
+        for c in codes:
+            out[c] = _validate_one(c)
+        return out
+
+    # 单 code 也失败 → 真不存在
+    logger.warning(f"[broker] validate rejected {codes[0]}: {str(df)[:120]}")
+    return out
+
+
+def probe_broker() -> tuple[bool, str]:
+    """启动时探测 broker 健康度。供 run_listener 在 client.start 前调用。
+
+    检查项：
+      1. SDK 装好了吗
+      2. OpenD 连得上吗
+      3. get_acc_list 返回里有没有 MOOMOO_ACC_ID + MOOMOO_TRD_ENV 匹配的活跃账户
+      4. REAL 模式：unlock_trade 测一下密码
+
+    DRY_RUN=true 时跳过整套探测，直接返回 OK。
+
+    Returns:
+        (ok, message)：ok=False 时 message 是用户可读的诊断原因
+    """
+    # 启动时把生效配置打到日志，方便人眼对比 .env，避免"以为改了实际没生效"
+    logger.info(
+        f"[broker] config snapshot: TRD_ENV={TRD_ENV_STR} ACC_ID={ACC_ID} "
+        f"TRADE_PWD={'set' if TRADE_PWD else 'empty'} "
+        f"OpenD={OPEND_HOST}:{OPEND_PORT} DRY_RUN={_is_dry_run()}"
+    )
+    if _is_dry_run():
+        return True, "DRY_RUN: 跳过 broker 探测"
+    if not SDK_AVAILABLE:
+        return False, "moomoo SDK 未安装（pip install moomoo-api）"
+    if ACC_ID == 0:
+        return False, "MOOMOO_ACC_ID 未配置或为 0"
+
+    try:
+        ctx = _get_ctx()
+    except Exception as e:
+        return False, f"连接 OpenD {OPEND_HOST}:{OPEND_PORT} 失败: {e}"
+
+    try:
+        ret, df = ctx.get_acc_list()
+    except Exception as e:
+        _reset_ctx()
+        return False, f"get_acc_list 抛异常: {type(e).__name__}: {e}"
+
+    if ret != RET_OK:
+        return False, f"get_acc_list 失败: {df}"
+    if df is None or len(df) == 0:
+        return False, (
+            "OpenD 没返回任何账户。检查：\n"
+            "  1) moomoo 桌面端是否已登录\n"
+            "  2) SIMULATE: 需要在桌面端启用模拟交易并选过一个账户\n"
+            "  3) 试着重启 OpenD 或重登桌面端"
+        )
+
+    # 匹配账户。
+    # moomoo SDK 不同版本对 trd_env 字段返回值不一致：可能是字符串 "SIMULATE"/"REAL"，
+    # 也可能是 enum TrdEnv.SIMULATE / 整型。直接 == TRD_ENV_STR 比较会在 enum/int 形态下
+    # 误判为不匹配，明明账户可用却阻止启动。这里把候选值都转字符串再比，覆盖所有形态。
+    try:
+        target = TRD_ENV_STR  # 已经 .upper() 过
+        env_str = df["trd_env"].astype(str).str.upper().str.replace("TRDENV.", "", regex=False)
+        matched = df[(df["acc_id"] == ACC_ID) & (env_str == target)]
+    except Exception as e:
+        return False, f"过滤账户列异常: {e}（df.columns={getattr(df, 'columns', '?').tolist() if hasattr(df, 'columns') else '?'}）"
+
+    if len(matched) == 0:
+        ids = df["acc_id"].tolist() if "acc_id" in df.columns else []
+        envs = df["trd_env"].tolist() if "trd_env" in df.columns else []
+        return False, (
+            f"MOOMOO_ACC_ID={ACC_ID} env={TRD_ENV_STR} 不在可用账户列表里。\n"
+            f"  OpenD 返回的 acc_id: {ids}\n"
+            f"  OpenD 返回的 trd_env: {envs}\n"
+            f"  → 把 .env 里 MOOMOO_ACC_ID 改成上面其中之一"
+        )
+
+    status = matched.iloc[0].get("acc_status", "UNKNOWN")
+    if status != "ACTIVE":
+        return False, f"账户 {ACC_ID} 状态为 {status}（非 ACTIVE），无法下单"
+
+    # REAL 模式：试 unlock。SIMULATE 由 _ensure_unlocked 直接 skip，这里不碰
+    if TRD_ENV_STR == "REAL":
+        if not TRADE_PWD:
+            return False, "REAL 模式但 MOOMOO_TRD_PWD 未配置"
+        try:
+            ret, data = ctx.unlock_trade(password=TRADE_PWD, is_unlock=True)
+            if ret != RET_OK:
+                return False, f"REAL unlock_trade 失败: {data}（密码错？）"
+            global _unlocked
+            _unlocked = True
+        except Exception as e:
+            return False, f"unlock_trade 抛异常: {type(e).__name__}: {e}"
+
+    return True, (
+        f"OK · env={TRD_ENV_STR} acc_id={ACC_ID} status={status} "
+        f"({len(matched)} matching / {len(df)} total)"
+    )
+
+
+# Probe quote access tier，状态码用于 banner 着色和后续判断
+QUOTE_OK = "ok"                # 期权 snapshot 真返价 + 新鲜
+QUOTE_DELAYED = "delayed"      # snapshot 通了但行情滞后（疑似 delayed-data tier）
+QUOTE_NO_PERMISSION = "no_perm"  # 账户没 US MarketOptions 订阅
+QUOTE_ERROR = "error"          # 其它失败（OpenD 连不上 / chain 取不到 / etc.）
+
+
+def probe_quote_access() -> tuple[str, str]:
+    """探测期权行情订阅状态，决定 SL/TP/EOD watcher 真盘是否能工作。
+
+    步骤：
+      1. quote_ctx 连得上吗
+      2. 个股 snapshot（US.SPY）能拿到吗 —— 这个不要 OPRA 权限
+      3. 拿一个真实存在的 SPY 期权 code（via get_option_chain）
+      4. 对该 code 调 snapshot —— "No permission" 返 NO_PERMISSION
+      5. 检查报价新鲜度 —— age > 15min 视为 DELAYED
+
+    不阻塞启动，调用方根据返回决定 banner / warn / 是否启动 watcher。
+
+    Returns:
+        (status, message) where status ∈ {OK, DELAYED, NO_PERMISSION, ERROR}
     """
     if _is_dry_run():
-        per_code = os.getenv(f"MOCK_LAST_PRICE_{option_code}")
-        if per_code:
-            return float(per_code)
-        fixed = os.getenv("MOCK_LAST_PRICE")
-        if fixed:
-            return float(fixed)
-        return None
+        return QUOTE_OK, "DRY_RUN: 跳过期权行情探测"
+    if not SDK_AVAILABLE:
+        return QUOTE_ERROR, "moomoo SDK 未安装"
 
-    # TODO: 真盘走 quote_ctx.get_market_snapshot
-    logger.warning(f"[broker] get_last_price not implemented for real env: {option_code}")
-    return None
+    # 1. quote ctx 连得通
+    try:
+        ctx = _get_quote_ctx()
+    except Exception as e:
+        return QUOTE_ERROR, f"quote_ctx 连接失败: {type(e).__name__}: {e}"
+
+    # 2. 个股 snapshot —— 基本 quote 连通性 + tier 探测
+    try:
+        ret, df = ctx.get_market_snapshot(["US.SPY"])
+    except Exception as e:
+        _reset_quote_ctx()
+        return QUOTE_ERROR, f"个股 snapshot 抛异常: {type(e).__name__}: {e}"
+    if ret != RET_OK:
+        return QUOTE_ERROR, f"个股 snapshot 失败（基本 quote 都不通）: {str(df)[:120]}"
+
+    # 3. 取一个真实期权 code（任何 SPY 近月 ATM 附近都行，列表第一个）
+    from datetime import date as _date, timedelta as _timedelta
+    today = _date.today()
+    # 下周三 → 让 weekly/monthly 大概率都覆盖；不论今天是周几
+    target = today + _timedelta(days=(2 - today.weekday()) % 7 + 7)
+    try:
+        ret, chain = ctx.get_option_chain(
+            code="US.SPY", start=target.isoformat(), end=target.isoformat(),
+        )
+    except Exception as e:
+        return QUOTE_ERROR, f"get_option_chain 抛异常: {type(e).__name__}: {e}"
+    if ret != RET_OK:
+        # get_option_chain 本身也吃 OPRA 权限（实测 6/30）
+        msg_lower = str(chain).lower()
+        if "no permission" in msg_lower or "quote permission" in msg_lower:
+            return QUOTE_NO_PERMISSION, (
+                "账户缺 US MarketOptions Lv1+ 行情订阅（get_option_chain 失败）。\n"
+                "  影响：SL / TP / EOD watcher 真盘下 no-op；validate_option_codes "
+                "降级到不预校验（让 broker 拒）。\n"
+                "  开通方法：moomoo app → 我的 → 行情订阅 → US MarketOptions Lv1。"
+            )
+        return QUOTE_ERROR, f"无法获取 SPY {target} 期权链: {str(chain)[:120]}"
+    if chain is None or len(chain) == 0:
+        return QUOTE_ERROR, f"SPY {target} 期权链为空（可能无该到期日，换一天试）"
+    sample_code = chain.iloc[0]["code"]
+
+    # 4. 对真实期权 code 试 snapshot —— 触发 OPRA 权限检查
+    try:
+        ret, opt_df = ctx.get_market_snapshot([sample_code])
+    except Exception as e:
+        return QUOTE_ERROR, f"OPRA snapshot 抛异常: {type(e).__name__}: {e}"
+    if ret != RET_OK:
+        msg_lower = str(opt_df).lower()
+        if "no permission" in msg_lower or "quote permission" in msg_lower:
+            return QUOTE_NO_PERMISSION, (
+                "账户缺 US MarketOptions Lv1+ 行情订阅。\n"
+                "  影响：SL / TP / EOD watcher 真盘下 no-op；validate_option_codes "
+                "降级到不预校验（让 broker 拒）。\n"
+                "  开通方法：moomoo app → 我的 → 行情订阅 → US MarketOptions Lv1。"
+            )
+        return QUOTE_ERROR, f"OPRA snapshot 异常: {str(opt_df)[:200]}"
+
+    # 5. 新鲜度（delayed-data tier 通常滞后 15 分钟）
+    try:
+        import pandas as pd
+        update_ts = pd.to_datetime(opt_df.iloc[0]["update_time"]).timestamp()
+        age = time.time() - update_ts
+        if age > 900:  # 15 分钟
+            return QUOTE_DELAYED, (
+                f"OPRA 行情可拿但滞后 {age:.0f}s（疑似 delayed-data tier）。\n"
+                f"  影响：watcher 的 60s 新鲜度过滤会把所有报价当 stale 丢弃 → "
+                f"实际 SL/TP/EOD 仍然 no-op。\n"
+                f"  开通方法：升级到 US MarketOptions Lv1 实时行情。"
+            )
+    except Exception:
+        pass  # 拿不到 update_time 时不阻断
+
+    return QUOTE_OK, f"OPRA 行情可用 + 实时（sample {sample_code}）"
 
 
 def close_ctx():
-    """优雅退出时调用。"""
-    global _ctx, _unlocked
+    """优雅退出时调用。同时关交易和行情两路。"""
+    global _ctx, _unlocked, _quote_ctx
     if _ctx is not None:
         try:
             _ctx.close()
@@ -446,4 +917,11 @@ def close_ctx():
             pass
         _ctx = None
         _unlocked = False
-        logger.info("[broker] ctx closed")
+        logger.info("[broker] trade ctx closed")
+    if _quote_ctx is not None:
+        try:
+            _quote_ctx.close()
+        except Exception:
+            pass
+        _quote_ctx = None
+        logger.info("[broker] quote ctx closed")

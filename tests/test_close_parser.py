@@ -414,3 +414,244 @@ def test_en_takes_precedence_over_zh():
     r = parse_close(text, OPEN_NOW_SET)
     assert r is not None
     assert r["lang"] == "en"
+
+
+# === 6/22 夜里 GOOGL trim 系列 regression lock-down ===
+# 这些 close 信号当晚实际**没** trigger（因为 GOOGL OPEN 被风控砍了，
+# 没进 open_symbols），但 parser 本身在 symbol 已开仓时是正确解析的。
+# 锁住这个行为，防止以后改 parser 把它改坏。
+
+GOOGL_OPEN_SET = OPEN_NOW_SET | {"GOOGL"}
+
+
+def test_zh_sharp_prefix_googl():
+    """'#GOOGL 正在抛售！... 7.00' — BARE_SYM_PATTERN_ZH 应能处理 # 前缀"""
+    r = parse_close(
+        "@everyone\nKC交易机器人：#GOOGL 正在抛售！350 安全减仓区域已触及 7.00 ✅",
+        GOOGL_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["GOOGL"]
+    assert r["signal_price"] == 7.0
+
+
+def test_en_trimmed_at_price_on_symbol():
+    """'trimmed another at 7.25 on GOOGL' — 价格在 symbol 之前的语序"""
+    r = parse_close(
+        "@everyone\nKC Trades Bot:trimmed another at 7.25 on GOOGL, "
+        "+$105 per contract gain here pushing near 20% 💰",
+        GOOGL_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["GOOGL"]
+    assert r["signal_price"] == 7.25
+
+
+def test_zh_verb_adjacent_symbol():
+    """'在7.25减仓GOOGL' — 中文动词紧贴 SYMBOL（无空格）"""
+    r = parse_close(
+        "@everyone\nKC Trades Bot:在7.25减仓GOOGL,每张合约获利105美元,收益率接近20%💰",
+        GOOGL_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["GOOGL"]
+    assert r["signal_price"] == 7.25
+
+
+# === 6/30 strike-aware close hint regression ===
+# 背景：KC 平 TSLA 420c 时我们持仓是 TSLA 425c。新 parser 抽 hint_strike+side，
+# listener 用来 filter，避免错平不同 strike 的仓位。
+
+TSLA_OPEN_SET = OPEN_NOW_SET | {"TSLA"}
+
+
+def test_en_strike_hint_extracted():
+    """'closed TSLA 420c runner @ 15.35' → hint_strike=420 hint_side=CALL
+
+    (实测 6/30 log 里 KC EN 用的是 'all out TSLA 420c' — 'all out' 不在 ACTION_VERBS
+    列表，EN parser 漏接，但 ZH '全部平仓 TSLA 420c' 接住了。'all out' 是单独 gap，
+    不在本次 strike-hint feature 范围内。这里用 'closed' 测 strike 抽取本身。)
+    """
+    r = parse_close(
+        "@everyone\nKC Trades Bot:closed TSLA 420c runner @ 15.35 "
+        "for +$1,000 per contract gain 🚀💰",
+        TSLA_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["TSLA"]
+    assert r["hint_strike"] == 420.0
+    assert r["hint_side"] == "CALL"
+    assert r["signal_price"] == 15.35
+
+
+def test_zh_strike_hint_extracted():
+    """'全部平仓 TSLA 420c 持仓 @ 15.35' → hint_strike=420 hint_side=CALL"""
+    r = parse_close(
+        "@everyone\nKC交易机器人：全部平仓 TSLA 420c 持仓 @ 15.35，"
+        "每张合约获利+$1,000 🚀💰",
+        TSLA_OPEN_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["TSLA"]
+    assert r["hint_strike"] == 420.0
+    assert r["hint_side"] == "CALL"
+
+
+def test_no_strike_hint_returns_none():
+    """普通 trim 信号没 strike → hint_strike/hint_side 为 None，保持 symbol-only 旧行为"""
+    r = parse_close(
+        "@everyone\nKC Trades Bot:trimmed SPY @ 3.00 💰",
+        OPEN_NOW_SET | {"SPY"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["hint_strike"] is None
+    assert r["hint_side"] is None
+
+
+def test_strike_hint_put_side():
+    """'closed TSLA 425p @ 8.50' → side=PUT"""
+    r = parse_close(
+        "trimmed TSLA 425p @ 8.50",
+        TSLA_OPEN_SET,
+    )
+    assert r is not None
+    assert r["hint_strike"] == 425.0
+    assert r["hint_side"] == "PUT"
+
+
+def test_strike_hint_calls_word():
+    """'closed AMZN 255 calls @ 2.30' → strike=255, side=CALL (用 'calls' 词)"""
+    r = parse_close(
+        "closed AMZN 255 calls @ 2.30",
+        OPEN_NOW_SET,
+    )
+    assert r is not None
+    assert r["hint_strike"] == 255.0
+    assert r["hint_side"] == "CALL"
+
+
+# === 7/3 close verb-coverage 回归 ===
+# detect_action + close_parser 双 layer 都要认 "closing"/"all out"/"out half" 之类。
+
+def test_closing_gerund_routes_to_close():
+    """7/3 03:20 `closing the MSFT 390c runner here at 5.00` case"""
+    r = parse_close(
+        "closing the MSFT 390c runner here at 5.00 💰",
+        OPEN_NOW_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["MSFT"]
+    assert r["pct"] == 33
+    assert r["hint_strike"] == 390.0
+    assert r["hint_side"] == "CALL"
+    assert r["signal_price"] == 5.0
+
+
+def test_all_out_recognized_as_100pct():
+    """'all out TSLA 420c @ 15.35' → pct=100 (FULL_CLOSE_VERBS)"""
+    r = parse_close(
+        "all out TSLA 420c runner @ 15.35 for +$1,000 per contract gain 🚀💰",
+        OPEN_NOW_SET | {"TSLA"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["TSLA"]
+    assert r["pct"] == 100
+    assert r["hint_strike"] == 420.0
+
+
+def test_out_half_recognized_as_close():
+    """'out half MSFT @ 2.90' → CLOSE 路径命中"""
+    r = parse_close(
+        "out half MSFT @ 2.90 💰 stop at entry on the rest",
+        OPEN_NOW_SET,
+    )
+    assert r is not None
+    assert r["symbols"] == ["MSFT"]
+    assert r["signal_price"] == 2.9
+
+
+# === 7/6 fraction & scaling-down 回归 ===
+# 昨晚实测：KC 高频用分数表达仓位（scaling out 1/3 / down to 1/2），
+# 且 "Scaling down" / ZH "减持"/"缩减至" 完全不在 close 词表里，
+# 分数一律落到默认 33%（"down to 1/3" 语义还相反，该卖 67%）。
+
+from src.parser.signal_parser import detect_action
+
+
+def test_detect_action_scaling_down():
+    assert detect_action("$IBM - Scaling down to 1/2 position sizing.") == "CLOSE"
+
+
+def test_detect_action_zh_jianchi_and_suojian():
+    assert detect_action("$IBM - 我在这里减持1/3。") == "CLOSE"
+    assert detect_action("$IBM - 将头寸规模缩减至 1/2。") == "CLOSE"
+
+
+def test_scaling_out_fraction_sells_that_fraction():
+    """7/6 23:53 'I'm scaling out 1/3 here' → 卖 33%"""
+    r = parse_close(
+        "$IBM - Nice profit cushion to start the week. I'm scaling out 1/3 here.",
+        {"IBM"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 33
+
+
+def test_down_to_fraction_sells_complement():
+    """7/6 00:36 'Scaling out more. Down to 1/3 of my position' → 剩 1/3 卖 67%
+
+    分数在 action 句外（两句式），靠全文兜底抓到；
+    "scaling out"（卖出向）和 "down to"（剩余向）同时出现时剩余向优先。
+    旧版：默认 33%，语义反了。
+    """
+    r = parse_close(
+        "$IBM - Scaling out more. Down to 1/3 of my position. Almost runners.",
+        {"IBM"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 67
+
+
+def test_scaling_down_to_half():
+    """7/6 23:58 'Scaling down to 1/2 position sizing' → 卖 50%（旧版不进 close 路径）"""
+    r = parse_close(
+        "$IBM - Scaling down to 1/2 position sizing. HAPPY MONDAY",
+        {"IBM"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 50
+
+
+def test_zh_jianchi_fraction():
+    """7/6 23:53 ZH '我在这里减持1/3' → 卖 33%（旧版 减持 不在词表，parse-fail）"""
+    r = parse_close("$IBM - 开周的不错利润缓冲。我在这里减持1/3。", {"IBM"})
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 33
+    assert r["lang"] == "zh"
+
+
+def test_zh_suojian_zhi_fraction():
+    """7/6 23:58 ZH '将头寸规模缩减至 1/2' → 剩 1/2 卖 50%"""
+    r = parse_close("$IBM - 将头寸规模缩减至 1/2。", {"IBM"})
+    assert r is not None
+    assert r["symbols"] == ["IBM"]
+    assert r["pct"] == 50
+    assert r["lang"] == "zh"
+
+
+def test_date_not_mistaken_for_fraction():
+    """'trimmed 7/13 SPY puts' —— 7/13 是到期日不是分数（分母>5 拒），回落默认 33%。
+
+    没有这个 guard，"trimmed 7/13" 会算成卖 54%。
+    （注：故意不用 'sold 7/13 ...'——裸 "sold" 本来就不在 ACTION_VERBS，
+    只有 "sold here"，那种文本根本进不了 close 路径。）
+    """
+    r = parse_close("trimmed 7/13 SPY puts here @ 1.90", {"SPY"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 33

@@ -31,6 +31,17 @@ TODO（实测调整）：
 - ACTION_DONE 里的 "took" 单独看可能误触（"took the trade"），暂依赖 RECAP_MARKERS 兜底
 - 若 [zh_unrecognized] warning 频繁，再考虑数据驱动的中文名→ticker 自动学习
   （EN 版本成功时关联同时段 ZH 文本里的未知中文名）
+
+风险 / 已知漏接（不修，列在这供日后参考）：
+- **无 symbol 的 follow-up close**：例如 "BANG! Out half @ 8.05 💰"
+  这种"承接上一条 trim 信号"的 close 没 ticker，要靠"最近交易"上下文判断。
+  当前一律 return None。修这个等于引入"最近持仓"状态机：要决定时间窗、
+  并发开仓如何选、多语言双发去重——容易引入更严重的"错平别的仓位"风险。
+  当前判断：宁可丢这种 follow-up（前一条 trim 通常已经触发了），
+  也不要 close 错仓位。
+- **CLOSE 误平的代价 > OPEN 误触发**：风控对 OPEN 有 max_price/qty/熔断兜底，
+  但 CLOSE 一旦匹配到 open_symbols 就直接挂卖单。改 close parser 前请
+  把 symbols 必须 in open_symbols 这一硬约束保留住。
 """
 import re
 from typing import Optional
@@ -54,6 +65,8 @@ BULK_MARKERS = [
 ]
 
 # 当前动作（gerund / 完成时）—— 真要动手的信号
+# 与 signal_parser.CLOSE_KEYWORDS 保持同步，否则 detect_action 说 CLOSE 但这里
+# _has_action_verb 说没动词 → close_parser 返回 None（7/3 "all out TSLA" 案例）
 ACTION_VERBS = [
     "trimming", "trimmed",
     "cutting", "cut ",        # "cut " 加空格避免匹配 "scout/circuit"
@@ -61,11 +74,15 @@ ACTION_VERBS = [
     "closing", "closed",
     "dumping", "dumped",
     "scaling out",
+    "scaling down",           # 7/6 "Scaling down to 1/2 position sizing"
     "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
+    # KC 常用 "out" 短语（多词 phrase，双 layer 加入避免 false positive）
+    "all out", "out half", "out full", "out majority",
 ]
 
 # 全平动词（pct 缺省 → 100）
-FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
+FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping",
+                    "all out", "out full"]
 
 # 提取百分比："25%" / "20 %"
 # 排除 `-15%` `+30%` 这类 PnL 标注（前面有符号/数字 → 不是 trim 比例）
@@ -83,6 +100,33 @@ BARE_SYM_PATTERN_ZH = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,5})(?![A-Za-z0-9])")
 
 # "N% LEFT" / "down to N% runners" / "runners only" → 卖 (100-N)%
 LEFT_PATTERN = re.compile(r"(\d{1,3})\s*%\s*(?:left|remaining)", re.I)
+
+# === 分数仓位表达（7/6 夜实测 KC 高频用法）===
+# 两种语义方向，容易搞反：
+#   "scaling out 1/3" / "selling 1/3" / "trimmed 1/2"       → 卖出 X/Y
+#   "down to 1/3 (of my position)" / "scaling down to 1/2"  → 剩 X/Y，卖 (1 - X/Y)
+# 日期防误伤（"sold my 7/13 puts"）：_fraction_pct 只认分母 2-5 且分子<分母。
+FRACTION_DOWN_TO_PATTERN = re.compile(
+    r"\bdown\s+to\s+(\d{1,2})\s*/\s*(\d{1,2})", re.I,
+)
+FRACTION_OUT_PATTERN = re.compile(
+    r"\b(?:out|trim(?:med|ming)?|sell(?:ing)?|sold|scaling\s+out)\s+"
+    r"(\d{1,2})\s*/\s*(\d{1,2})",
+    re.I,
+)
+# ZH："缩减至 1/2" / "减持到 1/3" / "剩下 1/4" → 剩余语义
+ZH_FRACTION_TO_PATTERN = re.compile(r"(?:至|到|剩下?|降至)\s*(\d{1,2})\s*/\s*(\d{1,2})")
+# ZH："减持1/3" / "卖出1/3" → 卖出语义（动词后紧跟分数）
+ZH_FRACTION_OUT_PATTERN = re.compile(
+    r"(?:减持|减仓|卖出|卖了|砍掉|砍仓|抛出|抛了)\s*了?\s*(\d{1,2})\s*/\s*(\d{1,2})"
+)
+
+
+def _fraction_pct(num: int, den: int) -> "int | None":
+    """X/Y → 百分比整数。分母 2-5 且分子<分母才当分数，否则视为日期（7/13）返 None。"""
+    if den < 2 or den > 5 or num < 1 or num >= den:
+        return None
+    return round(num * 100 / den)
 
 # KC 喊出的卖出价 —— 用来挂卖单限价，避免按 entry × 0.95 倒挂
 # 场景：
@@ -189,12 +233,17 @@ ZH_RECAP_MARKERS = [
 ZH_BULK_MARKERS = ["所有持仓", "全部持仓", "全部仓位"]
 
 # 当前动作动词
+# 7/6 加 减持 / 缩减至|缩减到（KC ZH 翻译的 "scaling out/down" 惯用词）。
+# 不加裸 "缩减"——"缩减购债" 类宏观评论会误触。
+# "减持" 理论上也可能出现在 "巴菲特减持苹果" 类新闻转述里，但风险与既有
+# 的 卖出/砍掉 相同（channel 只有 KC bot 发言 + symbol 白名单双保险），接受。
 ZH_ACTION_VERBS = [
     "减仓", "平仓", "清仓", "全平", "清空",
     "卖出", "卖了",
     "砍掉", "砍仓",
     "抛出", "抛了",
     "止盈",
+    "减持", "缩减至", "缩减到",
 ]
 
 # 全平动词 / 短语（pct 缺省 → 100）
@@ -222,7 +271,9 @@ def _has_full_close_verb(text_lower: str) -> bool:
 
 _ACTION_RE = re.compile("|".join(re.escape(v) for v in [
     "trimming", "trimmed", "cutting", "cut ", "selling", "sold here",
-    "closing", "closed", "dumping", "dumped", "scaling out", "bang!", "bang -",
+    "closing", "closed", "dumping", "dumped", "scaling out", "scaling down",
+    "bang!", "bang -",
+    "all out", "out half", "out full", "out majority",
 ]), re.IGNORECASE)
 
 
@@ -238,6 +289,46 @@ def _action_sentences(text: str) -> str:
     sentences = re.split(r"(?<!\d)[.!?](?!\d)\s+|(?<=[.!?])(?=\s)", text)
     hit = [s for s in sentences if _ACTION_RE.search(s)]
     return " ".join(hit) if hit else text
+
+
+def _extract_strike_hint(scope: str, symbols: list) -> tuple:
+    """从 close 文本里抽 strike + side hint。
+
+    场景背景：6/30 KC 发 "all out TSLA 420c @ 15.35"，但我们持仓是 TSLA 425c
+    （我们抄的 enrich 信号）。旧 parser 只看 symbol → 抽到 TSLA → 关掉我们 425c。
+    这次因为 420c/425c 同方向同到期日同 ITM，价差很小，意外赚了大钱。
+    下次未必有这种运气：KC 平 TSLA put 时我们的 TSLA call 也会被错平。
+
+    策略：只在文本里**显式给出 strike** 时返回 hint。无 strike → None，
+    保持旧"symbol-only"语义不变（不破坏没 strike 的 trim 消息行为）。
+
+    支持的写法（symbol 在前，strike+side 紧邻）：
+      "TSLA 420c", "SPY 748c", "AMZN 255 calls", "MSFT 420put"
+      ZH: "TSLA 420c" (KC ZH 翻译里 strike 通常保留 Latin)
+
+    Args:
+        scope: 含 close action 的句子片段
+        symbols: 已抽出的 symbols 列表（用于"靠近"判断）
+
+    Returns:
+        (strike: float, side: "CALL"|"PUT") 或 (None, None)
+    """
+    if not symbols:
+        return (None, None)
+    # 第一个 symbol 是主对象
+    sym = symbols[0]
+    # 匹配 "SYM 数字 c/p" 或 "SYM 数字 call(s)/put(s)"，最多隔 3 个空白字符
+    pat = re.compile(
+        rf"\b{re.escape(sym)}\s+(\d+(?:\.\d+)?)\s*(c\b|p\b|calls?|puts?)",
+        re.IGNORECASE,
+    )
+    m = pat.search(scope)
+    if not m:
+        return (None, None)
+    strike = float(m.group(1))
+    side_raw = m.group(2).lower()
+    side = "CALL" if side_raw.startswith("c") else "PUT"
+    return (strike, side)
 
 
 def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
@@ -277,10 +368,13 @@ def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
 def _extract_pct(text: str, text_lower: str) -> int:
     """提取卖出百分比。
 
-    规则：
+    规则（优先级从上到下）：
     - "30% LEFT" / "30% remaining" → 卖 70%
+    - "down to 1/3" → 剩 1/3，卖 67%（剩余语义，先查——
+      "Scaling out more. Down to 1/3" 两个方向的词都在，剩余语义才是对的）
+    - "scaling out 1/3" / "sold 1/2" → 卖 33% / 50%
     - "Selling 25%" → 卖 25%
-    - 无 % 数字：FULL_CLOSE_VERBS → 100%，否则 33%（trim 默认）
+    - 无数字：FULL_CLOSE_VERBS → 100%，否则 33%（trim 默认）
 
     扫描范围限制在 action 句内，避免抓到 commentary 里的 PnL %。
     PCT_PATTERN 已经排除了 -N% / +N%（PnL 标注）。
@@ -293,6 +387,23 @@ def _extract_pct(text: str, text_lower: str) -> int:
     if left_m:
         n = int(left_m.group(1))
         return max(1, min(100, 100 - n))
+
+    # 分数：先 action 句 scope，没有再全文兜底。
+    # KC 惯用两句式 "Scaling out more. Down to 1/3 of my position."——
+    # 分数落在 action 句外，只扫 scope 会漏（7/6 实测误判成默认 33）。
+    # 全文兜底安全性：recap 已在上层整条过滤；symbols / signal_price
+    # 仍然严格限 scope（那两个扫全文才有错平/错价风险，pct 没有）。
+    for search_space in (scope, text):
+        m = FRACTION_DOWN_TO_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, 100 - frac))
+        m = FRACTION_OUT_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, frac))
 
     pct_m = PCT_PATTERN.search(scope)
     if pct_m:
@@ -320,7 +431,7 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
         if pct == 33:
             pct = 50
         logger.info(f"[close_parser] EN BULK_TRIM pct={pct}")
-        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
+        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "en"}
 
@@ -328,11 +439,14 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if not symbols:
         return None
     pct = _extract_pct(text, text_lower)
+    hint_strike, hint_side = _extract_strike_hint(scope_en, symbols)
     logger.info(
         f"[close_parser] EN CLOSE symbols={symbols} pct={pct} "
+        f"strike={hint_strike} side={hint_side} "
         f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
     )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "matched": text[:120], "lang": "en"}
 
@@ -396,13 +510,26 @@ def _extract_zh_symbols(text: str, open_symbols: set[str]) -> list[str]:
 
 
 def _extract_zh_pct(text: str) -> int:
-    """中文版百分比抽取。"""
+    """中文版百分比抽取。优先级同 EN：剩余% → 剩余分数 → 卖出分数 → N%。"""
     scope = _zh_action_sentences(text)
 
     left_m = ZH_LEFT_PATTERN.search(scope)
     if left_m:
         n = int(left_m.group(1))
         return max(1, min(100, 100 - n))
+
+    # 分数：先 scope 后全文兜底（同 EN 版 _extract_pct 的两句式问题）
+    for search_space in (scope, text):
+        m = ZH_FRACTION_TO_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, 100 - frac))
+        m = ZH_FRACTION_OUT_PATTERN.search(search_space)
+        if m:
+            frac = _fraction_pct(int(m.group(1)), int(m.group(2)))
+            if frac is not None:
+                return max(1, min(100, frac))
 
     pct_m = PCT_PATTERN.search(scope)
     if pct_m:
@@ -428,7 +555,7 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         if pct == 33:
             pct = 50
         logger.info(f"[close_parser] ZH BULK_TRIM pct={pct}")
-        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct,
+        return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "zh"}
 
@@ -440,11 +567,14 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         )
         return None
     pct = _extract_zh_pct(text)
+    hint_strike, hint_side = _extract_strike_hint(scope_zh, symbols)
     logger.info(
         f"[close_parser] ZH CLOSE symbols={symbols} pct={pct} "
+        f"strike={hint_strike} side={hint_side} "
         f"price={signal_price} pnl={signal_pnl_pct} text={text[:80]}"
     )
     return {"kind": "CLOSE", "symbols": symbols, "pct": pct,
+            "hint_strike": hint_strike, "hint_side": hint_side,
             "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
             "matched": text[:120], "lang": "zh"}
 

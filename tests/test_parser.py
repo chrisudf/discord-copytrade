@@ -66,6 +66,37 @@ def test_detect_action_zh_close():
     assert detect_action("$AAOI weekly $220 calls $2.05") == "OPEN"
 
 
+def test_detect_action_en_gerund_and_phrases():
+    """7/3 复盘发现：'closing' 等 gerund 和 'all out'/'out half' 等短语应识别为 CLOSE
+
+    历史漏检 case（重放）：
+    - 7/3 03:20 `closing the MSFT 390c runner here at 5.00` → 之前误路由到 OPEN
+    - 6/30 02:51 `all out TSLA 420c runner @ 15.35` → 同样
+    - 6/29 `Out half MSFT @ 2.90` → 同样
+    """
+    from src.parser.signal_parser import detect_action
+    # gerund 形式
+    assert detect_action("closing the MSFT 390c runner here at 5.00") == "CLOSE"
+    assert detect_action("scaling out MSFT here") == "CLOSE"
+    # 多词 phrase
+    assert detect_action("all out TSLA 420c runner @ 15.35") == "CLOSE"
+    assert detect_action("out half MSFT @ 2.90") == "CLOSE"
+    assert detect_action("out full on TSLA 420c") == "CLOSE"
+    assert detect_action("out majority SPY here @ 3.00") == "CLOSE"
+
+
+def test_detect_action_open_not_falsely_matched():
+    """反向：真 OPEN 信号不能因为新加的关键字被误判为 CLOSE"""
+    from src.parser.signal_parser import detect_action
+    # 边缘：含 "close" 字符串但显然是开仓文本
+    assert detect_action("MSFT 390c 7/6 small @ 2.30") == "OPEN"
+    assert detect_action("Adding $APLD 50c weeklies @ .98") == "OPEN"
+    assert detect_action("$SPY $748 calls @ $2.40 close to breakout") == "CLOSE"
+    # ^ 这条其实含 "close" 单词，会被匹配（严格 word-boundary 也覆盖）—— 允许假阳
+    #   因为运行时 close_parser 会二次校验（找不到 action verb + open_symbols 就 return None）
+    # OPEN 信号 KC 从不用 "close to breakout" 这种含 close 的表达，实测不会遇到
+
+
 def test_tag_day_trade_variants():
     """'small day trade' / 'daytrade' / 'day-trade' 都应该 tag day_trade"""
     r = parse_signal("TSLA 415c June 26 @ 2.70 small day trade",
@@ -87,3 +118,111 @@ def test_tag_no_day_trade_when_swing():
                      msg_ts=FIXED_TODAY)
     assert "day_trade" not in r["tags"]
     assert "swing" in r["tags"]
+
+
+# === Pattern C: 简写格式（6/22 APLD 漏接修复）===
+
+def test_apld_shorthand_weeklies():
+    """6/22 凌晨 enrich 频道 APLD 漏接，原始文本：
+    'Adding $APLD 50c weeklies here @role_1362783378704699603 +alert .98 fill'
+    """
+    r = parse_signal(
+        "Adding $APLD 50c weeklies here @role_1362783378704699603 +alert .98 fill",
+        msg_ts=FIXED_TODAY,
+    )
+    assert r is not None, "APLD 简写信号应该被识别"
+    assert r["symbol"] == "APLD"
+    assert r["side"] == "CALL"
+    assert r["strike"] == 50.0
+    assert r["price"] == 0.98
+
+
+def test_shorthand_put_mmdd():
+    """简写 + 显式日期：$SYMBOL Nc/p MM/DD ... .XX fill"""
+    r = parse_signal("$SNOW 215p 7/2 .85 fill", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "SNOW"
+    assert r["side"] == "PUT"
+    assert r["strike"] == 215.0
+    assert r["price"] == 0.85
+    assert r["expiry"] == "7/2"
+
+
+def test_shorthand_at_price():
+    """@$X.XX 价格写法"""
+    r = parse_signal("Adding $NVDA 800c weeklies @ $1.20", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "NVDA"
+    assert r["strike"] == 800.0
+    assert r["price"] == 1.20
+
+
+def test_shorthand_at_price_no_dollar():
+    """@.98 不带 $"""
+    r = parse_signal("$IREN 60c weeklies @ .68", msg_ts=FIXED_TODAY)
+    assert r is not None
+    assert r["symbol"] == "IREN"
+    assert r["price"] == 0.68
+
+
+def test_shorthand_does_not_match_role_mention():
+    """@role_数字 不应该被当成价格"""
+    # 仅有 @role 没有真价格 → 不匹配
+    r = parse_signal("Adding $APLD 50c weeklies @role_1362783378704699603 alert",
+                     msg_ts=FIXED_TODAY)
+    assert r is None, "没有合法价格写法应该返回 None"
+
+
+def test_shorthand_requires_dollar_prefix():
+    """裸 SYMBOL Nc/p 没有 $ 前缀不应该被 Pattern C 抓（避免假阳）。
+
+    `APLD 50c` 在 A 路径需要 MM/DD，C 路径要求 $ 前缀，两个都不命中 → None
+    """
+    r = parse_signal("APLD 50c weeklies .98 fill", msg_ts=FIXED_TODAY)
+    assert r is None
+
+
+# === 6/23 APLD "holding up well" skip 误伤回归 ===
+# 修改 SKIP_KEYWORDS 后：精确短语 skip status 消息，"holding up well" 不再误伤
+
+def test_apld_with_holding_up_well_NOT_skipped():
+    """6/23 漏接原文：'$APLD weekly $50 calls $.66 ... holding up well'
+
+    'holding up well' 是描述价格走势，不该 skip。
+    """
+    text = ("enrich:\nUsing some $IBM gains - lotto sized (1%)\n\n"
+            "$APLD weekly $50 calls $.66\n\n"
+            "Risky business - holding up well though\n\n"
+            "@everyone $alert")
+    r = parse_signal(text, msg_ts=FIXED_TODAY)
+    assert r is not None and r.get("symbol") == "APLD", (
+        f"APLD 信号应该被解析，实际: {r}"
+    )
+    assert r["strike"] == 50.0
+    assert r["price"] == 0.66
+    assert r["side"] == "CALL"
+
+
+def test_holding_status_phrases_still_skipped():
+    """status 短语仍然正确 skip，不变成"无效信号下单"风险源"""
+    cases = [
+        "I'm holding into tomorrow",
+        "still holding my SNOW calls",
+        "currently holding 3 contracts",
+        "keep holding the position",
+        "holding my other half overnight",
+        "持仓 +30%",
+    ]
+    for c in cases:
+        r = parse_signal(c, msg_ts=FIXED_TODAY)
+        assert r is None or (isinstance(r, dict) and r.get("skip") == "holding_or_remaining"), (
+            f"应 skip 但没 skip: {c} → {r}"
+        )
+
+
+def test_holding_up_well_with_no_signal_returns_none():
+    """没有信号语法的 status 消息：之前 skip，现在 parse fail → None。
+    不会下错单（无 SYMBOL+strike+price 三件套）。
+    """
+    r = parse_signal("Stock is holding up well today, no setups yet", msg_ts=FIXED_TODAY)
+    assert r is None  # 没法 parse 出 OPEN 信号

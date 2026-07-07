@@ -4,6 +4,31 @@
 - [ ] Connect real moomoo API (uncomment broker block, test on account)
 - [ ] Validate option code format on OpenD
 - [ ] Securely store Discord token (consider keyring)
+- [x] **Tests must use tmp DB, not data/trades.db** (added 2026-07-03, done 2026-07-06)
+  - 7/3 sync 发现 130 个 OPEN 记录，大部分是 tests 里
+    `positions_db.open_or_add(...)` 直接写生产 DB 的残留（symbol=ADD/EOD/MGR/SL/BRJ/STK/LEG 等）
+  - 已修：`tests/conftest.py` autouse fixture 把 positions_db / logger_db /
+    risk_manager 三个 DB_PATH 全部 patch 到 tmp_path + 重跑 _init_db()。
+    验证过：重跑全套测试生产 DB 行数 0 增长。
+  - 历史残留已清（2026-07-06）：删除 840 行测试 positions + 1832 行 events，
+    备份在 data/trades.db.bak-before-test-cleanup-20260706。
+    剩 12 行真实仓位（全 CLOSED）+ 25 events；orders/raw_signals/risk.db
+    本来就无污染。
+- [ ] **Position sync as preflight step in run_listener.py**
+  - 手工跑 `python scripts/sync_positions.py` 太容易漏
+  - 加进 preflight，在 broker probe 之后跑一次，把本地 stale 全清
+  - 顺便：sync 里若 broker 有本地没的期权 → 建议 record 到本地 DB（stray 变已知）
+- [ ] **Runner mode B (quote-driven trim decision)**
+  - 前置依赖：OPRA subscription (US MarketOptions Lv1+)
+  - 背景：当前策略 A（qty==1 且 pct<100 → skip trim）粗暴保 runner。
+    真实场景更精细：早期跟 KC trim（+9%~40% 该出），中后期变 runner
+    （+50% 以上留一张）。见 lessons.md #13。
+  - 实现：在 close 流程里查 get_last_price(pos.code)，算 (last / avg_entry - 1) * 100 = 当前 PnL%。
+    * PnL% < 50 → 正常跟 KC 的 pct 卖（对齐早期风险管理）
+    * PnL% >= 50 且 qty==1 → 跳过 <100% trim（保 runner）
+    * 100% close 信号总是执行
+  - 需求：get_last_prices 真返价（等 OPRA），以及一个可调阈值（.env 里 RUNNER_MIN_PNL_PCT，默认 50）
+  - 替换掉 calc_qty_to_sell 里的策略 A 分支
 
 ## P1 - position sizing
 - [ ] Calculate qty based on account balance %
@@ -36,3 +61,21 @@
   - first (current)
   - high_delta (closest to ITM)
   - all (open all contracts)
+
+## Real-env quotes (P3, added 2026-06-30)
+- [ ] **Subscribe US MarketOptions Lv1** in moomoo app (我的 → 行情订阅)
+  - Without this: probe_quote_access returns QUOTE_NO_PERMISSION,
+    SL/TP/EOD watchers no-op in real env, validate_option_codes
+    falls back to "let broker decide"
+- [ ] After subscribe: implement P3 PR 2 (watcher batch prefetch)
+  - Refactor sl_watcher / tp_watcher / eod_watcher: replace
+    N×get_last_price per tick with one get_last_prices(codes)
+  - Add asyncio.wait_for(timeout=2.0) around to_thread snapshot
+    call (the 6/18 thread-pool starvation concern)
+  - Wire SL/TP/EOD watchers to consume the batched dict
+  - Test: mock OpenQuoteContext to confirm exactly 1 snapshot RTT
+    per tick regardless of position count
+  - Verify live: open 1-2 SIMULATE positions and watch SL fire on
+    a fake MOCK_LAST_PRICE
+- [ ] After subscribe: verify validate_option_codes catches real
+  invalid contracts (TEM/DRAM 类) instead of falling back
