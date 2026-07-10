@@ -27,7 +27,7 @@ import asyncio
 import os
 from typing import Optional
 
-from src.broker.moomoo_client import place_sell_order, get_last_price
+from src.broker.moomoo_client import place_sell_order, get_last_prices
 from src.position import manager as position_mgr
 from src.position import fill_checker
 from src.storage import positions_db
@@ -144,7 +144,11 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
 
 
 async def _tp_tick():
-    """单轮检查。仅扫 category 在 LADDER 里的活跃仓位。"""
+    """单轮检查。仅扫 category 在 LADDER 里的活跃仓位。
+
+    批量取价（7/8 改造，同 sl_watcher._sl_tick）：整个 tick 只发一次
+    get_last_prices，避免打满 moomoo 60 次/30s 频率配额。
+    """
     cfg = _cfg()
     global _triggered_this_tick
     _triggered_this_tick = set()  # tick 边界重置（每轮独立判断）
@@ -156,9 +160,12 @@ async def _tp_tick():
     if not positions:
         return
 
+    codes = [p["option_code"] for p in positions]
+    prices = await asyncio.to_thread(get_last_prices, codes)
+
     for pos in positions:
         cat = pos["category"]
-        last = await asyncio.to_thread(get_last_price, pos["option_code"])
+        last = prices.get(pos["option_code"])
         if last is None:
             continue
 

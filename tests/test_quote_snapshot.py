@@ -334,3 +334,61 @@ def test_get_last_prices_et_realtime_not_stale(monkeypatch):
     monkeypatch.setattr(bc, "_get_quote_ctx", lambda: _mock_ctx_returning(rows))
     out = bc.get_last_prices(["US.AAPL"])
     assert out["US.AAPL"] == 5.20
+
+
+# === 7/8 复盘回归：限频/无权限退避 ===
+
+def test_snapshot_high_frequency_triggers_backoff(monkeypatch):
+    """moomoo 限频报错原文不含 quota/limit 字样，旧关键词接不住 → 不退避硬打。"""
+    import time as _time
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (
+        -1, "Get Market Snapshot request failed due to high frequency. "
+            "Maximum 60 times per 30 seconds.")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    bc.get_last_prices(["US.X"])
+    assert bc._quote_backoff_until > _time.monotonic(), "限频必须触发退避"
+
+
+def test_snapshot_no_permission_long_backoff(monkeypatch):
+    """无 OPRA 权限 → 300s 长退避。7/8 整夜 watcher 空转打满频率配额，
+    连 validate 都被挤到限频（靠 fail-open 才没误拒买单）。"""
+    import time as _time
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (
+        -1, "No permission to get quotes for US.X. "
+            "Please check US MarketOptions quote permissions.")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    bc.get_last_prices(["US.X"])
+    # 长退避：显著大于普通 60s 档
+    assert bc._quote_backoff_until > _time.monotonic() + 200
+
+
+def test_snapshot_no_permission_warn_throttled(monkeypatch):
+    """7/9 实测：300s 退避到期后 SL/TP 各重探一次，每次都 WARNING
+    一夜刷 ~200 行。同原因一小时内只 WARNING 一次，其余 DEBUG。"""
+    from src.utils.logger import logger as _lg
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (
+        -1, "No permission to get quotes for US.X.")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    monkeypatch.setattr(bc, "_no_perm_last_warn", 0.0)
+
+    records = []
+    sink = _lg.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="DEBUG",
+    )
+    try:
+        bc.get_last_prices(["US.X"])
+        monkeypatch.setattr(bc, "_quote_backoff_until", 0.0)  # 模拟退避到期
+        bc.get_last_prices(["US.X"])
+    finally:
+        _lg.remove(sink)
+
+    warns = [r for r in records
+             if r[0] == "WARNING" and "no-permission" in r[1]]
+    debugs = [r for r in records
+              if r[0] == "DEBUG" and "no-permission" in r[1]]
+    assert len(warns) == 1, f"一小时内同原因只应 WARNING 一次: {warns}"
+    assert len(debugs) == 1, "第二次应降为 DEBUG"

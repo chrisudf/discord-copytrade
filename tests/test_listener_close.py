@@ -3,7 +3,9 @@
 补 6/18 IWM 事件暴露的两个 bug：
 - broker 拒单后误报 "no matching open positions"（原 any_executed 没 set）
 """
+import asyncio
 import os
+import time
 from datetime import date, datetime
 from unittest.mock import patch
 
@@ -416,3 +418,106 @@ async def test_multi_symbol_close_hint_only_scopes_first_symbol():
 
     positions_db.record_close(code_a, 2, 7.0, "manual", note="ut cleanup")
     positions_db.record_close(code_b, 2, 7.0, "manual", note="ut cleanup")
+
+
+# === 7/8 复盘回归：fp 原子性 / BULK 例外 ===
+
+@pytest.mark.asyncio
+async def test_close_fp_atomic_blocks_inflight_twin():
+    """双发在第一条还没处理完时到达（实测 0.9s < handler 耗时 1.2s）
+    → 第二条必须被 dup 拦住。
+
+    7/7-7/8 连续两夜实锤：0005 把登记挪到 handler 末尾后，第二条 EN 穿过
+    dup 检查双重处理（qty≥2 时 trim 执行两次）。现在查即登记（原子）。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("ATW")
+    positions_db.open_or_add(
+        option_code=code, symbol="ATWX", strike=100.0, side="CALL",
+        expiry=date(2026, 7, 17), qty=4, fill_price=2.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_atw",
+    )
+    discord_client._close_fps.clear()
+
+    calls = []
+
+    def slow_sell(*args, **kwargs):
+        time.sleep(0.05)  # 模拟 broker RTT，制造双发竞态窗口
+        calls.append(kwargs)
+        return {"success": True, "order_id": f"ATW{len(calls)}",
+                "code": code, "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    async def noop(msg):
+        pass
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop), \
+         patch.object(discord_client, "place_sell_order", side_effect=slow_sell):
+        await asyncio.gather(
+            discord_client._handle_close_signal("trimmed ATWX @ 2.45", msg_id=71),
+            discord_client._handle_close_signal("trimmed ATWX @ 2.45", msg_id=72),
+        )
+
+    assert len(calls) == 1, f"孪生并发必须只执行一次 trim，实际: {calls}"
+
+    positions_db.record_close(code, 4 - calls[0]["qty"], 2.45, "manual",
+                              note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_bulk_close_excludes_kept_symbol():
+    """7/8 'Closing all positions outside of the $IBM lotto'：
+    IBM 不卖，其余按 100% 全平。"""
+    os.environ["DRY_RUN"] = "true"
+    code_keep = _uniq_code("BKE")
+    code_sell = _uniq_code("BKS")
+    positions_db.open_or_add(
+        option_code=code_keep, symbol="IBM", strike=310.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.27,
+        category="lotto", apply_sl=False, eod_force_close=False, tags=["lotto"],
+        channel_name="ut", msg_id="m_bke",
+    )
+    positions_db.open_or_add(
+        option_code=code_sell, symbol="DELL", strike=465.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.65,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_bks",
+    )
+    discord_client._close_fps.clear()
+
+    sold = []
+
+    def fake_sell(*args, **kwargs):
+        sold.append(kwargs["option_code"])
+        return {"success": True, "order_id": "BK", "code": kwargs["option_code"],
+                "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    async def noop(msg):
+        pass
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "Alright - here's what I'm doing: Closing all positions outside of "
+            "the $IBM $310 lotto - this is a 1% position - I am 99% cash @ 2.80",
+            msg_id=73,
+        )
+
+    assert code_sell in sold, "DELL 应被全平"
+    assert code_keep not in sold, "IBM 在例外表里，不能卖"
+    assert positions_db.get(code_sell)["status"] == "CLOSED"  # pct=100 全平
+    assert positions_db.get(code_keep)["status"] == "OPEN"
+
+    positions_db.record_close(code_keep, 2, 2.27, "manual", note="ut cleanup")
+
+
+def test_bang_not_bare_ticker():
+    """7/9 'BANG! Out half 2.45' —— BANG 是叹词不是 ticker，无 symbol 的
+    跟单 trim 不该触发 looks-like-close TG。"""
+    assert discord_client._looks_like_close_attempt(
+        "@everyone\nKC Trades Bot:BANG! Out half 2.45, stop at 2.10 ✅"
+    ) is False
+    # 带真 ticker 的仍然要告警
+    assert discord_client._looks_like_close_attempt(
+        "@everyone\nKC Trades Bot:BANG! Out half SPY 2.45"
+    ) is True

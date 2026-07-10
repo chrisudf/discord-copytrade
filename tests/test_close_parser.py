@@ -193,17 +193,23 @@ def test_action_scope_filters_commentary_symbols():
 
 # ========== 中文 fallback ==========
 
-def test_zh_chinese_company_name_returns_none(caplog):
-    """中文公司名不再映射 → ZH 返回 None + [zh_unrecognized] warning。
+def test_zh_chinese_company_name_maps_when_held():
+    """7/8 起：高频中文公司名走最小映射（白名单门控）。
 
-    依赖：1-3s 后 EN 版本会正确处理（见 test_en_handles_same_signal_as_zh_missed）。
+    '减仓亚马逊' + 持仓 AMZN → 直接解析，不再依赖 1-3s 后的 EN 版本兜底。
     """
-    import logging
-    caplog.set_level(logging.WARNING, logger="src.parser.close_parser")
     r = parse_close("KC Trades Bot:减仓亚马逊", OPEN_NOW_SET)
-    assert r is None
-    # warning 应被记录（便于运营时看实际漏哪些）
-    # loguru 不走 stdlib logging，所以这里只检查行为；warning 在运行时可见
+    assert r is not None
+    assert r["symbols"] == ["AMZN"]
+    assert r["lang"] == "zh"
+
+
+def test_zh_unmapped_company_name_still_none():
+    """映射表外的公司名（或未持仓）仍然 None → [zh_unrecognized]，EN 版本兜底。"""
+    # 未持仓：亚马逊在映射表里但 AMZN 不在白名单
+    assert parse_close("KC Trades Bot:减仓亚马逊", {"MSFT"}) is None
+    # 映射表外的公司名
+    assert parse_close("KC Trades Bot:减仓甲骨文", OPEN_NOW_SET) is None
 
 
 def test_en_handles_same_signal_as_zh_missed():
@@ -678,3 +684,88 @@ def test_out_full_is_full_close():
     r = parse_close("out full TSLA @ 8.05", {"TSLA"})
     assert r is not None
     assert r["pct"] == 100
+
+
+# === 7/8 复盘回归：公司名映射 / BULK 例外 / 仓位标注 / stop at entry ===
+
+def test_all_out_company_name_maps_to_held_ticker():
+    """7/7 'all out apple' —— EN 公司名 + 持仓白名单 → AAPL 全平 100%"""
+    r = parse_close(
+        "KC Trades Bot:all out apple to secure green trade 🙏🏼 "
+        "will look to re-enter again for a put swing again",
+        {"AAPL"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["AAPL"]
+    assert r["pct"] == 100
+
+
+def test_company_name_without_holding_stays_none():
+    """没持仓 AAPL 时 'apple' 只是闲聊，不映射（白名单门控）。"""
+    r = parse_close("all out apple to secure green trade", {"MSFT"})
+    assert r is None
+
+
+def test_zh_company_name_maps_to_held_ticker():
+    """7/8 '💥苹果！！减仓3.15' —— ZH 公司名 + 白名单 → AAPL trim 33%"""
+    r = parse_close("KC交易机器人：💥苹果！！减仓3.15💰", {"AAPL"})
+    assert r is not None
+    assert r["symbols"] == ["AAPL"]
+    assert r["pct"] == 33
+    assert r["lang"] == "zh"
+
+
+def test_zh_chuqing_full_close():
+    """ZH '全部出清苹果仓位' → 出清 = 全平 100%"""
+    r = parse_close("KC 交易机器人：全部出清苹果仓位，确保交易盈利。", {"AAPL"})
+    assert r is not None
+    assert r["symbols"] == ["AAPL"]
+    assert r["pct"] == 100
+
+
+def test_bulk_close_all_with_exclusion_and_size_annotation():
+    """7/8 enrich 'Closing all positions outside of the $IBM $310 lotto -
+    this is a 1% position'：
+    - '1% position' 是仓位大小标注，不是 trim 比例（曾被读成 pct=1）
+    - 'closing all positions' 无显式比例 → 全清 100（不是 bulk 默认 50）
+    - 'outside of $IBM' → IBM 进例外表
+    """
+    r = parse_close(
+        "Alright - here's what I'm doing: Closing all positions outside of "
+        "the $IBM $310 lotto - this is a 1% position - I am 99% cash",
+        {"IBM", "DELL", "LLY"},
+    )
+    assert r is not None
+    assert r["kind"] == "BULK_TRIM"
+    assert r["pct"] == 100
+    assert r["exclude_symbols"] == ["IBM"]
+
+
+def test_trimming_all_positions_keeps_bulk_default():
+    """'trimming all positions' 无比例 → 仍是 bulk 默认 50，不升级 100"""
+    r = parse_close("trimming all positions at the open", {"IBM"})
+    assert r["kind"] == "BULK_TRIM"
+    assert r["pct"] == 50
+
+
+def test_stop_at_entry_not_breakeven_pnl():
+    """7/8 'trimmed AAPL +20% stop at entry' —— 'stop at entry' 是移止损备注，
+    pnl 应取 +20 而非被误判为保本 0。"""
+    r = parse_close("KC Trades Bot:trimmed AAPL +20% 💰 stop at entry", {"AAPL"})
+    assert r is not None
+    assert r["signal_pnl_pct"] == 20.0
+    assert r["pct"] == 33  # +20% 是 PnL 不是 trim 比例
+
+
+def test_bare_trim_imperative():
+    """7/9 'trim SPY runner at 3.10' —— 祈使式裸 trim 也是动作动词
+    （detect_action 认但 close_parser 曾拒，靠 ZH 孪生兜的底）。"""
+    r = parse_close(
+        "KC Trades Bot:trim SPY runner at 3.10 💰 leaving the rest for a "
+        "free swing trade into Friday for fun now! 😎",
+        {"SPY"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 33
+    assert r["signal_price"] == 3.10

@@ -30,7 +30,7 @@ import asyncio
 import os
 from typing import Optional
 
-from src.broker.moomoo_client import place_sell_order, get_last_price
+from src.broker.moomoo_client import place_sell_order, get_last_prices
 from src.position import manager as position_mgr
 from src.position import fill_checker
 from src.notifier.telegram_client import (
@@ -146,7 +146,12 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
 
 
 async def _sl_tick():
-    """单轮检查。可独立测试。"""
+    """单轮检查。可独立测试。
+
+    批量取价（7/8 改造）：之前每仓位一次 get_last_price = 一次 snapshot RTT，
+    N 个仓位 × 5s tick 会打满 moomoo 60 次/30s 频率配额（连 validate 都被
+    挤到限频）。现在整个 tick 只发一次 get_last_prices。
+    """
     cfg = _cfg()
     positions = [
         p for p in position_mgr.get_open_positions()
@@ -155,9 +160,11 @@ async def _sl_tick():
     if not positions:
         return
 
+    codes = [p["option_code"] for p in positions]
+    prices = await asyncio.to_thread(get_last_prices, codes)
+
     for pos in positions:
-        code = pos["option_code"]
-        last = await asyncio.to_thread(get_last_price, code)
+        last = prices.get(pos["option_code"])
         if last is None:
             continue
         threshold = pos["avg_entry_price"] * (1 - cfg["sl_pct"])

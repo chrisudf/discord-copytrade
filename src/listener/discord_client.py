@@ -134,10 +134,13 @@ def _signal_fingerprint(sig: dict) -> str:
 # 场景：KC 机器人翻译流程会发英文 + 中文两条；
 #       现在 ZH parser 也能解析了，两条都会触发，需要二次拦截。
 # key = (kind, sorted symbols, pct)  —— 不带 lang，跨语言去重
-# 窗口 5min（同信号语义重发的时间尺度，参考 _is_duplicate_signal 设计）
+# 窗口 60s（7/8 调整，原 5min）：
+#   - 双语孪生/重发实测间隔 ≤8.5s，60s 有 7x 余量
+#   - 5min 窗口误伤真实的连续 trim：7/8 "BANG! Trimmed AAPL @ 2.00" 是
+#     82s 后的第二次 trim（价格都不同），被当 dup 拦掉——qty≥2 时会漏跟
 _close_fps: dict[tuple, "datetime"] = {}
 _CLOSE_FP_MAX = 100
-CLOSE_FP_WINDOW = timedelta(minutes=5)
+CLOSE_FP_WINDOW = timedelta(seconds=60)
 
 
 def _close_fingerprint(parsed: dict) -> tuple:
@@ -146,13 +149,15 @@ def _close_fingerprint(parsed: dict) -> tuple:
     return (parsed["kind"], syms, parsed["pct"])
 
 
-def _check_duplicate_close(parsed: dict) -> tuple[bool, float]:
-    """只查重，不登记。返回 (是否重复, 距上次秒数)。
+def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
+    """查重 + 登记，**原子**（单 event loop，中间无 await）。
 
-    登记动作拆到 _record_close_fp，由调用方在**至少一笔卖单成功提交后**调用。
-    之前是查即登记：ZH 版先到但卖单失败（broker 异常/拒单）时，1-3s 后到的
-    EN 版会被当 dup 拦掉——天然的重试机会没了。现在失败不登记，EN 版正常重试。
-    代价：完全没匹配到持仓时两个语言版本各发一条 skip 通知（可接受）。
+    7/8 教训：0005 曾把登记挪到 handler 末尾（执行成功后），但 KC bot 双发
+    间隔 ~0.9s < handler 耗时 ~1.2s（含 TG await）→ 第二条穿过 dup 检查
+    双重处理（连续两夜实锤，qty≥2 时会 trim 两次）。登记必须和查重同步做。
+
+    broker 失败时的重试语义（0005 的目的）改由回滚实现：handler 末尾发现
+    "零成交且有 broker 失败" → _unregister_close_fp，让下一条孪生重试。
     """
     fp = _close_fingerprint(parsed)
     now = datetime.now(timezone.utc)
@@ -164,15 +169,17 @@ def _check_duplicate_close(parsed: dict) -> tuple[bool, float]:
     prev_ts = _close_fps.get(fp)
     if prev_ts is not None:
         return True, (now - prev_ts).total_seconds()
-    return False, 0.0
 
-
-def _record_close_fp(parsed: dict):
-    """登记 CLOSE 指纹（含硬上限保护）。仅在实际执行成功后调用。"""
     if len(_close_fps) >= _CLOSE_FP_MAX:
         oldest = min(_close_fps, key=_close_fps.get)
         _close_fps.pop(oldest, None)
-    _close_fps[_close_fingerprint(parsed)] = datetime.now(timezone.utc)
+    _close_fps[fp] = now
+    return False, 0.0
+
+
+def _unregister_close_fp(parsed: dict):
+    """回滚指纹：broker 失败且零成交时调用，让双语孪生版本充当天然重试。"""
+    _close_fps.pop(_close_fingerprint(parsed), None)
 
 
 def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
@@ -625,10 +632,9 @@ async def _handle_close_signal(raw: str, msg_id: int):
             await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 
-    # CLOSE dedup —— 双语双发 / 同信号重发拦截
-    # 注意：这里只查重，指纹在下面"至少一笔卖单成功"后才登记（_record_close_fp），
-    # 让执行失败时 1-3s 后到达的另一语言版本天然充当重试。
-    is_dup, ago = _check_duplicate_close(parsed)
+    # CLOSE dedup —— 双语双发 / 同信号重发拦截（查即登记，原子堵双发窗口；
+    # broker 失败时末尾回滚指纹，孪生版本充当重试）
+    is_dup, ago = _is_duplicate_close(parsed)
     if is_dup:
         logger.info(
             f"🔁 [CLOSE] dup skipped (lang={parsed.get('lang')}): "
@@ -638,8 +644,13 @@ async def _handle_close_signal(raw: str, msg_id: int):
         return
 
     if parsed["kind"] == "BULK_TRIM":
-        # 全仓 trim，遍历所有 open symbols
-        targets = list(open_symbols)
+        # 全仓 trim：遍历所有 open symbols，扣掉信号里的例外
+        # （7/8 "Closing all positions outside of the $IBM $310 lotto"——
+        # 不能连人家明确保留的仓位一起卖）
+        excluded = set(parsed.get("exclude_symbols") or [])
+        targets = [s for s in open_symbols if s not in excluded]
+        if excluded:
+            logger.info(f"[CLOSE] BULK exclude: {sorted(excluded)}")
     else:
         targets = parsed["symbols"]
 
@@ -794,16 +805,13 @@ async def _handle_close_signal(raw: str, msg_id: int):
             any_executed = True
             any_success = True
 
-    if any_success or not any_broker_failure:
-        # 登记指纹拦掉 1-3s 后的双语孪生版本，两种情况：
-        #   1. 至少一笔卖单成功——正常路径
-        #   2. 全部是确定性结果（runner-preserve / 无价格参照 / strike 不匹配 /
-        #      no matching）——孪生版本重试也是同样结果，只会重复刷 TG
-        #      （7/6 实测：runner-preserve 和"无价格参照"各触发一次时，
-        #      ZH/EN 双发若不去重会连发 2-4 条相同告警）
-        # 唯一不登记的情况：零成交且出现过 broker 失败（异常/拒单）——
-        # 让另一语言版本充当天然重试（0005 补丁的核心目的）。
-        _record_close_fp(parsed)
+    if any_broker_failure and not any_success:
+        # 指纹已在 _is_duplicate_close 查重时登记（原子，堵双发竞态）。
+        # 零成交且出现过 broker 失败（异常/拒单）→ 回滚指纹，
+        # 让 1-3s 后到达的另一语言版本充当天然重试（0005 的目的）。
+        # 确定性结果（runner-preserve / 无价格参照 / strike 不匹配）不回滚——
+        # 孪生重试也是同样结果，只会重复刷 TG。
+        _unregister_close_fp(parsed)
 
     if not any_executed:
         await _safe_notify(format_close_skipped(
@@ -835,6 +843,22 @@ _OPEN_PRICE_RE = _re.compile(
     _re.I,
 )
 
+# bot 名前缀会污染裸 ticker 启发式："KC Trades Bot:" 里的 "KC" 命中
+# `\b[A-Z]{2,5}\b`，让每条带价格的无 symbol 跟单 trim 都触发 TG
+# （7/8 一夜 ~10 条 "parser skipped" 噪音）。启发式判断前先剥掉。
+# "BANG" 是 KC 的情绪叹词（7/9 "BANG! Out half 2.45" 还是触发了 TG），
+# 全大写 4 位正好命中裸 ticker 形态，一并剥掉。
+# 只影响启发式，不影响 parser 本体。
+_BOT_NOISE_RE = _re.compile(
+    r"@everyone|KC\s*Trades\s*Bot|KC\s*交易机器人|美股会员网机器人|enrich|丰富"
+    r"|\bBANG\b",
+    _re.IGNORECASE,
+)
+
+
+def _strip_bot_noise(text: str) -> str:
+    return _BOT_NOISE_RE.sub(" ", text or "")
+
 
 def _looks_like_open_attempt(text: str) -> bool:
     """三件套都有 → 大概率是想发开仓信号但 parser 没接住。值得 TG。
@@ -843,6 +867,7 @@ def _looks_like_open_attempt(text: str) -> bool:
     """
     if not text:
         return False
+    text = _strip_bot_noise(text)
     return bool(
         _OPEN_TICKER_RE.search(text)
         and _OPEN_SIDE_RE.search(text)
@@ -879,6 +904,7 @@ def _looks_like_addon_attempt(text: str) -> "str | None":
     """
     if not text:
         return None
+    text = _strip_bot_noise(text)
     has_kw = bool(_ADDON_KEYWORD_RE.search(text)) or any(
         k in text for k in _ZH_ADDON_KEYWORDS
     )
@@ -909,6 +935,7 @@ def _looks_like_close_attempt(text: str) -> bool:
     """
     if not text:
         return False
+    text = _strip_bot_noise(text)
     has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
     # 价格-like：$X / @X / 任何 d.dd（不用 \b 边界，因为中文+数字无 word boundary）
     has_price_hint = bool(_re.search(r"\$\.?\d|@\s*\.?\d|\d+\.\d{1,2}", text))

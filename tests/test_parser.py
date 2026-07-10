@@ -316,3 +316,46 @@ def test_holding_up_well_not_skipped():
     r = parse_signal("$APLD weekly $50 calls $.66 - holding up well", msg_ts=FIXED_TODAY)
     assert r is not None
     assert r["symbol"] == "APLD"
+
+
+# === 7/8 复盘回归 ===
+
+def test_lowercase_word_not_ticker():
+    """'taking AAPL again but 300p 7/17 @ 1.50' —— 小写 'but' 不是 ticker BUT。
+
+    IGNORECASE 让 [A-Z]{1,5} 实际也吃小写，垃圾单 US.BUT... 曾真实提交
+    （被预校验 'Unknown stock' 拦下）。无 gap-tolerant 关联时信号仍为 None
+    → 走 listener 的 looks-like-signal TG 告警人工接住；绝不能出 BUT 单。
+    """
+    r = parse_signal("taking AAPL again but 300p 7/17 @ 1.50 for a small swing",
+                     msg_ts=FIXED_TODAY)
+    assert r is None
+
+
+def test_detect_action_trimming_gerund():
+    """'Start trimming. Down to 1/2.' —— trimming 必须进 close 路由
+    （\\btrim\\b 匹配不到 gerund，7/8 实测漏路由）。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action("$DELL - Congrats all. Start trimming. Down to 1/2.") == "CLOSE"
+
+
+def test_detect_action_stop_at_entry_not_open_intent():
+    """'out half 3.22 stop at entry' —— 'at entry' 是止损备注不是开仓意图，
+    不能把弱 close 路由压掉（7/8 实测）。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action("out half 3.22 💰 stop at entry") == "CLOSE"
+
+
+def test_detect_action_re_enter_not_open_intent():
+    """'will look to re-enter' —— re-enter 是未来意图，\\benter\\b 在连字符处
+    误命中导致 'all out apple' 没进 close 路由（7/7 实测）。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action(
+        "all out apple to secure green trade 🙏🏼 will look to re-enter again "
+        "for a put swing again"
+    ) == "CLOSE"
+
+
+def test_detect_action_zh_chuqing():
+    from src.parser.signal_parser import detect_action
+    assert detect_action("全部出清苹果仓位，确保交易盈利") == "CLOSE"

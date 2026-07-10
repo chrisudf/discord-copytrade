@@ -586,12 +586,19 @@ def query_order_status(order_id: str) -> dict:
                 "status": None, "filled_qty": 0, "filled_avg_price": 0.0}
 
 
+# no-permission 退避日志节流：每个 300s 退避周期到期后 SL/TP 各重探一次，
+# 每次都打 WARNING 一夜能刷 ~200 行（7/9 实测）。状态没变化时只在
+# 首次 + 每小时提醒一次，其余降为 DEBUG。
+_no_perm_last_warn: float = 0.0
+_NO_PERM_WARN_INTERVAL = 3600.0
+
+
 def _snapshot(codes: list) -> "tuple[int, object]":
     """单层 wrapper：处理 lock、限频 backoff、异常 reset。返回 (ret, df_or_msg)。
 
     设计见 docs/realtime_quote_design.md (PR 1)。
     """
-    global _quote_backoff_until
+    global _quote_backoff_until, _no_perm_last_warn
     now = time.monotonic()
     if now < _quote_backoff_until:
         return -1, f"backoff (limit/quota) for another {_quote_backoff_until - now:.0f}s"
@@ -607,9 +614,28 @@ def _snapshot(codes: list) -> "tuple[int, object]":
 
     if ret != RET_OK:
         msg = str(df)
-        if "quota" in msg.lower() or "limit" in msg.lower():
+        msg_lower = msg.lower()
+        # 限频/配额 → 短退避。7/8 实测 moomoo 的限频报错原文是
+        # "request failed due to high frequency. Maximum 60 times per 30 seconds."
+        # ——不含 quota/limit 字样，旧关键词接不住 → watcher 不退避持续硬打。
+        if any(k in msg_lower for k in ("quota", "limit", "high frequency", "frequent")):
             _quote_backoff_until = time.monotonic() + 60.0
             logger.warning(f"[broker] snapshot quota/limit exceeded, backoff 60s: {msg[:120]}")
+        # 无期权行情权限 → 长退避。权限不会在一次 tick 之间凭空出现，
+        # 但每次失败的调用**照样消耗 60/30s 频率配额**（7/8 整夜被 watcher
+        # 打满，validate_option_codes 全靠 fail-open 才没误拒买单）。
+        # 5 分钟重试一次：中途开通订阅也能在几分钟内自动恢复。
+        elif "no permission" in msg_lower or "quote permission" in msg_lower:
+            _quote_backoff_until = time.monotonic() + 300.0
+            note = (
+                f"[broker] snapshot no-permission, backoff 300s "
+                f"(watcher 轮询暂停，避免打满频率配额): {msg[:120]}"
+            )
+            if time.monotonic() - _no_perm_last_warn >= _NO_PERM_WARN_INTERVAL:
+                _no_perm_last_warn = time.monotonic()
+                logger.warning(note)
+            else:
+                logger.debug(note)
     return ret, df
 
 

@@ -73,6 +73,8 @@ BULK_MARKERS = [
 # 把普通 trim 误升级成 100% 全平（实测 "Trimmed SPY ... overall outlook" 案例）。
 ACTION_VERBS = [
     "trimming", "trimmed",
+    "trim ",                  # 祈使式 "trim SPY runner at 3.10"（7/9 实测漏接，
+                              # detect_action 的 \btrim\b 认但这里没有 → parser 拒）
     "cutting", "cut ",        # "cut " 加空格避免匹配 "scout/circuit"
     "selling", "sold here",
     "closing", "closed",
@@ -94,7 +96,13 @@ FULL_CLOSE_VERBS = ["closed", "cutting", "cut ", "dumped", "dumping"]
 
 # 提取百分比："25%" / "20 %"
 # 排除 `-15%` `+30%` 这类 PnL 标注（前面有符号/数字 → 不是 trim 比例）
-PCT_PATTERN = re.compile(r"(?<![-+\d.])(\d{1,3})\s*%")
+# 排除 "1% position" / "99% cash" / "2% 的仓位/头寸" 这类**仓位大小标注**
+# （7/8 实测：enrich "Closing all positions ... this is a 1% position -
+# I am 99% cash" 被读成 trim 1%，BULK 遍历全部持仓刷了 8 连 TG）
+PCT_PATTERN = re.compile(
+    r"(?<![-+\d.])(\d{1,3})\s*%"
+    r"(?!\s*(?:position\b|pos\b|sizing\b|cash\b|的?\s*仓位|的?\s*头寸|的?\s*现金))"
+)
 
 # 提取 $SYMBOL（强信号）
 DOLLAR_SYM_PATTERN = re.compile(r"\$([A-Z]{1,5})\b")
@@ -182,9 +190,11 @@ def _extract_signal_price(scope: str) -> "float | None":
 #   "closed NOW at entry"                  → 0   （持平退出）
 #   "trimmed @ break even"                 → 0
 # 不同于 trim 比例 ("Selling 25%")：PnL 必须带正负号 / 或 "at entry" 之类显式标记。
+# "stop(s) at entry" 是移止损备注不是持平退出（7/8 "trimmed AAPL +20% stop at
+# entry" 被误标 pnl=0），用 lookbehind 排除。
 PNL_SIGNED_PATTERN = re.compile(r"([+\-])\s*(\d{1,3}(?:\.\d+)?)\s*%")
 AT_ENTRY_PATTERN = re.compile(
-    r"\bat\s+(?:entry|breakeven|break\s*even|be)\b", re.I
+    r"(?<!stop\s)(?<!stops\s)\bat\s+(?:entry|breakeven|break\s*even|be)\b", re.I
 )
 # 中文版："在进场位 / 在入场位 / 保本 / 平本"
 ZH_AT_ENTRY_PATTERN = re.compile(r"在\s*(?:进场|入场)位|保本|平本")
@@ -245,6 +255,7 @@ ZH_BULK_MARKERS = ["所有持仓", "全部持仓", "全部仓位"]
 # 不加裸 "缩减"——"缩减购债" 类宏观评论会误触。
 # "减持" 理论上也可能出现在 "巴菲特减持苹果" 类新闻转述里，但风险与既有
 # 的 卖出/砍掉 相同（channel 只有 KC bot 发言 + symbol 白名单双保险），接受。
+# 7/8 加 出清（"全部出清苹果仓位"）。
 ZH_ACTION_VERBS = [
     "减仓", "平仓", "清仓", "全平", "清空",
     "卖出", "卖了",
@@ -252,13 +263,59 @@ ZH_ACTION_VERBS = [
     "抛出", "抛了",
     "止盈",
     "减持", "缩减至", "缩减到",
+    "出清",
 ]
 
 # 全平动词 / 短语（pct 缺省 → 100）
-ZH_FULL_CLOSE_VERBS = ["平仓", "清仓", "全平", "清空", "全部卖出", "全部抛"]
+ZH_FULL_CLOSE_VERBS = ["平仓", "清仓", "全平", "清空", "全部卖出", "全部抛", "出清"]
 
 # "剩下 30%" / "剩 N%" → 卖 (100-N)%
 ZH_LEFT_PATTERN = re.compile(r"剩\s*下?\s*(\d{1,3})\s*%")
+
+
+# === 公司名 → ticker 最小映射（白名单门控）===
+# 7/7-7/8 实测：KC 平仓爱写公司名不写 ticker（"all out apple" / "减仓苹果"），
+# EN/ZH 都抽不出 symbol → 平仓信号静默丢失（AAPL 305p 僵尸仓的直接成因）。
+# 只映射高频大票，且**必须命中 open_symbols 白名单才生效**——
+# 没持仓时这些词只是行情闲聊，映射了反而会误平。
+EN_NAME_TO_TICKER = {
+    "apple": "AAPL", "tesla": "TSLA", "amazon": "AMZN", "microsoft": "MSFT",
+    "nvidia": "NVDA", "google": "GOOGL", "meta": "META", "netflix": "NFLX",
+}
+ZH_NAME_TO_TICKER = {
+    "苹果": "AAPL", "特斯拉": "TSLA", "亚马逊": "AMZN", "微软": "MSFT",
+    "英伟达": "NVDA", "谷歌": "GOOGL", "脸书": "META", "网飞": "NFLX",
+}
+
+
+# === BULK 例外抽取 ===
+# "Closing all positions outside of the $IBM $310 lotto"（7/8 实测）——
+# BULK_TRIM 不能连人家明确保留的仓位一起卖。
+# EN: outside of / except (for) / other than / besides + $TICKER
+# ZH: "$IBM ... 以外" / "除了 $IBM"
+EXCLUDE_EN_PATTERN = re.compile(
+    r"(?:outside of|except(?:\s+for)?|other than|besides)\s+(?:the\s+)?\$?([A-Z]{1,5})\b",
+    re.IGNORECASE,
+)
+EXCLUDE_ZH_PATTERN = re.compile(
+    r"\$?([A-Z]{1,5})[^\n，。]{0,15}?以外"
+    r"|除了?\s*\$?([A-Z]{1,5})"
+)
+
+
+def _extract_exclude_symbols(text: str) -> list[str]:
+    """抽 BULK 例外 symbol。EN pattern 带 IGNORECASE，要求命中的词原文全大写
+    （否则 "outside of the money" 会捕到 "money"）。"""
+    out, seen = [], set()
+    for pat in (EXCLUDE_EN_PATTERN, EXCLUDE_ZH_PATTERN):
+        for m in pat.finditer(text):
+            s = next((g for g in m.groups() if g), None)
+            if not s or not s.isupper():
+                continue
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
 
 
 def _has_recap_marker(text_lower: str) -> bool:
@@ -286,7 +343,7 @@ def _has_full_close_verb(text_lower: str) -> bool:
 # 分句 scope 用：单词动词加 \b 边界；"out" 短语与 _OUT_PHRASE_RE 同边界规则
 _ACTION_RE = re.compile(
     r"\b(?:trimming|trimmed|cutting|selling|closing|closed|dumping|dumped)\b"
-    r"|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
+    r"|\btrim\s|\bcut\s|\bsold\s+here\b|\bscaling\s+(?:out|down)\b|bang!|\bbang\s+-"
     r"|\ball\s+out\b|\bout\s+(?:half|full|majority)\b",
     re.IGNORECASE,
 )
@@ -377,6 +434,15 @@ def _extract_symbols(text: str, open_symbols: set[str]) -> list[str]:
                 seen.add(s)
         if found:
             return found
+        # 3. 公司名兜底（"all out apple"）——只认已持仓的映射，见 EN_NAME_TO_TICKER 注释
+        scope_lower = scope.lower()
+        for name, tick in EN_NAME_TO_TICKER.items():
+            if tick in open_symbols and tick not in seen \
+                    and re.search(rf"\b{name}\b", scope_lower):
+                found.append(tick)
+                seen.add(tick)
+        if found:
+            return found
     return []
 
 
@@ -451,9 +517,13 @@ def _parse_close_en(text: str, open_symbols: set[str]) -> Optional[dict]:
     if _has_bulk_marker(text_lower):
         pct = _extract_pct(text, text_lower)
         if pct == 33:
-            pct = 50
-        logger.info(f"[close_parser] EN BULK_TRIM pct={pct}")
+            # 无显式比例："closing/closed all positions" 是全清语义 → 100；
+            # "trimming all positions" 保持 bulk 默认 50
+            pct = 100 if re.search(r"\bclos(?:e|ing|ed)\b", text_lower) else 50
+        exclude = _extract_exclude_symbols(text)
+        logger.info(f"[close_parser] EN BULK_TRIM pct={pct} exclude={exclude}")
         return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
+                "exclude_symbols": exclude,
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "en"}
 
@@ -528,6 +598,12 @@ def _extract_zh_symbols(text: str, open_symbols: set[str]) -> list[str]:
                 found.append(s); seen.add(s)
         if found:
             return found
+        # 3. 中文公司名兜底（"减仓苹果"）——只认已持仓的映射
+        for name, tick in ZH_NAME_TO_TICKER.items():
+            if tick in open_symbols and tick not in seen and name in scope:
+                found.append(tick); seen.add(tick)
+        if found:
+            return found
     return []
 
 
@@ -576,8 +652,10 @@ def _parse_close_zh(text: str, open_symbols: set[str]) -> Optional[dict]:
         pct = _extract_zh_pct(text)
         if pct == 33:
             pct = 50
-        logger.info(f"[close_parser] ZH BULK_TRIM pct={pct}")
+        exclude = _extract_exclude_symbols(text)
+        logger.info(f"[close_parser] ZH BULK_TRIM pct={pct} exclude={exclude}")
         return {"kind": "BULK_TRIM", "symbols": [], "pct": pct, "hint_strike": None, "hint_side": None,
+                "exclude_symbols": exclude,
                 "signal_price": signal_price, "signal_pnl_pct": signal_pnl_pct,
                 "matched": text[:120], "lang": "zh"}
 

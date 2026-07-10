@@ -48,9 +48,17 @@ def _quote_for(code: str, price):
     """生成一个只对指定 code 返回价格、其他返回 None 的 get_last_price mock。
 
     避免前面 test 留下的 OPEN 仓位被本 test 的 mock 一起命中。
+    （EOD watcher 仍用逐个接口；SL/TP 已改批量 → 用 _quotes_for）
     """
     def _f(c):
         return price if c == code else None
+    return _f
+
+
+def _quotes_for(code: str, price):
+    """批量版 get_last_prices mock：只对指定 code 返回价格，其他 None。"""
+    def _f(codes):
+        return {c: (price if c == code else None) for c in codes}
     return _f
 
 
@@ -62,7 +70,7 @@ async def test_sl_triggers_on_threshold():
     sl_watcher._triggered.discard(code)
 
     os.environ["STOP_LOSS_PCT"] = "0.50"
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order",
                return_value={"success": True, "qty": 3, "price": 0.37,
                              "order_id": "SL_ORD_1", "code": code}), \
@@ -88,7 +96,7 @@ async def test_sl_skips_above_threshold():
 
     os.environ["STOP_LOSS_PCT"] = "0.50"
     sell_mock = AsyncMock()
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.60)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.60)), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -114,7 +122,7 @@ async def test_sl_skips_apply_sl_false():
     sl_watcher._triggered.discard(code)
 
     sell_mock = AsyncMock()
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.05)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.05)), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -131,7 +139,8 @@ async def test_sl_skips_when_quote_unavailable():
     sl_watcher._triggered.discard(code)
 
     sell_mock = AsyncMock()
-    with patch("src.position.sl_watcher.get_last_price", return_value=None), \
+    with patch("src.position.sl_watcher.get_last_prices",
+               side_effect=lambda codes: {c: None for c in codes}), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -153,7 +162,7 @@ async def test_sl_triggered_set_released_after_success_allows_reopen():
     os.environ["STOP_LOSS_PCT"] = "0.50"
     sell_ok = {"success": True, "qty": 1, "price": 0.37,
                "order_id": "SL_ORD_5", "code": code}
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -163,7 +172,7 @@ async def test_sl_triggered_set_released_after_success_allows_reopen():
 
     # reopen 同 code，再次深跌 → SL 必须再次触发
     _open_weekly("SLT5", code, qty=1, entry=1.00)
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -184,7 +193,7 @@ async def test_sl_triggered_set_kept_when_record_close_fails():
     os.environ["STOP_LOSS_PCT"] = "0.50"
     sell_ok = {"success": True, "qty": 1, "price": 0.37,
                "order_id": "SL_ORD_6", "code": code}
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok) as sell_mock, \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock), \
          patch.object(sl_watcher.position_mgr, "on_close_filled",
@@ -372,7 +381,7 @@ async def test_sell_lock_prevents_concurrent_double_sell():
 
     with patch("src.position.sl_watcher.place_sell_order", side_effect=slow_sell), \
          patch("src.position.eod_watcher.place_sell_order", side_effect=slow_sell), \
-         patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.eod_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock), \
          patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock):

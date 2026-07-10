@@ -229,6 +229,11 @@ def _try_pattern_a(text: str, today: date):
     )
     for m in pattern_a2.finditer(text):
         symbol, strike, cp, month_name, dd, price = m.groups()
+        # 7/8 实测：regex 带 IGNORECASE，[A-Z] 实际也吃小写——
+        # "taking AAPL again but 300p 7/17" 里的 "but" 被当成 ticker BUT。
+        # 停用词表永远列不全，要求 symbol 在原文中就是全大写（真 ticker 惯例）
+        if not symbol.isupper():
+            continue
         if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
             continue
         if price is None:
@@ -265,6 +270,9 @@ def _try_pattern_a(text: str, today: date):
     for m in pattern.finditer(text):
         symbol, strike, cp, mm, dd, price = m.groups()
 
+        # 同 A2：小写单词不是 ticker（"but 300p 7/17" 案例，7/8）
+        if not symbol.isupper():
+            continue
         if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
             continue
 
@@ -583,9 +591,18 @@ def _extract_tags(text: str) -> list:
 #     （"adding..., scaling down size" 类开仓语境靠 OPEN_INTENT 豁免）
 #   - ZH "减持1/3" / "缩减至 1/2" → 减持 / 缩减至|缩减到 放强词层
 #     （不加裸 "缩减"：会误伤 "缩减购债" 类宏观评论）
+# 7/8 复盘补充：
+#   - trim(?:med|ming)?：\btrim\b 匹配不到 "trimming"（"Start trimming. Down
+#     to 1/2" 没进 close 路径），close_parser 的 ACTION_VERBS 一直认 trimming，
+#     双层词表不同步的实锤
+#   - 出清：ZH "全部出清苹果仓位" 漏路由
+#   - OPEN_INTENT 两次实测误伤（都是把弱 close 压掉）：
+#       "will look to re-enter" → \benter\b 在连字符处成立命中 "re-enter"
+#       "out half 3.22 stop at entry" → \bentry\b 命中 "stop at entry"
+#     "at/to entry" 和 "re-enter" 是 KC 高频的止损/复盘用语，不是开仓动作
 STRONG_CLOSE_RE = re.compile(
-    r"\b(closed?|sold|exit|stopped|trim|trimmed|out of|scaling\s+out)\b"
-    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到",
+    r"\b(closed?|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
+    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清",
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
@@ -598,7 +615,8 @@ WEAK_CLOSE_RE = re.compile(
 )
 OPEN_INTENT_RE = re.compile(
     r"\b(buy(?:ing)?|bought|add(?:ing|ed)?|grab(?:bed|bing)?|"
-    r"load(?:ing|ed)?|bto|enter(?:ed|ing)?|entry|in at)\b",
+    r"load(?:ing|ed)?|bto|(?<!re-)enter(?:ed|ing)?|"
+    r"(?<!at\s)(?<!to\s)entry|in at)\b",
     re.I,
 )
 
