@@ -371,6 +371,15 @@ async def _handle_message_inner(message):
     except Exception as e:
         logger.error(f"log_raw_signal failed: {e}")
 
+    # ---- 原文级去重 ----
+    # 7/14 起源频道每条消息双发（EN×2 + ZH×2，一个信号 4 条）。交易路径有
+    # 指纹 dedup 兜底，但 parse-fail 的 TG 告警会跟着双响（7/14 00:13 两条
+    # 一模一样的 looks-like-signal）。同频道同内容 30s 内只处理一次；
+    # 放在 log_raw_signal 之后——raw_signals 照常留底，复盘不丢原文。
+    if _is_duplicate_raw(cid, raw):
+        logger.info(f"🔁 duplicate raw message skipped (30s window): {raw[:60]}")
+        return
+
     # ---- 检测 OPEN / CLOSE ----
     action = detect_action(raw)
     if action == "CLOSE":
@@ -893,7 +902,12 @@ import re as _re
 # 只认 $ 会把 "TSLA 250c 7/11 @ 1.20 好像没接住" 这类真漏检静默掉）。
 # 裸大写词（BANG/OK 等）会带来一点过报，但这只是 TG 告警闸门，宁多勿漏。
 _OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b")
-_OPEN_SIDE_RE = _re.compile(r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b", _re.I)
+# ZH 方向词不带 \b（汉字间无 word boundary）。parser 已归一化 看涨/看跌期权，
+# 这里兜的是 parser 因**其他**原因失败的 ZH 信号——有方向词就该报
+# "looks like signal"，而不是掉进 sized-entry 的"无 C/P 方向"（7/14 HOOD 误报）
+_OPEN_SIDE_RE = _re.compile(
+    r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b|看[涨跌]期权", _re.I
+)
 # 价格写法：$X.XX / @X.XX / .98 fill / .98 filled
 _OPEN_PRICE_RE = _re.compile(
     r"\$\.?\d+(?:\.\d+)?"
@@ -970,6 +984,29 @@ def _looks_like_sized_entry(text: str) -> "str | None":
 
 # 双语双发 dedup：同 symbol 5 分钟只提醒一次（enrich 中英×2 一口气 4 条）
 _sized_entry_alerted: dict[str, datetime] = {}
+
+
+# ============================================================
+# 原文级消息去重
+# ============================================================
+# 7/14 起源频道把每条消息发两遍（EN×2 + ZH×2）。指纹 dedup 挡住了重复下单，
+# 但 parse-fail 告警、close-skipped TG、日志全部双份。同频道同原文 30s 内
+# 只处理第一条。窗口刻意短：KC 隔几分钟重发同文本（如同价再 trim）是
+# 真实场景，不能误吞；实测双发间隔 1-5s，30s 足够。
+_RAW_DEDUP_WINDOW = timedelta(seconds=30)
+_recent_raw: dict[tuple[int, str], datetime] = {}
+
+
+def _is_duplicate_raw(cid: int, raw: str) -> bool:
+    """同频道同原文在窗口内出现过 → True（并顺手清过期条目）。"""
+    now = datetime.now(timezone.utc)
+    for key in [k for k, ts in _recent_raw.items() if now - ts > _RAW_DEDUP_WINDOW]:
+        _recent_raw.pop(key, None)
+    key = (cid, raw)
+    if key in _recent_raw:
+        return True
+    _recent_raw[key] = now
+    return False
 
 
 # ============================================================

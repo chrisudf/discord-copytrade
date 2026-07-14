@@ -189,6 +189,13 @@ def parse_signal(text: str, msg_ts: date = None):
     if not text or len(text.strip()) < 5:
         return None
 
+    # ZH 方向词 → EN，让 ZH 版信号走既有 pattern（7/14 实测：enrich 的 ZH 版
+    # 比 EN 版早 ~2s 到达，"$HOOD - 7/24 $125 看涨期权 $1.50" 差一个方向词
+    # 全 pattern 落空，白等 EN 版。归一化后 ZH 先解析先下单，EN 孪生被
+    # 指纹 dedup 自然吸收。只认完整词"看涨期权/看跌期权"——裸"看涨/看跌"
+    # 在行情评论里太常见（"我看涨大盘"），不碰。
+    text = text.replace("看涨期权", " calls ").replace("看跌期权", " puts ")
+
     if _has_skip_keyword(text) or _HOLDING_TICKER_RE.search(text):
         logger.info(f"[parser] skip (holding/remaining): {text[:60]}")
         return {"skip": "holding_or_remaining"}

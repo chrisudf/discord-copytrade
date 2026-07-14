@@ -96,3 +96,48 @@ def test_record_recent_exec_prunes_stale_entries():
     dc._record_recent_exec(123, "MU")
     assert (123, "OLD") not in dc._recent_exec
     assert (123, "MU") in dc._recent_exec
+
+
+# ============ 原文级消息去重（7/14 源频道每条消息双发） ============
+
+@pytest.fixture(autouse=True)
+def _clean_recent_raw():
+    dc._recent_raw.clear()
+    yield
+    dc._recent_raw.clear()
+
+
+def test_raw_dedup_same_channel_same_text():
+    raw = "@everyone\nKC Trades Bot:PLTR 160c 8/21 starter swing @ 2.50"
+    assert dc._is_duplicate_raw(123, raw) is False  # 首条放行
+    assert dc._is_duplicate_raw(123, raw) is True   # 双发第二条挡住
+
+
+def test_raw_dedup_different_channel_not_blocked():
+    raw = "same text"
+    assert dc._is_duplicate_raw(123, raw) is False
+    assert dc._is_duplicate_raw(456, raw) is False
+
+
+def test_raw_dedup_different_text_not_blocked():
+    assert dc._is_duplicate_raw(123, "trimmed PLTR @ 3.40") is False
+    assert dc._is_duplicate_raw(123, "trimmed PLTR @ 3.65") is False
+
+
+def test_raw_dedup_expires_after_window():
+    raw = "repeat me"
+    dc._recent_raw[(123, raw)] = (
+        datetime.now(timezone.utc) - dc._RAW_DEDUP_WINDOW - timedelta(seconds=1)
+    )
+    # 窗口外的旧记录不算重复（KC 隔几分钟重发同文本是真实场景）
+    assert dc._is_duplicate_raw(123, raw) is False
+
+
+# ============ ZH 方向词进 looks-like-signal 启发式 ============
+
+def test_open_attempt_recognizes_zh_side_word():
+    """parser 因其他原因失败的 ZH 方向信号应报 "looks like signal"，
+    而不是掉进 sized-entry 的"无 C/P 方向"（7/14 HOOD 误报）。"""
+    assert dc._looks_like_open_attempt("$HOOD - 7/24 $125 看涨期权 $1.50") is True
+    # 且不再被 sized-entry 分支捕获的前提成立：有方向词的文本 side RE 必命中
+    assert dc._OPEN_SIDE_RE.search("买入看跌期权对冲") is not None

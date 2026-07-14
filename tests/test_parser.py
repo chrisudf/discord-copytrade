@@ -359,3 +359,56 @@ def test_detect_action_re_enter_not_open_intent():
 def test_detect_action_zh_chuqing():
     from src.parser.signal_parser import detect_action
     assert detect_action("全部出清苹果仓位，确保交易盈利") == "CLOSE"
+
+
+# ============ ZH 方向词归一化（7/14 复盘：enrich ZH 版先到但解析不了） ============
+
+ZH_TODAY = date(2026, 7, 14)  # 周二，非假日
+
+
+def test_zh_call_word_enrich_hood():
+    """7/14 实测原文：ZH 版比 EN 版早 ~2s，之前差一个方向词全 pattern 落空。"""
+    r = parse_signal(
+        "enrich:\n$HOOD - 7/24 $125 看涨期权 $1.50\n\n2% 头寸 \n\n@everyone $alert",
+        msg_ts=ZH_TODAY,
+    )
+    assert r is not None and not r.get("skip")
+    assert r["symbol"] == "HOOD"
+    assert r["side"] == "CALL"
+    assert r["strike"] == 125.0
+    assert r["price"] == 1.50
+    assert r["expiry_date"] == date(2026, 7, 24)
+
+
+def test_zh_call_word_enrich_googl():
+    """7/14 实测原文：strike 带小数 + 价格 $.80 简写 + 方向词后接汉字。"""
+    r = parse_signal(
+        "enrich:\n$GOOGL 7/15 $362.50 看涨期权 - 逐步增加到 $.80\n\n@everyone $alert",
+        msg_ts=ZH_TODAY,
+    )
+    assert r is not None and not r.get("skip")
+    assert r["symbol"] == "GOOGL"
+    assert r["side"] == "CALL"
+    assert r["strike"] == 362.5
+    assert r["price"] == 0.80
+    assert r["expiry_date"] == date(2026, 7, 15)
+
+
+def test_zh_put_word():
+    r = parse_signal("$SPY 7/17 $740 看跌期权 $2.10", msg_ts=ZH_TODAY)
+    assert r is not None and not r.get("skip")
+    assert r["side"] == "PUT"
+    assert r["strike"] == 740.0
+
+
+def test_zh_side_word_attached_no_space():
+    """"$362.50看涨期权" 紧贴写法——归一化补了空格，pattern 仍应命中。"""
+    r = parse_signal("$GOOGL 7/15 $362.50看涨期权 $.80", msg_ts=ZH_TODAY)
+    assert r is not None and not r.get("skip")
+    assert r["side"] == "CALL"
+
+
+def test_zh_bare_kanzhang_not_converted():
+    """裸"看涨"（无"期权"后缀）是行情评论用词，不得触发方向归一化。"""
+    r = parse_signal("我看涨大盘，$SPY 目标 $750", msg_ts=ZH_TODAY)
+    assert r is None or r.get("skip")
