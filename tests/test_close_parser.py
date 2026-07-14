@@ -769,3 +769,71 @@ def test_bare_trim_imperative():
     assert r["symbols"] == ["SPY"]
     assert r["pct"] == 33
     assert r["signal_price"] == 3.10
+
+
+# === 7/10 事故回归：strike-hint 全文回退 / hold-context / 一半 ===
+
+def test_strike_hint_survives_sentence_split():
+    """7/10 事故消息：'SPY 755c IN THE MONEY! Closed @ 4.40' ——
+    hint 在感叹句、动作在下一句，分句后 hint 曾丢失 → symbol-only 匹配
+    把我们的 SPY put 当 call 平掉。现在 scope 未命中回退全文。"""
+    r = parse_close("KC Trades Bot:SPY 755c IN THE MONEY! Closed @ 4.40 💰", {"SPY"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 100
+    assert r["hint_strike"] == 755.0
+    assert r["hint_side"] == "CALL"
+
+
+def test_hold_context_symbol_not_close_target():
+    """7/10 near-miss：'+100% on SPY closed out ... just have runners on the
+    NVDA call swings' —— NVDA 是继续持有的对象，不是 close 目标。"""
+    msg = ("KC Trades Bot:no new swings for me, +100% on SPY closed out now "
+           "and just have runners on the NVDA call swings 🚀💰")
+    # 只持 NVDA（实况：SPY 已出白名单）→ 不应产出任何 close
+    assert parse_close(msg, {"NVDA"}) is None
+    # SPY 也在持仓时 → 只平 SPY，NVDA 仍被排除
+    r = parse_close(msg, {"SPY", "NVDA"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 100
+
+
+def test_zh_hold_context_symbol_excluded():
+    """ZH 孪生：'SPY已平仓获利+100%，仅保留NVDA看涨波段的持仓'"""
+    msg = "KC交易机器人：本日无新波段交易，SPY已平仓获利+100%，仅保留NVDA看涨波段的持仓🚀💰"
+    assert parse_close(msg, {"NVDA"}) is None
+    r = parse_close(msg, {"SPY", "NVDA"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 100
+    assert r["lang"] == "zh"
+
+
+def test_zh_yiban_is_fifty_pct():
+    """7/10 '减仓一半' → 50%（曾落默认 33，与 EN 孪生 'out half'=50 指纹不匹配）"""
+    r = parse_close(
+        "KC Trades Bot: 嘭！206成交！NVDA以3.60美元成交 💰 减仓一半，止损设在入场价",
+        {"NVDA"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["NVDA"]
+    assert r["pct"] == 50
+
+
+def test_zh_jianban_verb_and_fifty():
+    """'减半仓' 是动作动词（"减仓"非其连续子串，旧词表接不住）且 pct=50"""
+    r = parse_close("减半仓 NVDA @ 2.45", {"NVDA"})
+    assert r is not None
+    assert r["pct"] == 50
+
+
+def test_trimmed_runner_of_symbol_still_closes():
+    """方向性检查：'trimmed 1 SPY runner @ 4.00' 是在 trim SPY（合法 close），
+    不能被 'runners on X' 的 hold 排除误伤。"""
+    r = parse_close(
+        "KC Trades Bot:trimmed 1 SPY runner here at 4.00 🚀 leaving 1 for in the money! 💰",
+        {"SPY"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["SPY"]

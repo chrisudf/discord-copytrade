@@ -374,7 +374,7 @@ async def _handle_message_inner(message):
     # ---- 检测 OPEN / CLOSE ----
     action = detect_action(raw)
     if action == "CLOSE":
-        await _handle_close_signal(raw, message.id)
+        await _handle_close_signal(raw, message.id, channel_name=cfg.name)
         return
 
     # ---- 解析信号 ----
@@ -607,16 +607,21 @@ def _calc_sell_limit(avg_entry: float, signal_price: float = None) -> "float | N
     return round(signal_price * (1 - SELL_SLIP), 2)
 
 
-async def _handle_close_signal(raw: str, msg_id: int):
+async def _handle_close_signal(raw: str, msg_id: int, channel_name: str = None):
     """detect_action==CLOSE 时调用。
 
     流程：
       1. 查当前活跃持仓 symbols → 给 parser 做白名单消歧
       2. parse_close → dict | None
       3. 多 symbol 循环：每个 symbol 可能对应多 strike，全部按 pct 卖
+         （channel_name 传入时只平**同频道来源**的仓位——7/10 enrich 的
+         "$NVDA all out" 差点平掉我们跟 KC 开的 NVDA swing，两个频道是
+         两个独立 trader，close 不能跨源）
       4. broker.place_sell_order（to_thread 包同步调用）
       5. position_mgr.on_close_filled 扣减
       6. Telegram 通知
+
+    channel_name=None（测试/旧调用方）时不做频道过滤，保持旧行为。
     """
     open_symbols = position_mgr.get_open_symbols()
     if not open_symbols:
@@ -674,6 +679,34 @@ async def _handle_close_signal(raw: str, msg_id: int):
         if not positions:
             logger.warning(f"[CLOSE] {symbol} not found in open positions")
             continue
+
+        # 频道来源过滤：只平信号来源频道开的仓位（channel_name 为空的历史
+        # 仓位放行）。7/10 实测：enrich "$NVDA - I'm practically all out"
+        # 匹配到我们跟 KC 开的 NVDA 230c —— enrich 平的是他自己的 0DTE，
+        # 两个频道是独立 trader，靠"无价格参照拒卖"才躲过 100% 误平。
+        if channel_name:
+            same_ch = [
+                p for p in positions
+                if not p.get("channel_name") or p["channel_name"] == channel_name
+            ]
+            if not same_ch:
+                logger.info(
+                    f"[CLOSE] {symbol}: {len(positions)} position(s) opened from "
+                    f"other channel(s) "
+                    f"({sorted({p.get('channel_name') for p in positions})}), "
+                    f"signal from '{channel_name}' — skip"
+                )
+                if parsed["kind"] == "CLOSE":
+                    # 定向 close 才提示（BULK 会扫到一堆别频道仓位，全提示会刷屏）
+                    await _safe_notify(format_close_skipped(
+                        f"频道不匹配：{symbol} 仓位来自 "
+                        f"{sorted({p.get('channel_name') or '?' for p in positions})}，"
+                        f"信号来自 {channel_name}，不跨源平仓",
+                        raw,
+                    ))
+                    any_executed = True  # 已发专属 TG，不再让外层报 "no matching"
+                continue
+            positions = same_ch
 
         # strike-aware filter：close 文本里显式给了 strike+side 时只关匹配的仓位。
         # 背景见 [docs/lessons.md](docs/lessons.md) #11：6/30 KC 平 TSLA 420c

@@ -521,3 +521,89 @@ def test_bang_not_bare_ticker():
     assert discord_client._looks_like_close_attempt(
         "@everyone\nKC Trades Bot:BANG! Out half SPY 2.45"
     ) is True
+
+
+# === 7/10 事故回归：频道来源约束 / strike-hint 端到端 ===
+
+@pytest.mark.asyncio
+async def test_cross_channel_close_skipped():
+    """enrich 的 close 信号不能平 KC 来源的仓位（7/10 near-miss）。"""
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("XCH")
+    positions_db.open_or_add(
+        option_code=code, symbol="XCHX", strike=230.0, side="CALL",
+        expiry=date(2026, 8, 21), qty=2, fill_price=2.93,
+        category="swing", apply_sl=False, eod_force_close=False, tags=[],
+        channel_name="KC-期权-波段", msg_id="m_xch",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    sell_called = []
+
+    def fake_sell(*args, **kwargs):
+        sell_called.append(kwargs)
+        return {"success": True, "order_id": "XC", "code": code,
+                "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    # enrich 的信号 → 不卖 + 专属 TG
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "$XCHX - I'm practically all out @ 3.60", msg_id=81,
+            channel_name="enrich",
+        )
+    assert sell_called == [], "跨频道信号不能触发卖单"
+    text = "\n".join(notifications)
+    assert "频道不匹配" in text, ("应有频道不匹配 TG", text)
+    assert positions_db.get(code)["status"] == "OPEN"
+
+    # 同频道信号 → 正常平仓
+    discord_client._close_fps.clear()
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "$XCHX - I'm practically all out @ 3.60", msg_id=82,
+            channel_name="KC-期权-波段",
+        )
+    assert len(sell_called) == 1, "同频道信号应正常平仓"
+
+
+@pytest.mark.asyncio
+async def test_wrong_side_close_blocked_end_to_end():
+    """7/10 事故端到端复现：KC 平 755 call，我们持 730 put →
+    strike/side hint 现在能从全文抽到 → 不匹配 → 拒绝卖出。"""
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("WSC")
+    positions_db.open_or_add(
+        option_code=code, symbol="WSCX", strike=730.0, side="PUT",
+        expiry=date(2026, 7, 17), qty=1, fill_price=2.93,
+        category="swing", apply_sl=False, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_wsc",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    sell_called = []
+
+    def fake_sell(*args, **kwargs):
+        sell_called.append(kwargs)
+        return {"success": True}
+
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "KC Trades Bot:WSCX 755c IN THE MONEY! Closed @ 4.40 💰", msg_id=83,
+        )
+
+    assert sell_called == [], "错向（call hint vs put 持仓）不能卖"
+    assert "不匹配" in "\n".join(notifications)
+    assert positions_db.get(code)["status"] == "OPEN"
