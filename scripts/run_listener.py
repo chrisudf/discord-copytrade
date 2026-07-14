@@ -32,7 +32,7 @@ from src.broker.moomoo_client import (
     QUOTE_OK, QUOTE_DELAYED, QUOTE_NO_PERMISSION, QUOTE_ERROR,
 )
 from src.position.sl_watcher import run_sl_watcher
-from src.position.eod_watcher import run_eod_watcher
+from src.position.eod_watcher import run_eod_watcher, sweep_expired_and_notify
 from src.position.tp_watcher import run_tp_watcher
 
 
@@ -377,6 +377,13 @@ async def main():
     token = preflight()
     loop = asyncio.get_running_loop()
     setup_signal_handlers(loop)
+
+    # 过期仓位清扫必须在 watchers 之前：7/13 整夜 SL/TP 第一轮 tick 就对
+    # 7/10 过期的 DELL 取快照 → 报错 → 300s backoff 循环，validate 连带 fail-open。
+    try:
+        await sweep_expired_and_notify()
+    except Exception:
+        logger.exception("startup expiry sweep failed (continuing)")
 
     # 保护性 watcher：SL 止损 / EOD 到期强平 / TP 分批止盈。
     # 之前只有 src.main（start_listener）启动它们，而这个生产入口一直没起——

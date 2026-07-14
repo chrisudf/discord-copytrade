@@ -401,7 +401,30 @@ async def _handle_message_inner(message):
                     f"(prev {(now - prev).total_seconds():.0f}s ago)"
                 )
         elif _looks_like_open_attempt(raw):
-            await _safe_notify(format_error("Parse failed (looks like signal)", raw))
+            twin_sym = _twin_of_recent_exec(raw, cid)
+            if twin_sym:
+                logger.info(
+                    f"🔁 parse-fail alert suppressed: {twin_sym} executed from "
+                    f"this channel <{_TWIN_SUPPRESS_WINDOW.total_seconds():.0f}s ago "
+                    f"(likely ZH/EN twin)"
+                )
+            else:
+                await _safe_notify(format_error("Parse failed (looks like signal)", raw))
+        else:
+            sized_sym = _looks_like_sized_entry(raw)
+            if sized_sym:
+                now = datetime.now(timezone.utc)
+                prev = _sized_entry_alerted.get(sized_sym)
+                if prev is None or now - prev > _ADDON_ALERT_WINDOW:
+                    _sized_entry_alerted[sized_sym] = now
+                    await _safe_notify(format_error(
+                        "疑似入场信号（无 C/P 方向，未自动下单）", raw
+                    ))
+                else:
+                    logger.info(
+                        f"🔁 sized-entry alert dedup: {sized_sym} "
+                        f"(prev {(now - prev).total_seconds():.0f}s ago)"
+                    )
         return
 
     if signal.get("skip"):
@@ -522,6 +545,9 @@ async def _handle_message_inner(message):
                 f"{signal.get('expiry', '')}\n{err_msg}"
             ))
             return
+
+        # 下单成功 → 记录 (channel, symbol)，压制随后 ZH 孪生消息的 parse-fail 报警
+        _record_recent_exec(cid, signal["symbol"])
 
         try:
             # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
@@ -906,6 +932,76 @@ def _looks_like_open_attempt(text: str) -> bool:
         and _OPEN_SIDE_RE.search(text)
         and _OPEN_PRICE_RE.search(text)
     )
+
+
+# ============================================================
+# 启发：enrich 风格"带仓位比例、无方向"的入场
+# ============================================================
+# 背景 7/13：enrich "$IBM weekly $310 $1.33 / 2% position"（中英×2 共 4 条）
+# 全部静默漏掉——B2 pattern 和 _looks_like_open_attempt 都硬要求 calls/puts，
+# 而 enrich 熟仓复入时会省掉方向（后续消息 "I'm in for now" 实锤是真入场）。
+# 没方向不能自动下单（不猜方向），但必须 TG 提醒人工。
+#
+# 三件套控误报（enrich 的 levels/watchlist/持仓更新都发不出来）：
+#   1. 恰好一个 $TICKER（watchlist 是一串 ticker；0 个不是信号）
+#   2. "N% position/头寸/仓位" 仓位标记（enrich 入场信号的签名格式）
+#   3. ≥2 个 $数字（strike + price；"Holding my 2% position" 这类纯状态没有）
+_SIZED_ENTRY_TICKER_RE = _re.compile(r"\$([A-Z]{1,5})\b")
+_SIZED_ENTRY_SIZE_RE = _re.compile(
+    r"\d{1,2}(?:\.\d+)?\s*%\s*(?:position|头寸|仓位)", _re.I
+)
+_SIZED_ENTRY_DOLLAR_NUM_RE = _re.compile(r"\$\s?\.?\d")
+
+
+def _looks_like_sized_entry(text: str) -> "str | None":
+    """检测 enrich 式无方向入场。返回命中的 symbol，未命中返回 None。"""
+    if not text:
+        return None
+    text = _strip_bot_noise(text)
+    tickers = {m.group(1) for m in _SIZED_ENTRY_TICKER_RE.finditer(text)}
+    if len(tickers) != 1:
+        return None
+    if not _SIZED_ENTRY_SIZE_RE.search(text):
+        return None
+    if len(_SIZED_ENTRY_DOLLAR_NUM_RE.findall(text)) < 2:
+        return None
+    return tickers.pop()
+
+
+# 双语双发 dedup：同 symbol 5 分钟只提醒一次（enrich 中英×2 一口气 4 条）
+_sized_entry_alerted: dict[str, datetime] = {}
+
+
+# ============================================================
+# 双语孪生消息的 parse-fail 报警抑制
+# ============================================================
+# 背景 7/13：EN "MU 1050c July 15 @ 2.60" 执行成功后 ~1s，ZH 翻译版
+# "MU 1050c 7月15日 @ 2.60" parse-fail 触发 "Parse failed (looks like signal)"
+# 系统错误报警——每笔成功单后必跟一条假警报。
+# 规则：同频道 + 窗口内刚**成功下单**过的 symbol 出现在 fail 文本里 → 只 log。
+# 只认成功执行（风控拒/broker 拒不算），不同 symbol 的真漏检不受影响。
+_TWIN_SUPPRESS_WINDOW = timedelta(seconds=60)
+_recent_exec: dict[tuple[int, str], datetime] = {}  # (channel_id, symbol) → 下单成功时间
+
+
+def _record_recent_exec(cid: int, symbol: str):
+    now = datetime.now(timezone.utc)
+    # 顺手清掉过期条目，dict 不增长
+    for key in [k for k, ts in _recent_exec.items() if now - ts > _TWIN_SUPPRESS_WINDOW]:
+        _recent_exec.pop(key, None)
+    _recent_exec[(cid, symbol)] = now
+
+
+def _twin_of_recent_exec(text: str, cid: int) -> "str | None":
+    """fail 文本是否像"刚执行过的信号"的翻译孪生。返回命中 symbol 或 None。"""
+    now = datetime.now(timezone.utc)
+    for (c, sym), ts in _recent_exec.items():
+        if c != cid or now - ts > _TWIN_SUPPRESS_WINDOW:
+            continue
+        # ZH 文本里汉字紧贴 ticker，\b 不触发——用 lookaround（同 BARE_SYM_PATTERN_ZH）
+        if _re.search(rf"(?<![A-Za-z0-9]){_re.escape(sym)}(?![A-Za-z0-9])", text):
+            return sym
+    return None
 
 
 # ============================================================

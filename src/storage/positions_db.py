@@ -430,6 +430,56 @@ def find_by_symbol(symbol: str) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def sweep_expired(today_et: date) -> list[dict]:
+    """把 expiry < today（ET）的 OPEN/PARTIAL 仓位标记为 EXPIRED。
+
+    背景（7/13 复盘）：5 张 7/10 到期合约一直挂着 OPEN——
+    - SL/TP watcher 每轮先对过期 code 取快照 → 报错 → 300s backoff，
+      连带 validate 整夜 fail-open（即使补了 OPRA 订阅也会复现）
+    - 过期 symbol 留在 close 白名单里，"IBM trimmed" 会对过期合约挂卖单
+
+    注意 expiry == today 不清（当天仍可交易，EOD watcher 15:50 强平）。
+    ITM 过期可能被自动行权变成正股头寸——这里只管本地记账，
+    行权对账靠 scripts/sync_positions.py 人工跑。
+
+    Returns:
+        被清掉的仓位 dict 列表（清扫前的快照，qty_remaining 是过期时剩的张数）
+    """
+    today_iso = today_et.isoformat()
+    now = _utc_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT * FROM positions
+            WHERE status IN ('OPEN', 'PARTIAL') AND expiry < ?
+        """, (today_iso,)).fetchall()
+        swept = [_row_to_dict(r) for r in rows]
+        for pos in swept:
+            conn.execute("""
+                UPDATE positions
+                SET status = 'EXPIRED', qty_remaining = 0,
+                    last_action_at = ?, closed_at = ?
+                WHERE option_code = ?
+            """, (now, now, pos["option_code"]))
+            conn.execute("""
+                INSERT INTO position_events (
+                    option_code, event_type, qty_delta, price, pct,
+                    trigger_source, ref_msg_id, ts, note
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                pos["option_code"], "EXPIRE", -pos["qty_remaining"], None, None,
+                "expiry_sweep", None, now,
+                f"expired {pos['expiry']}, {pos['qty_remaining']} contract(s) "
+                f"unclosed @ entry {pos['avg_entry_price']:.2f}",
+            ))
+            logger.warning(
+                f"[positions] EXPIRE {pos['option_code']}: "
+                f"{pos['qty_remaining']} contract(s) expired {pos['expiry']} "
+                f"(entry={pos['avg_entry_price']:.2f})"
+            )
+    return swept
+
+
 def adjust_entry_price(option_code: str, expect_qty_total: int, dealt_avg: float) -> bool:
     """买单 fill 确认后，用真实成交均价回填 avg_entry_price。
 

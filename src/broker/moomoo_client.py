@@ -276,19 +276,24 @@ def build_option_code(symbol: str, exp_date: date, strike: float, side: str) -> 
     """
     构造 moomoo 期权代码
 
-    格式：US.{SYMBOL}{YYMMDD}{C/P}{STRIKE*1000:06d}
-    例子：IREN 60C exp 2026-06-15 → US.IREN260615C060000
+    格式：US.{SYMBOL}{YYMMDD}{C/P}{STRIKE*1000}
+    例子：IREN 60C exp 2026-06-15 → US.IREN260615C60000
 
     注意：
     - strike * 1000 是因为 moomoo 用千分之一美元为单位
-    - 6 位前导零填充（不是 8 位！）
-      strike=2.5  → 002500
-      strike=60   → 060000
+    - strike 段是**裸整数，不做前导零填充**：
+      strike=2.5  → 2500
+      strike=60   → 60000
       strike=400  → 400000
+      7/13 复盘实锤：带前导零的 code 被 moomoo 100% 拒（"Cannot find ... in
+      US Stocks"）——OSCR 30c(6/23)、TEM 65c(6/29)、RGTI 15p、NFLX 80c(7/13)
+      四笔全灭；strike ≥ $100（天然 ≥6 位）的全部成功。此前 :06d 填充只是
+      恰好没被大票踩到。
+    - round 而非 int 截断：浮点误差下 int() 可能把 x999.9999 截成 x999
     """
     date_str = exp_date.strftime("%y%m%d")
     cp = "C" if side == "CALL" else "P"
-    strike_str = f"{int(strike * 1000):06d}"
+    strike_str = str(round(strike * 1000))
     return f"US.{symbol}{date_str}{cp}{strike_str}"
 
 

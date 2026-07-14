@@ -221,3 +221,61 @@ def test_calc_qty_to_sell_multi_contract_unchanged():
     assert manager.calc_qty_to_sell(pos, 25) == 1  # ceil(0.5) = 1
     assert manager.calc_qty_to_sell(pos, 50) == 1  # ceil(1.0) = 1
     assert manager.calc_qty_to_sell(pos, 100) == 2
+
+
+# ============ sweep_expired（7/13 复盘：过期合约残留 OPEN） ============
+
+def _open_test_pos(code: str, symbol: str, expiry: date, qty: int = 2):
+    positions_db.open_or_add(
+        option_code=code, symbol=symbol, strike=15.0, side="CALL",
+        expiry=expiry, qty=qty, fill_price=1.50,
+        category="weekly", apply_sl=True, eod_force_close=False,
+        tags=[], channel_name="test", msg_id="1",
+    )
+
+
+def test_sweep_expired_marks_and_excludes():
+    code = _uniq("EXPA")
+    _open_test_pos(code, "EXPA", date(2026, 7, 10))
+
+    swept = positions_db.sweep_expired(date(2026, 7, 13))
+
+    assert code in [p["option_code"] for p in swept]
+    pos = positions_db.get(code)
+    assert pos["status"] == "EXPIRED"
+    assert pos["qty_remaining"] == 0
+    # 移出 watcher 轮询和 close 白名单
+    assert code not in [p["option_code"] for p in positions_db.get_open_positions()]
+    assert "EXPA" not in positions_db.get_open_symbols()
+    # 事件流水留痕
+    events = positions_db.get_events(code)
+    assert events[-1]["event_type"] == "EXPIRE"
+    assert events[-1]["qty_delta"] == -2
+    assert events[-1]["trigger_source"] == "expiry_sweep"
+
+
+def test_sweep_expired_keeps_today_and_future():
+    """expiry == today 不清（当天仍可交易，EOD watcher 15:50 强平）。"""
+    today_code = _uniq("EXPB")
+    future_code = _uniq("EXPC")
+    _open_test_pos(today_code, "EXPB", date(2026, 7, 13))
+    _open_test_pos(future_code, "EXPC", date(2026, 8, 21))
+
+    swept = positions_db.sweep_expired(date(2026, 7, 13))
+
+    swept_codes = [p["option_code"] for p in swept]
+    assert today_code not in swept_codes
+    assert future_code not in swept_codes
+    assert positions_db.get(today_code)["status"] == "OPEN"
+    assert positions_db.get(future_code)["status"] == "OPEN"
+
+
+def test_sweep_expired_idempotent():
+    code = _uniq("EXPD")
+    _open_test_pos(code, "EXPD", date(2026, 7, 10))
+
+    first = positions_db.sweep_expired(date(2026, 7, 13))
+    second = positions_db.sweep_expired(date(2026, 7, 13))
+
+    assert [p["option_code"] for p in first].count(code) == 1
+    assert second == []

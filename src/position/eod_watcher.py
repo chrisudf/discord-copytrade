@@ -163,9 +163,39 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     ))
 
 
+async def sweep_expired_and_notify() -> list[dict]:
+    """过期仓位清扫 + TG 通知。幂等（清过的 status=EXPIRED 不会再选中）。
+
+    listener 启动时调一次（watchers 起来之前），之后 eod watcher 每轮
+    tick 兜底跨日。TG 用 parse_mode=None 免转义。
+    """
+    swept = position_mgr.sweep_expired()
+    if not swept:
+        return swept
+    lines = "\n".join(
+        f"  • {p['option_code']} x{p['qty_remaining']} "
+        f"(entry ${p['avg_entry_price']:.2f}, expired {p['expiry']})"
+        for p in swept
+    )
+    try:
+        await send_telegram(
+            f"🧹 过期仓位清扫\n"
+            f"{len(swept)} 张合约已过期未平仓，标记 EXPIRED（移出 watcher 轮询"
+            f"和 close 白名单）：\n{lines}\n"
+            f"ITM 可能已被自动行权，请核对 moomoo 持仓"
+            f"（必要时跑 scripts/sync_positions.py）",
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.warning(f"[eod] expiry sweep TG notify failed: {e}")
+    return swept
+
+
 async def _eod_tick(now_et: datetime):
     """单轮：判断是否在 EOD 时窗、找待平仓位、依次强平。"""
     cfg = _cfg()
+    # 过期清扫放时窗判断之前——凌晨跨日后就要清，不能等到 15:50
+    await sweep_expired_and_notify()
     if not _is_eod_window(now_et, cfg["hour"], cfg["minute"]):
         return
 

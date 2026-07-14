@@ -156,6 +156,15 @@ def find_by_symbol(symbol: str) -> list[dict]:
     return positions_db.find_by_symbol(symbol)
 
 
+def sweep_expired() -> list[dict]:
+    """清扫 expiry < 今天（ET）的残留仓位 → EXPIRED。返回被清的仓位。
+
+    调用点：listener 启动时（watchers 起来之前，避免第一轮 tick 就对
+    过期 code 取快照进 backoff）+ eod_watcher 每轮 tick（跨日兜底）。
+    """
+    return positions_db.sweep_expired(_today_et())
+
+
 def calc_qty_to_sell(position: dict, pct: int) -> int:
     """根据 close 信号给的 % 算实际卖出张数。
 
