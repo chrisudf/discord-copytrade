@@ -372,7 +372,9 @@ def test_snapshot_no_permission_warn_throttled(monkeypatch):
     ctx.get_market_snapshot.return_value = (
         -1, "No permission to get quotes for US.X.")
     monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
-    monkeypatch.setattr(bc, "_no_perm_last_warn", 0.0)
+    # None = "进程内没警告过"。不能用 0.0：uptime < 1h 的机器（CI runner）上
+    # monotonic - 0.0 < 3600，首条 WARNING 会被节流吞掉，测试在 CI 假失败
+    monkeypatch.setattr(bc, "_no_perm_last_warn", None)
 
     records = []
     sink = _lg.add(

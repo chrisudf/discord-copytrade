@@ -594,7 +594,10 @@ def query_order_status(order_id: str) -> dict:
 # no-permission 退避日志节流：每个 300s 退避周期到期后 SL/TP 各重探一次，
 # 每次都打 WARNING 一夜能刷 ~200 行（7/9 实测）。状态没变化时只在
 # 首次 + 每小时提醒一次，其余降为 DEBUG。
-_no_perm_last_warn: float = 0.0
+# 哨兵必须是 None 而非 0.0：monotonic 是**开机以来**的秒数，uptime < 1h 的
+# 机器（重启后的生产机、CI runner）上 `now - 0.0 < 3600` 会把首条 WARNING
+# 吞掉——7/14 CI 实锤（本地 uptime 数天所以测不出来）。
+_no_perm_last_warn: "float | None" = None
 _NO_PERM_WARN_INTERVAL = 3600.0
 
 
@@ -636,7 +639,8 @@ def _snapshot(codes: list) -> "tuple[int, object]":
                 f"[broker] snapshot no-permission, backoff 300s "
                 f"(watcher 轮询暂停，避免打满频率配额): {msg[:120]}"
             )
-            if time.monotonic() - _no_perm_last_warn >= _NO_PERM_WARN_INTERVAL:
+            if (_no_perm_last_warn is None
+                    or time.monotonic() - _no_perm_last_warn >= _NO_PERM_WARN_INTERVAL):
                 _no_perm_last_warn = time.monotonic()
                 logger.warning(note)
             else:
