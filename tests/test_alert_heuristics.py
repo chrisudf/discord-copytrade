@@ -58,42 +58,49 @@ def _clean_recent_exec():
     dc._recent_exec.clear()
 
 
+def _mu_signal():
+    """_record_recent_exec 需要的最小开仓信号快照。"""
+    return {"symbol": "MU", "strike": 1050.0, "side": "CALL", "price": 2.60}
+
+
 def test_twin_suppressed_same_channel_same_symbol():
-    dc._record_recent_exec(123, "MU")
+    dc._record_recent_exec(123, _mu_signal())
     zh = "@everyone\nKC Trades Bot：MU 1050c 7月15日 @ 2.60 日内交易彩票"
     assert dc._twin_of_recent_exec(zh, 123) == "MU"
 
 
 def test_twin_not_suppressed_other_channel():
-    dc._record_recent_exec(123, "MU")
+    dc._record_recent_exec(123, _mu_signal())
     zh = "KC Trades Bot：MU 1050c 7月15日 @ 2.60"
     assert dc._twin_of_recent_exec(zh, 456) is None
 
 
 def test_twin_not_suppressed_different_symbol():
     # 60s 内的**另一个**标的 parse-fail 是真漏检，必须照常报警
-    dc._record_recent_exec(123, "MU")
+    dc._record_recent_exec(123, _mu_signal())
     assert dc._twin_of_recent_exec("NFLX 80c 7/17 @ 1.38 day trade", 123) is None
 
 
 def test_twin_suppression_expires_after_window():
-    dc._recent_exec[(123, "MU")] = (
-        datetime.now(timezone.utc) - dc._TWIN_SUPPRESS_WINDOW - timedelta(seconds=1)
-    )
+    dc._recent_exec[(123, "MU")] = {
+        "ts": datetime.now(timezone.utc) - dc._TWIN_SUPPRESS_WINDOW - timedelta(seconds=1),
+        "strike": 1050.0, "side": "CALL", "price": 2.60,
+    }
     assert dc._twin_of_recent_exec("MU 1050c @ 2.60", 123) is None
 
 
 def test_twin_matches_ticker_attached_to_hanzi():
     # ZH 文本汉字紧贴 ticker（"减仓MU"），\b 不触发，lookaround 要能命中
-    dc._record_recent_exec(123, "MU")
+    dc._record_recent_exec(123, _mu_signal())
     assert dc._twin_of_recent_exec("KC交易机器人：减仓MU 1050c @ 2.60", 123) == "MU"
 
 
 def test_record_recent_exec_prunes_stale_entries():
-    dc._recent_exec[(123, "OLD")] = (
-        datetime.now(timezone.utc) - dc._TWIN_SUPPRESS_WINDOW - timedelta(seconds=5)
-    )
-    dc._record_recent_exec(123, "MU")
+    dc._recent_exec[(123, "OLD")] = {
+        "ts": datetime.now(timezone.utc) - dc._TWIN_SUPPRESS_WINDOW - timedelta(seconds=5),
+        "strike": 1.0, "side": "CALL", "price": 1.0,
+    }
+    dc._record_recent_exec(123, _mu_signal())
     assert (123, "OLD") not in dc._recent_exec
     assert (123, "MU") in dc._recent_exec
 
@@ -141,3 +148,67 @@ def test_open_attempt_recognizes_zh_side_word():
     assert dc._looks_like_open_attempt("$HOOD - 7/24 $125 看涨期权 $1.50") is True
     # 且不再被 sized-entry 分支捕获的前提成立：有方向词的文本 side RE 必命中
     assert dc._OPEN_SIDE_RE.search("买入看跌期权对冲") is not None
+
+
+# ============ scalp/NDTE 无方向入场提醒（7/15 MSFT 0DTE 漏检） ============
+
+def test_sized_entry_hits_scalp_dte_format():
+    # 7/15 实测原文（中英双发全静默漏掉，后续 +200%）
+    en = "enrich:\nScalp - $MSFT 0DTE $397.50 $.90\n\n@everyone $alert"
+    zh = "enrich:\n头皮 - $MSFT 0DTE $397.50 $.90\n\n@everyone $alert"
+    assert dc._looks_like_sized_entry(en) == "MSFT"
+    assert dc._looks_like_sized_entry(zh) == "MSFT"
+
+
+def test_sized_entry_dte_needs_two_dollar_numbers():
+    # "$META scalp $685s" —— 无 DTE 无价格，不值得提醒
+    assert dc._looks_like_sized_entry("enrich:\n$META scalp $685s") is None
+
+
+# ============ 翻译孪生 close 防护（7/15 SPY "smaller size"→"小规模减仓"） ============
+
+def _spy_open():
+    return {"symbol": "SPY", "strike": 760.0, "side": "CALL", "price": 3.0}
+
+
+def test_close_twin_blocked_by_same_price():
+    dc._record_recent_exec(123, _spy_open())
+    parsed = {"signal_price": 3.0, "hint_strike": None, "hint_side": None}
+    assert dc._close_is_open_twin(123, "SPY", parsed) is not None
+
+
+def test_close_twin_blocked_by_same_contract_hint():
+    dc._record_recent_exec(123, _spy_open())
+    # 7/15 实测 parse 结果：strike=760.0 side=CALL price=3.0
+    parsed = {"signal_price": None, "hint_strike": 760.0, "hint_side": "CALL"}
+    assert dc._close_is_open_twin(123, "SPY", parsed) is not None
+
+
+def test_close_twin_not_blocked_different_price():
+    # 真砍仓：价格已变（-11% 后 KC 喊 2.65 之类），必须放行
+    dc._record_recent_exec(123, _spy_open())
+    parsed = {"signal_price": 2.65, "hint_strike": None, "hint_side": None}
+    assert dc._close_is_open_twin(123, "SPY", parsed) is None
+
+
+def test_close_twin_not_blocked_no_price_no_hint():
+    # "全部平仓 SPY -11%" 无价无 strike —— 不能仅凭时间窗判定孪生
+    dc._record_recent_exec(123, _spy_open())
+    parsed = {"signal_price": None, "hint_strike": None, "hint_side": None}
+    assert dc._close_is_open_twin(123, "SPY", parsed) is None
+
+
+def test_close_twin_not_blocked_outside_window():
+    dc._recent_exec[(123, "SPY")] = {
+        "ts": datetime.now(timezone.utc) - dc._TWIN_SUPPRESS_WINDOW - timedelta(seconds=1),
+        "strike": 760.0, "side": "CALL", "price": 3.0,
+    }
+    parsed = {"signal_price": 3.0, "hint_strike": None, "hint_side": None}
+    assert dc._close_is_open_twin(123, "SPY", parsed) is None
+
+
+def test_close_twin_not_blocked_other_channel_or_none_cid():
+    dc._record_recent_exec(123, _spy_open())
+    parsed = {"signal_price": 3.0, "hint_strike": None, "hint_side": None}
+    assert dc._close_is_open_twin(456, "SPY", parsed) is None
+    assert dc._close_is_open_twin(None, "SPY", parsed) is None  # 旧调用方/测试

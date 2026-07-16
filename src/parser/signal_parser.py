@@ -106,6 +106,10 @@ MONTH_NAMES_RE = (
 # 会被当真信号下单。实测样本里没出现，等真碰到再加。
 SKIP_KEYWORDS = [
     "remaining", "into tomorrow", "持仓",
+    # ZH 持有系（7/15："只持有我的 $HOOD 7/24 $125 看涨期权" 归一化后
+    # 触发 looks-like-signal 误报，EN 孪生 "Only holding my" 正确 skip）。
+    # 只收带前缀的形态——裸"持有"太宽，会误伤"买入 X 打算持有到 9 月"这类真开仓
+    "只持有", "仅持有", "继续持有", "暂时持有",
     # 第一人称主语 + holding
     "i'm holding", "im holding", "i am holding",
     # 状语 + holding
@@ -609,12 +613,15 @@ def _extract_tags(text: str) -> list:
 #     "at/to entry" 和 "re-enter" 是 KC 高频的止损/复盘用语，不是开仓动作
 STRONG_CLOSE_RE = re.compile(
     r"\b(closed?|sold|exit|stopped|trim(?:med|ming)?|out of|scaling\s+out)\b"
+    # "all out" 从 WEAK 提级（7/15："all out SPY -11% not adding" 里的
+    # "adding" 命中 OPEN_INTENT 把 WEAK close 一票否决 → 误判 OPEN，
+    # 靠 ZH 孪生"全部平仓"才兜住检测）。"going all out" 是开仓情绪，排除。
+    r"|(?<!going\s)\ball\s+out\b"
     r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清",
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
     r"\bclosing\b(?!\s+bell)"          # 'closing bell' 是时间状语不是动作
-    r"|(?<!going\s)\ball\s+out\b"      # 'going all out' 是开仓情绪不是平仓
     r"|\bout\s+(?:half|full|majority)\b"
     r"|\bselling\b"
     r"|\bscaling\s+down\b",
@@ -626,11 +633,20 @@ OPEN_INTENT_RE = re.compile(
     r"(?<!at\s)(?<!to\s)entry|in at)\b",
     re.I,
 )
+# 否定式的开仓词（"not adding" / "won't buy"）是**放弃**开仓，不该否决
+# close 判定。正则不懂否定，先把这类短语抹掉再查 OPEN_INTENT。
+# 撇号兼容 ASCII ' 和弯引号 '（KC 消息里两种都出现过）。
+_NEGATED_OPEN_INTENT_RE = re.compile(
+    r"\b(?:not|no|never|stop(?:ped)?|won['’]?t|wouldn['’]?t|don['’]?t|didn['’]?t)\s+"
+    r"(?:be\s+)?(?:add(?:ing|ed)?|buy(?:ing)?|enter(?:ing)?|load(?:ing)?)\b",
+    re.I,
+)
 
 
 def detect_action(text: str) -> str:
     if STRONG_CLOSE_RE.search(text):
         return "CLOSE"
-    if WEAK_CLOSE_RE.search(text) and not OPEN_INTENT_RE.search(text):
+    text_wo_neg = _NEGATED_OPEN_INTENT_RE.sub(" ", text)
+    if WEAK_CLOSE_RE.search(text_wo_neg) and not OPEN_INTENT_RE.search(text_wo_neg):
         return "CLOSE"
     return "OPEN"

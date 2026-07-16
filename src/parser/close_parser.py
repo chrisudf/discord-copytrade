@@ -125,11 +125,16 @@ _HOLD_CONTEXT_TEMPLATES = (
     r"runners?\s+on\s+(?:the\s+)?\$?{sym}\b",
     r"hold(?:ing)?\s+(?:the\s+)?\$?{sym}\b",
     r"keep(?:ing)?\s+(?:the\s+)?\$?{sym}\b",
+    # "All cash now besides $HOOD 1.5% position"（7/15）——besides/except
+    # 后面的 symbol 是**留着**的，close 目标是"其他所有"，不是它
+    r"(?:besides|except(?:\s+for)?)\s+(?:the\s+|my\s+)?\$?{sym}\b",
 )
 _ZH_HOLD_CONTEXT_TEMPLATES = (
     r"保留[^\n，。]{{0,8}}{sym}",
     r"持有[^\n，。]{{0,8}}{sym}",
     r"留着?[^\n，。]{{0,6}}{sym}",
+    # "除了 $HOOD 1.5% 的头寸外，现在全是现金"（7/15）
+    r"除了?[^\n，。]{{0,8}}{sym}",
 )
 
 

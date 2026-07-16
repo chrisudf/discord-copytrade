@@ -383,7 +383,9 @@ async def _handle_message_inner(message):
     # ---- 检测 OPEN / CLOSE ----
     action = detect_action(raw)
     if action == "CLOSE":
-        await _handle_close_signal(raw, message.id, channel_name=cfg.name)
+        await _handle_close_signal(
+            raw, message.id, channel_name=cfg.name, channel_id=cid,
+        )
         return
 
     # ---- 解析信号 ----
@@ -555,8 +557,9 @@ async def _handle_message_inner(message):
             ))
             return
 
-        # 下单成功 → 记录 (channel, symbol)，压制随后 ZH 孪生消息的 parse-fail 报警
-        _record_recent_exec(cid, signal["symbol"])
+        # 下单成功 → 记录 (channel, symbol) + 合约快照：压制 ZH 孪生的
+        # parse-fail 报警 + 挡住被机翻成 close 动词的孪生（_close_is_open_twin）
+        _record_recent_exec(cid, signal)
 
         try:
             # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
@@ -642,7 +645,9 @@ def _calc_sell_limit(avg_entry: float, signal_price: float = None) -> "float | N
     return round(signal_price * (1 - SELL_SLIP), 2)
 
 
-async def _handle_close_signal(raw: str, msg_id: int, channel_name: str = None):
+async def _handle_close_signal(
+    raw: str, msg_id: int, channel_name: str = None, channel_id: int = None,
+):
     """detect_action==CLOSE 时调用。
 
     流程：
@@ -710,6 +715,17 @@ async def _handle_close_signal(raw: str, msg_id: int, channel_name: str = None):
     hint_source_symbol = (parsed.get("symbols") or [None])[0]
 
     for symbol in targets:
+        # 翻译孪生防护：刚开仓的 OPEN 消息被机翻出 close 动词
+        # （7/15 "smaller size"→"小规模减仓"），不平仓，TG 留痕
+        twin_reason = _close_is_open_twin(channel_id, symbol, parsed)
+        if twin_reason:
+            logger.warning(f"[CLOSE] open-twin guard: {twin_reason} — skip")
+            await _safe_notify(format_close_skipped(
+                f"疑似开仓消息的翻译孪生，不平仓：{twin_reason}", raw,
+            ))
+            any_executed = True  # 已发专属 TG，不再让外层报 "no matching"
+            continue
+
         positions = position_mgr.find_by_symbol(symbol)
         if not positions:
             logger.warning(f"[CLOSE] {symbol} not found in open positions")
@@ -964,18 +980,22 @@ _SIZED_ENTRY_TICKER_RE = _re.compile(r"\$([A-Z]{1,5})\b")
 _SIZED_ENTRY_SIZE_RE = _re.compile(
     r"\d{1,2}(?:\.\d+)?\s*%\s*(?:position|头寸|仓位)", _re.I
 )
+# scalp 简写没有仓位比例但有 NDTE（7/15 "Scalp - $MSFT 0DTE $397.50 $.90"
+# 中英双发全静默漏掉，后续 +200%）
+_SIZED_ENTRY_DTE_RE = _re.compile(r"\b\d+\s*DTE\b", _re.I)
 _SIZED_ENTRY_DOLLAR_NUM_RE = _re.compile(r"\$\s?\.?\d")
 
 
 def _looks_like_sized_entry(text: str) -> "str | None":
-    """检测 enrich 式无方向入场。返回命中的 symbol，未命中返回 None。"""
+    """检测 enrich 式无方向入场（N% position 或 NDTE 简写）。
+    返回命中的 symbol，未命中返回 None。"""
     if not text:
         return None
     text = _strip_bot_noise(text)
     tickers = {m.group(1) for m in _SIZED_ENTRY_TICKER_RE.finditer(text)}
     if len(tickers) != 1:
         return None
-    if not _SIZED_ENTRY_SIZE_RE.search(text):
+    if not (_SIZED_ENTRY_SIZE_RE.search(text) or _SIZED_ENTRY_DTE_RE.search(text)):
         return None
     if len(_SIZED_ENTRY_DOLLAR_NUM_RE.findall(text)) < 2:
         return None
@@ -1018,26 +1038,70 @@ def _is_duplicate_raw(cid: int, raw: str) -> bool:
 # 规则：同频道 + 窗口内刚**成功下单**过的 symbol 出现在 fail 文本里 → 只 log。
 # 只认成功执行（风控拒/broker 拒不算），不同 symbol 的真漏检不受影响。
 _TWIN_SUPPRESS_WINDOW = timedelta(seconds=60)
-_recent_exec: dict[tuple[int, str], datetime] = {}  # (channel_id, symbol) → 下单成功时间
+# (channel_id, symbol) → {"ts", "strike", "side", "price"}（开仓信号快照，
+# 供 parse-fail 报警抑制 + close 翻译孪生防护共用）
+_recent_exec: dict[tuple[int, str], dict] = {}
 
 
-def _record_recent_exec(cid: int, symbol: str):
+def _record_recent_exec(cid: int, signal: dict):
     now = datetime.now(timezone.utc)
     # 顺手清掉过期条目，dict 不增长
-    for key in [k for k, ts in _recent_exec.items() if now - ts > _TWIN_SUPPRESS_WINDOW]:
+    for key in [k for k, e in _recent_exec.items() if now - e["ts"] > _TWIN_SUPPRESS_WINDOW]:
         _recent_exec.pop(key, None)
-    _recent_exec[(cid, symbol)] = now
+    _recent_exec[(cid, signal["symbol"])] = {
+        "ts": now,
+        "strike": signal.get("strike"),
+        "side": signal.get("side"),
+        "price": signal.get("price"),
+    }
 
 
 def _twin_of_recent_exec(text: str, cid: int) -> "str | None":
     """fail 文本是否像"刚执行过的信号"的翻译孪生。返回命中 symbol 或 None。"""
     now = datetime.now(timezone.utc)
-    for (c, sym), ts in _recent_exec.items():
-        if c != cid or now - ts > _TWIN_SUPPRESS_WINDOW:
+    for (c, sym), entry in _recent_exec.items():
+        if c != cid or now - entry["ts"] > _TWIN_SUPPRESS_WINDOW:
             continue
         # ZH 文本里汉字紧贴 ticker，\b 不触发——用 lookaround（同 BARE_SYM_PATTERN_ZH）
         if _re.search(rf"(?<![A-Za-z0-9]){_re.escape(sym)}(?![A-Za-z0-9])", text):
             return sym
+    return None
+
+
+def _close_is_open_twin(cid: "int | None", symbol: str, parsed: dict) -> "str | None":
+    """CLOSE 信号是否疑似"刚成功开仓的 OPEN 消息"的翻译孪生。返回原因或 None。
+
+    7/15 实测：SPY 开仓 2s 后，ZH 孪生把 "smaller size" 机翻成"小规模减仓"，
+    close parser 完整解析出 SPY 760c pct=33 @3.00（== 开仓价），一路走到卖出
+    计算，只靠 runner-preserve（恰好持 1 张）才没把刚开的仓原价卖掉。
+
+    判定：同频道 + 窗口内刚成功开仓过该 symbol，且满足其一——
+      a. close 喊价 ≈ 开仓信号价（±1%；同一条消息的翻译价格必然相同）
+      b. close 的 strike+side hint == 刚开的合约
+    真砍仓通常在几分钟后且价格/pnl 已变化；60s 内"同价平仓"只有机翻场景。
+    误杀时有 TG 提示，用户可手动补平。
+    """
+    if cid is None:
+        return None
+    entry = _recent_exec.get((cid, symbol))
+    if not entry:
+        return None
+    age = (datetime.now(timezone.utc) - entry["ts"]).total_seconds()
+    if age > _TWIN_SUPPRESS_WINDOW.total_seconds():
+        return None
+    close_price = parsed.get("signal_price")
+    open_price = entry.get("price")
+    if close_price is not None and open_price and abs(close_price - open_price) <= open_price * 0.01:
+        return (
+            f"{symbol} {age:.0f}s 前刚开仓 @ {open_price}，close 喊价相同"
+        )
+    if (parsed.get("hint_strike") is not None
+            and parsed.get("hint_strike") == entry.get("strike")
+            and parsed.get("hint_side") == entry.get("side")):
+        return (
+            f"{symbol} {age:.0f}s 前刚开仓 "
+            f"{entry.get('strike')}{(entry.get('side') or '?')[0]}，close 指向同一合约"
+        )
     return None
 
 

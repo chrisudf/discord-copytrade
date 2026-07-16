@@ -412,3 +412,36 @@ def test_zh_bare_kanzhang_not_converted():
     """裸"看涨"（无"期权"后缀）是行情评论用词，不得触发方向归一化。"""
     r = parse_signal("我看涨大盘，$SPY 目标 $750", msg_ts=ZH_TODAY)
     assert r is None or r.get("skip")
+
+
+# ============ detect_action：否定式开仓词 + all out 提级（7/15） ============
+
+def test_detect_action_all_out_with_negated_add():
+    """7/15 实测："not adding" 的 adding 曾一票否决 WEAK 'all out' → 误判 OPEN，
+    KC -11% 离场我们没跟。现在 all out 是 STRONG，且否定式不算开仓意图。"""
+    from src.parser.signal_parser import detect_action
+    assert detect_action("@everyone\nKC Trades Bot:all out SPY -11% not adding") == "CLOSE"
+
+
+def test_detect_action_going_all_out_still_open():
+    from src.parser.signal_parser import detect_action
+    assert detect_action("I'm going all out tomorrow, loading calls") == "OPEN"
+
+
+def test_detect_action_weak_close_with_negated_buy():
+    from src.parser.signal_parser import detect_action
+    # weak "selling" + 否定式 "not buying" → 否定形不该否决 close
+    assert detect_action("selling some here, not buying more") == "CLOSE"
+    # 真开仓意图仍然否决 weak close："selling puts to buy calls"
+    assert detect_action("selling my house and buying TSLA calls") == "OPEN"
+
+
+def test_zh_holding_keywords_skip():
+    """7/15："只持有我的 $HOOD 7/24 $125 看涨期权" 归一化后带全三件套，
+    曾触发 looks-like-signal 误报；EN 孪生 "Only holding my" 正确 skip。"""
+    r = parse_signal(
+        "enrich:\n只持有我的 $HOOD 7/24 $125 看涨期权 - 喜欢这个日线图。\n\n"
+        "1.5% 的仓位。真是一天。\n\n@everyone $alert",
+        msg_ts=date(2026, 7, 15),
+    )
+    assert r is not None and r.get("skip") == "holding_or_remaining"

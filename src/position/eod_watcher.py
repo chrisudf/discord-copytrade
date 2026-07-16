@@ -56,19 +56,26 @@ def _cfg() -> dict:
     }
 
 
-def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
-    """是否到了 EOD 时间窗（>=hour:minute 且当天是工作日，且未到第二天 00:00）。
+# 时窗上界：16:00 ET 收盘 + 5 分钟迟到成交余量。过点后合约命运已定
+# （到期日的过不了夜），继续尝试/告警纯属噪音——7/15 对已到期的 GOOGL/MU
+# 每 30 分钟"手动平仓"告警到 18:50 ET，直到人工 Ctrl-C。
+_WINDOW_END_HOUR, _WINDOW_END_MIN = 16, 5
 
-    简化：只看小时分钟。00:00 ET 自然进入下一天，下次开仓日重置。
+
+def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
+    """是否在 EOD 强平时窗内（工作日 hour:minute ～ 16:05 ET）。
 
     TODO: 半日交易日（黑五 / 平安夜 / 独立日前夜 / 元旦前夜等）13:00 ET 收盘，
-          应在 holidays.py 加 EARLY_CLOSE_DATES set，当日把 cutoff 调到 12:50。
-          实测一年才几次，不急；但漏掉那几天会变成"收盘后才挂卖单"。
+          应在 holidays.py 加 EARLY_CLOSE_DATES set，当日把 cutoff 调到 12:50、
+          上界调到 13:05。实测一年才几次，不急；但漏掉那几天会变成"收盘后才挂卖单"。
     """
     if now_et.weekday() >= 5:  # 周六/日
         return False
     cutoff = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return now_et >= cutoff
+    window_end = now_et.replace(
+        hour=_WINDOW_END_HOUR, minute=_WINDOW_END_MIN, second=0, microsecond=0
+    )
+    return cutoff <= now_et <= window_end
 
 
 # 单进程 backoff：连续失败的 code → 下次 tick 跳过

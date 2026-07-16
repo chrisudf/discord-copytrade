@@ -393,3 +393,19 @@ async def test_sell_lock_prevents_concurrent_double_sell():
 
     assert len(calls) == 1, f"expected exactly 1 sell order, got {calls}"
     assert positions_db.get(code)["status"] == "CLOSED"
+
+
+# ============ EOD 时窗上界（7/15 收盘后告警到 18:50 ET） ============
+
+def test_eod_window_ends_after_market_close():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from src.position.eod_watcher import _is_eod_window
+
+    ET = ZoneInfo("America/New_York")
+    wed = lambda h, m: datetime(2026, 7, 15, h, m, tzinfo=ET)  # 周三
+    assert _is_eod_window(wed(15, 30), 15, 50) is False  # 未到 cutoff
+    assert _is_eod_window(wed(15, 55), 15, 50) is True   # 时窗内
+    assert _is_eod_window(wed(16, 4), 15, 50) is True    # 收盘+5min 余量内
+    assert _is_eod_window(wed(16, 10), 15, 50) is False  # 收盘后：合约命运已定
+    assert _is_eod_window(wed(18, 50), 15, 50) is False  # 7/15 实测噪音时点

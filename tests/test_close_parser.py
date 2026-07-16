@@ -837,3 +837,18 @@ def test_trimmed_runner_of_symbol_still_closes():
     )
     assert r is not None
     assert r["symbols"] == ["SPY"]
+
+
+# ============ besides/除了 hold-context（7/15 "全现金只留 HOOD"） ============
+
+def test_hold_context_besides_en():
+    from src.parser.close_parser import _extract_symbols
+    text = ("All cash now besides $HOOD 1.5% position. WHAT A DAY.\n\n"
+            "Selling into strength is key, we timed that perfectly.")
+    assert _extract_symbols(text, {"HOOD"}) == []
+
+
+def test_hold_context_chule_zh():
+    from src.parser.close_parser import _extract_zh_symbols
+    text = "除了 $HOOD 1.5% 的头寸外，现在全是现金。真是一天。"
+    assert _extract_zh_symbols(text, {"HOOD"}) == []
