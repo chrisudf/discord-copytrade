@@ -212,3 +212,33 @@ def test_close_twin_not_blocked_other_channel_or_none_cid():
     parsed = {"signal_price": 3.0, "hint_strike": None, "hint_side": None}
     assert dc._close_is_open_twin(456, "SPY", parsed) is None
     assert dc._close_is_open_twin(None, "SPY", parsed) is None  # 旧调用方/测试
+
+
+# ============ 短线标签 × 长 DTE 防护（7/16 June-20 笔误 → 2027 合约） ============
+
+from datetime import date
+
+
+def test_suspicious_long_dte_blocks_typo():
+    sig = {"symbol": "SPY", "strike": 755.0, "side": "CALL",
+           "expiry_date": date(2027, 6, 17), "tags": ["day_trade"]}
+    assert dc._suspicious_long_dte(sig, date(2026, 7, 16)) is not None
+
+
+def test_suspicious_long_dte_allows_leap_swing():
+    # 真 LEAPS："SOFI 20c Jan 15 2027 starter leap swing" tags=['swing']
+    sig = {"symbol": "SOFI", "strike": 20.0, "side": "CALL",
+           "expiry_date": date(2027, 1, 15), "tags": ["swing"]}
+    assert dc._suspicious_long_dte(sig, date(2026, 7, 17)) is None
+
+
+def test_suspicious_long_dte_allows_short_dte_lotto():
+    sig = {"symbol": "AMZN", "strike": 250.0, "side": "CALL",
+           "expiry_date": date(2026, 7, 17), "tags": ["lotto", "day_trade"]}
+    assert dc._suspicious_long_dte(sig, date(2026, 7, 14)) is None
+
+
+def test_suspicious_long_dte_no_tags_not_blocked():
+    sig = {"symbol": "UPS", "strike": 130.0, "side": "CALL",
+           "expiry_date": date(2027, 1, 15), "tags": []}
+    assert dc._suspicious_long_dte(sig, date(2026, 7, 7)) is None

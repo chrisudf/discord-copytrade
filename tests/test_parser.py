@@ -445,3 +445,61 @@ def test_zh_holding_keywords_skip():
         msg_ts=date(2026, 7, 15),
     )
     assert r is not None and r.get("skip") == "holding_or_remaining"
+
+
+# ============ A3: 裸 ticker + NDTE（7/17 漏掉 KC +200% 主力单） ============
+
+def test_bare_ticker_ndte():
+    """"SPY 745p 8DTE @ 2.66"——A 系列只认 M/D、B 系列要 $ 前缀，曾两头落空。"""
+    r = parse_signal(
+        "@everyone\nKC Trades Bot:SPY 745p 8DTE @ 2.66 potential swing, "
+        "can add to these later",
+        msg_ts=date(2026, 7, 16),
+    )
+    assert r is not None and not r.get("skip")
+    assert r["symbol"] == "SPY"
+    assert r["side"] == "PUT"
+    assert r["strike"] == 745.0
+    assert r["price"] == 2.66
+    assert r["expiry_date"] == date(2026, 7, 24)  # 7/16(周四) + 8 天
+
+
+def test_bare_ticker_ndte_lowercase_word_not_ticker():
+    # "but 15p 3DTE" 之类：小写单词不是 ticker（与 A1/A2 同规则）
+    r = parse_signal("nothing here but 15p 3DTE @ 1.00", msg_ts=date(2026, 7, 16))
+    assert r is None or r.get("skip")
+
+
+# ============ ZH tags（7/17 ARM ZH 先执行但 tags=[] → category 错） ============
+
+def test_zh_tags_extracted():
+    r = parse_signal(
+        "enrich:\n彩票头皮 - $ARM $272.50 看涨期权 $1.30\n\n@everyone $alert",
+        msg_ts=date(2026, 7, 17),
+    )
+    assert r is not None and not r.get("skip")
+    assert "lotto" in r["tags"] and "scalp" in r["tags"]
+
+
+def test_zh_tag_swing():
+    r = parse_signal(
+        "@everyone\nKC交易机器人：SPY 745p 8DTE @ 2.66 潜在波段",
+        msg_ts=date(2026, 7, 16),
+    )
+    assert r is not None and not r.get("skip")
+    assert "swing" in r["tags"]
+
+
+# ============ lock-in 止盈口头禅（7/17 XOM/ARM 双漏） ============
+
+def test_detect_action_lock_in_variants():
+    from src.parser.signal_parser import detect_action
+    assert detect_action("enrich:\n$XOM LOCK THEM ALL ON\n\n@everyone $alert") == "CLOSE"
+    assert detect_action("$ARM - Cheers, lock them in!") == "CLOSE"
+    assert detect_action("丰富：\n$XOM 全部锁定\n\n@everyone $警报") == "CLOSE"
+
+
+def test_detect_action_locked_past_tense_is_recap():
+    from src.parser.signal_parser import detect_action
+    # 过去式 "locked in 200%" 是 PnL 复盘，不是平仓动作
+    assert detect_action("locked in 200% on my runners today, what a day") == "OPEN"

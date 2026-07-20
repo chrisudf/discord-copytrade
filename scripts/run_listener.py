@@ -28,7 +28,7 @@ from src.listener.discord_client import handle_message
 from src.notifier.telegram_client import send_telegram, format_error
 from src.risk.risk_manager import get_daily_stats
 from src.broker.moomoo_client import (
-    probe_broker, probe_quote_access,
+    probe_broker, probe_quote_access, close_ctx,
     QUOTE_OK, QUOTE_DELAYED, QUOTE_NO_PERMISSION, QUOTE_ERROR,
 )
 from src.position.sl_watcher import run_sl_watcher
@@ -363,6 +363,13 @@ async def shutdown():
         await send_telegram("🔴 *Listener 退出*")
     except Exception:
         pass
+    # moomoo SDK 的连接线程是非 daemon：不关掉的话 asyncio.run 结束后
+    # threading._shutdown 会 lock.acquire() 挂死，每次都要连按 ^C 硬杀
+    # （连续 5 晚复现）。先关 broker 线程再关 Discord。
+    try:
+        await asyncio.to_thread(close_ctx)
+    except Exception:
+        logger.exception("close_ctx failed (continuing shutdown)")
     await client.close()
 
 

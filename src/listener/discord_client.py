@@ -477,6 +477,20 @@ async def _handle_message_inner(message):
         )
         return
 
+    # ---- 短线标签 × 长 DTE 防护 ----
+    # 7/16 实锤：KC 笔误 "SPY 755c June 20 @ 2.17 day trade"（June 20 已过），
+    # smart_expiry 跨年滚动 → 买成 2027-06 合约（真实市场该合约根本不是 $2.17
+    # 量级）。day trade / scalp / lotto / 0dte 隐含短 DTE，解析出 30 天以上
+    # 只可能是喊单笔误或解析错位 → 不下单，TG 让人工确认。
+    # 真 LEAPS 不受影响："SOFI 20c Jan 15 2027 starter leap swing" tags=['swing']。
+    dte_guard_reason = _suspicious_long_dte(signal, msg_date_et)
+    if dte_guard_reason:
+        logger.warning(f"[dte-guard] {dte_guard_reason} — 不下单: {raw[:80]}")
+        await _safe_notify(format_error(
+            "疑似日期笔误（短线标签 + 长 DTE），未下单", f"{dte_guard_reason}\n\n{raw[:200]}",
+        ))
+        return
+
     # TODO P3: symbol blacklist
 
     # 解析成功立即预警，带 breakeven 提示 + KC tags
@@ -702,6 +716,7 @@ async def _handle_close_signal(
     pct = parsed["pct"]
     any_executed = False
     any_success = False  # 至少一笔卖单成功提交 → 登记 CLOSE 指纹
+    runner_preserved: list[str] = []  # 被 runner-preserve 跳过的仓位，循环外合并 TG
     # broker 侧失败（异常/拒单）——这类失败是瞬时的，值得让 1-3s 后的
     # 双语孪生版本重试；确定性跳过（runner-preserve / 无价格参照 /
     # strike 不匹配）重试也是同样结果，不算在内
@@ -803,15 +818,13 @@ async def _handle_close_signal(
                 qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
                 if qty_to_sell <= 0:
                     # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
-                    # 必须发专属 TG 并标记"已处理"——否则落到外层
-                    # "no matching open positions" 兜底文案（7/6 IBM 两次实锤，
-                    # 半夜看到会以为仓位状态错乱）
-                    await _safe_notify(format_close_skipped(
-                        f"runner-preserve：{pos['symbol']} "
-                        f"{pos['strike']}{pos['side'][0]} 剩 1 张，"
-                        f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
-                        raw,
-                    ))
+                    # 收集起来循环外合并成一条 TG——多 strike 时逐仓位发会刷屏
+                    # （7/17 一夜 12+ 条，SPY/NVDA 各两个 strike × 每次 trim）。
+                    # 仍标记"已处理"，否则落到外层 "no matching" 兜底文案
+                    # （7/6 IBM 两次实锤，半夜看到会以为仓位状态错乱）
+                    runner_preserved.append(
+                        f"{pos['symbol']} {pos['strike']}{pos['side'][0]}"
+                    )
                     any_executed = True
                     continue
                 limit = _calc_sell_limit(
@@ -889,6 +902,13 @@ async def _handle_close_signal(
             any_executed = True
             any_success = True
 
+    if runner_preserved:
+        await _safe_notify(format_close_skipped(
+            f"runner-preserve：{'、'.join(runner_preserved)} 各剩 1 张，"
+            f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
+            raw,
+        ))
+
     if any_broker_failure and not any_success:
         # 指纹已在 _is_duplicate_close 查重时登记（原子，堵双发竞态）。
         # 零成交且出现过 broker 失败（异常/拒单）→ 回滚指纹，
@@ -947,6 +967,30 @@ _BOT_NOISE_RE = _re.compile(
 
 def _strip_bot_noise(text: str) -> str:
     return _BOT_NOISE_RE.sub(" ", text or "")
+
+
+# day_trade/scalp/lotto/0dte 隐含的 DTE 上限。30 天 = 宽松到不会误伤
+# "周内 lotto 放到下下周五"，又足以拦住跨年滚动（>300 天）
+_SHORT_TAG_MAX_DTE = 30
+_SHORT_TAGS = {"day_trade", "scalp", "lotto", "0dte"}
+
+
+def _suspicious_long_dte(signal: dict, msg_date) -> "str | None":
+    """短线标签 + 解析出的 DTE > 30 天 → 返回原因文本（不下单），否则 None。"""
+    expiry_d = signal.get("expiry_date")
+    if not expiry_d or not msg_date:
+        return None
+    hit_tags = _SHORT_TAGS & set(signal.get("tags") or [])
+    if not hit_tags:
+        return None
+    dte = (expiry_d - msg_date).days
+    if dte <= _SHORT_TAG_MAX_DTE:
+        return None
+    return (
+        f"{signal.get('symbol')} {signal.get('strike')}"
+        f"{(signal.get('side') or '?')[0]} 解析到期日 {expiry_d}"
+        f"（DTE={dte}），但标签 {sorted(hit_tags)} 是短线信号"
+    )
 
 
 def _looks_like_open_attempt(text: str) -> bool:

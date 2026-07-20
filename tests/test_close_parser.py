@@ -852,3 +852,44 @@ def test_hold_context_chule_zh():
     from src.parser.close_parser import _extract_zh_symbols
     text = "除了 $HOOD 1.5% 的头寸外，现在全是现金。真是一天。"
     assert _extract_zh_symbols(text, {"HOOD"}) == []
+
+
+# ============ lock-in 平仓解析 + EN 周报 recap（7/17） ============
+
+def test_lock_in_close_parses_symbols():
+    from src.parser.close_parser import parse_close
+    p = parse_close("enrich:\n$XOM LOCK THEM ALL ON\n\n@everyone $alert", {"XOM"})
+    assert p is not None
+    assert p["symbols"] == ["XOM"]
+
+
+def test_weekly_recap_en_skipped():
+    """7/17 06:30 真实消息：EN 版曾被当 BULK close 解析出 7 个 symbol，
+    扇出 3 条 runner-preserve TG；ZH 版"每周回顾"一直会跳。"""
+    from src.parser.close_parser import parse_close
+    text = (
+        "enrich:\nWeekly recap, 7/13:\n\n$GOOGL 1,200%+\n$XOM 265%+\n"
+        "$META 260%+\n$MSFT 140%\n$ARM 100%+\n$HOOD 50%\n\n"
+        "$IBM x (terrible news overnight)\n\n"
+        "Came out of the week with one loss. Make sure you are selling "
+        "into strength.\n\n@everyone $alert"
+    )
+    assert parse_close(text, {"XOM", "ARM", "HOOD"}) is None
+
+
+def test_watchlist_with_lock_advice_skipped():
+    """watchlist 帖内文常带 "lock in profits" 建议——detect 会路由 CLOSE，
+    close parser 必须按 recap 拦掉（语料回放发现的 lock-in 副作用）。"""
+    from src.parser.close_parser import parse_close
+    text = (
+        "enrich:\nWatchlist for tomorrow, 4/23:\n\n"
+        "Crushed our $ARM swing today for 450%. "
+        "Make sure to lock in profits along the way.\n\n@everyone"
+    )
+    assert parse_close(text, {"ARM"}) is None
+
+
+def test_zh_watchlist_skipped():
+    from src.parser.close_parser import parse_close
+    text = "丰富：\n明天的观察列表，5/12：\n\n今天我们在TSLA上赚了160%。锁定收益。\n\n@everyone"
+    assert parse_close(text, {"TSLA"}) is None

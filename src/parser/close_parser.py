@@ -57,6 +57,13 @@ RECAP_MARKERS = [
     "the plan", "my plan", "here's my plan",
     "have an order", "will be ", "going to ",
     "out of 4", "out of 5",  # PnL 复盘 "2 losing out of 4"
+    # 7/17 "Weekly recap, 7/13: $GOOGL 1,200%+ ..." 被当 BULK close 解析出
+    # 7 个 symbol，扇出 3 条 runner-preserve TG。ZH 版"每周回顾"早就在
+    # ZH_RECAP_MARKERS 里，EN 一直漏
+    "weekly recap", "recap,", "recap:",
+    # watchlist 帖本质是 recap——语料回放发现内文带 "lock in gains" 建议的
+    # watchlist 会被 lock-in 动词路由成 CLOSE，这里统一拦掉
+    "watchlist",
 ]
 
 # bulk action —— 不指定 symbol，对所有持仓批量 trim
@@ -82,6 +89,10 @@ ACTION_VERBS = [
     "scaling out",
     "scaling down",           # 7/6 "Scaling down to 1/2 position sizing"
     "bang!", "bang -",        # KC 的情绪触发词，通常配 trim
+    # enrich 止盈口头禅（7/17 "$XOM LOCK THEM ALL ON" / "lock them in!"）。
+    # 两词 substring 避免误伤 blocked/clock；过去式 "locked in" 是 recap，
+    # 与 detect_action 的 lock(?:ing)? 规则一致地排除
+    "lock them", "lock it", "lock in", "lock these", "locking in",
 ]
 
 # "out" 短语统一走词边界 regex（勿放回 ACTION_VERBS/FULL_CLOSE_VERBS 的
@@ -284,6 +295,7 @@ ZH_RECAP_MARKERS = [
     "打算", "准备", "即将", "将要", "将把",  # 未来意图
     "时卖出", "时减仓", "时清", "时砍", "时抛",  # "在 40% 时卖出"
     "了一些",  # "卖出了一些" 多为复盘；与 "了一笔" / "了一份" 区分
+    "每周回顾", "观察列表", "观察名单",  # 周报/watchlist（与 EN 侧对齐）
 ]
 
 # bulk action
@@ -304,6 +316,7 @@ ZH_ACTION_VERBS = [
     "减持", "缩减至", "缩减到",
     "出清",
     "减半",   # "减半仓于2.45"（7/9 实测；"减仓" 不是它的连续子串，接不住）
+    "锁定",   # "$XOM 全部锁定"（7/17，enrich 止盈口头禅的 ZH 版）
 ]
 
 # 全平动词 / 短语（pct 缺省 → 100）

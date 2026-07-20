@@ -309,6 +309,43 @@ def _try_pattern_a(text: str, today: date):
             "tags": _extract_tags(text),
         }
 
+    # A3: SYMBOL STRIKEc/p NDTE [@ PRICE]
+    # 7/17 实锤："SPY 745p 8DTE @ 2.66" 中英双发全漏（A 系列只认 M/D 日期，
+    # B 系列要 $ 前缀，裸 ticker + NDTE 两头落空），正是 KC 当晚 +200% 的主力单
+    pattern_a3 = re.compile(
+        r"\b([A-Z]{1,5})\s+"
+        r"(\d+(?:\.\d+)?)([cp])\s+"
+        r"(\d+)\s*DTE\b"
+        r"(?:[^@\n]*?@\s*\$?(\d+(?:\.\d+)?))?",
+        re.IGNORECASE,
+    )
+    for m in pattern_a3.finditer(text):
+        symbol, strike, cp, dte, price = m.groups()
+        # 同 A1/A2：小写单词不是 ticker（"but 300p ..." 案例）
+        if not symbol.isupper():
+            continue
+        if symbol.upper() in {"I", "A", "THE", "AT", "ON", "IS", "DTE", "IPO"}:
+            continue
+        if price is None:
+            filled = re.search(r"filled?\s*@\s*\$?(\d+(?:\.\d+)?)", text, re.I)
+            if filled:
+                price = filled.group(1)
+        if price is None:
+            continue
+        return {
+            "raw": text,
+            "matched": m.group(0).strip(),
+            "symbol": symbol.upper(),
+            "side": "CALL" if cp.lower() == "c" else "PUT",
+            "strike": float(strike),
+            "expiry": f"{dte}DTE",
+            "expiry_date": _adjust_expiry(
+                today + timedelta(days=int(dte)), context="A3 NDTE"
+            ),
+            "price": float(price),
+            "tags": _extract_tags(text),
+        }
+
     return None
 
 
@@ -579,6 +616,13 @@ def _extract_tags(text: str) -> list:
     # day trade 三种写法
     if any(p in lower for p in ("day trade", "day-trade", "daytrade")):
         tags.append("day_trade")
+    # ZH 对应词——ZH 归一化后 enrich 的 ZH 版常常先到先执行（7/17 "彩票头皮 -
+    # $ARM ..." ZH 先下单，tags=[] → category 记成 0dte 而非 0dte_lotto；
+    # 对周内 lotto 更要命：会被错挂 SL）。tags 决定 category/SL/EOD，必须双语。
+    zh_tag_map = {"彩票": "lotto", "波段": "swing", "头皮": "scalp", "日内": "day_trade"}
+    for zh, tag in zh_tag_map.items():
+        if zh in text and tag not in tags:
+            tags.append(tag)
     return tags
 
 
@@ -617,7 +661,12 @@ STRONG_CLOSE_RE = re.compile(
     # "adding" 命中 OPEN_INTENT 把 WEAK close 一票否决 → 误判 OPEN，
     # 靠 ZH 孪生"全部平仓"才兜住检测）。"going all out" 是开仓情绪，排除。
     r"|(?<!going\s)\ball\s+out\b"
-    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清",
+    # enrich 的止盈口头禅（7/17 "$XOM LOCK THEM ALL ON" / "$ARM lock them in!"
+    # 双双漏掉，两个都是我们的持仓）。只认现在时/祈使——过去式 "locked in 200%"
+    # 是 recap，不匹配。
+    r"|\block(?:ing)?\s+(?:them\s+|these\s+|it\s+|profits?\s+)?(?:all\s+)?(?:in|on)\b"
+    r"|减仓|平仓|清仓|卖出|卖了|砍仓|砍掉|抛出|止盈|全平|清空|减持|缩减至|缩减到|出清"
+    r"|锁定",
     re.I,
 )
 WEAK_CLOSE_RE = re.compile(
