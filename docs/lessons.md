@@ -421,6 +421,56 @@ mismatch. Applies to real-env only (`DRY_RUN` short-circuits earlier).
 
 ---
 
+## 16. Full re-login (`on_ready`) does **not** replay missed messages; only RESUME does
+
+**Symptom**: 7/20 overnight the local network flapped ~every 15-20 min for
+10 hours. Discord dropped ~28 times, of which ~25 were **full re-logins**
+(`logged back in after ~3000ms`) and only 3 were fast `RESUMED`. moomoo's
+trade+quote contexts dropped in the same seconds (9 reconnects), confirming
+it was the shared network layer flapping, not Discord blocking the token.
+
+Two hidden failures fell out of this:
+- **~75s of silent blindness.** A gateway RESUME replays events buffered
+  during the gap; a full re-IDENTIFY does **not** — the session is gone and
+  any message KC sent during those ~3s windows is never delivered to
+  `on_message`. 25 × 3s ≈ 75s where a signal would vanish with zero trace.
+  That night nothing fired in a gap, but it's a real loss window.
+- **Zero alerting.** The existing storm detector only fires on "3
+  disconnects in 60s" (the 6/30 identify-rate-limit burst pattern). Slow
+  chronic churn every 15-20 min never trips a 60s window, so the bot
+  limped all night with no TG warning.
+
+**Why non-obvious**:
+- `on_ready` and `on_resumed` both look like "we're back online." The
+  critical difference — resume replays the gap, re-identify silently drops
+  it — is a gateway-protocol detail, not visible in the callback names.
+- The storm detector *existed* and looked like "reconnect churn is
+  covered." It only covered the *fast* burst shape; the *slow* churn shape
+  is a different failure the same code doesn't catch.
+- Simultaneous Discord+moomoo drops are the tell for "network, not
+  service" — easy to misread as a Discord/token problem and go chasing the
+  wrong layer.
+
+**Defense** (all in [scripts/run_listener.py](../scripts/run_listener.py)):
+- `_backfill_missed()` runs in the `on_ready` **re-login** branch (not
+  `on_resumed`): fetches each monitored channel's `history(after=...)`
+  since the disconnect wall-clock time and re-feeds through
+  `handle_message`. Idempotent because `handle_message` already dedups on
+  `_seen(message.id)` — replayed messages that were processed live are
+  dropped, so no double orders. `_last_disconnect_wall` is set on the first
+  disconnect of a gap and cleared on resume/backfill so we cover the whole
+  gap exactly once.
+- Chronic-churn detector: 30-min rolling window, ≥5 disconnects → one TG
+  alert per 30 min, alongside the existing 60s storm detector.
+- `shutdown()` is now idempotent (a second ^C is ignored) so two concurrent
+  shutdown coroutines don't race on `close_ctx`/`client.close`.
+- Root cause (WiFi power-save / router dropping idle connections) is
+  environmental — code only *mitigates* (backfill + alert), it cannot stop
+  the drops. Wired/ethernet or disabling WiFi power management is the real
+  fix.
+
+---
+
 ## Format guidelines for adding new lessons
 
 Keep entries focused on **gotchas that weren't documented or
