@@ -141,6 +141,22 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
 
         if not result.get("success"):
             err = result.get("message", "unknown")
+            if result.get("naked_short"):
+                # broker 说没这么多 long → 脱钩。核销本地(0→CLOSED)让它退出待平列表,
+                # 停止每 60s 重挂 + 刷 TG;只首次核销告警一次。
+                bq = result.get("broker_qty", 0)
+                changed = position_mgr.reconcile_to_broker(code, bq)
+                logger.error(
+                    f"[eod] naked-short desync {code}: broker long={bq}, "
+                    f"reconciled local DB (changed={changed})"
+                )
+                if changed:
+                    await send_telegram(format_error(
+                        "持仓脱钩已核销",
+                        f"{code}: broker 实际持有 {bq} 张,本地 DB 高估。已核销并停止 EOD 强平重试。\n"
+                        f"请核对 moomoo 持仓（必要时跑 scripts/sync_positions.py）。"
+                    ))
+                return
             logger.error(f"[eod] sell rejected: {err}")
             _skip_until[code] = ts_now + 60
             await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))

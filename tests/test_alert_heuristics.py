@@ -242,3 +242,21 @@ def test_suspicious_long_dte_no_tags_not_blocked():
     sig = {"symbol": "UPS", "strike": 130.0, "side": "CALL",
            "expiry_date": date(2027, 1, 15), "tags": []}
     assert dc._suspicious_long_dte(sig, date(2026, 7, 7)) is None
+
+
+# ============ "calls up @ price" 行情评论不再误报 looks-like-signal（7/21） ============
+
+def test_open_attempt_ignores_bare_calls_commentary():
+    # 7/21 实测:三件套(SPY + calls + @3.80)全中但其实是行情评论,不该报
+    assert dc._looks_like_open_attempt(
+        "@everyone\nKC Trades Bot:PDH here on SPY, calls up @ 3.80 🚀💰"
+    ) is False
+    assert dc._looks_like_open_attempt("SPY calls paying nicely @ 2.50 ✅") is False
+
+
+def test_open_attempt_still_catches_strike_bearing_signals():
+    # strike 紧贴方向词的真开仓仍要报(parser 万一没接住)
+    assert dc._looks_like_open_attempt("$NVDA $210 calls $.58 7/22") is True   # $210 calls
+    assert dc._looks_like_open_attempt("TSLA 250c 7/11 @ 1.20 没接住") is True  # 750c 紧凑形
+    assert dc._looks_like_open_attempt("$AAOI weekly $220 calls for $2.05") is True  # strike 前置
+    assert dc._looks_like_open_attempt("$HOOD - 7/24 $125 看涨期权 $1.50") is True   # ZH

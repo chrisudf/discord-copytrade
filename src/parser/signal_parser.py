@@ -462,6 +462,36 @@ def _try_pattern_b(text: str, today: date):
             "tags": _extract_tags(text),
         }
 
+    # ----- B1c: $SYMBOL ... $STRIKE calls $PRICE  MM/DD （日期跟在价格之后）-----
+    # enrich scalp 常见写法 "$NVDA $210 calls $.58 7/22"：日期在**价格后**。
+    # B0 只找 strike 前的 MM/DD,抓不到;必须排在 B2（weekly 无日期兜底）之前,
+    # 否则 B2 先命中,把显式 7/22 丢成 next-Friday（7/21 复盘：NVDA 7/22→误开 7/24）。
+    p_mmdd_trailing = re.compile(
+        r"\$([A-Z]{1,5})\b"
+        r"[^\$\n]*?\$(\d+(?:\.\d+)?)\s*(?:[a-z0-9]+\s+){0,3}?(calls?|puts?)"
+        r"[^\$\n]*?\$(\.?\d+(?:\.\d+)?)"
+        r"[^\$\n]*?\b(\d{1,2})/(\d{1,2})\b",
+        re.IGNORECASE,
+    )
+    m = p_mmdd_trailing.search(text)
+    if m:
+        symbol, strike, side, price, mm, dd = m.groups()
+        mm_i, dd_i = int(mm), int(dd)
+        if 1 <= mm_i <= 12 and 1 <= dd_i <= 31:
+            return {
+                "raw": text,
+                "matched": m.group(0).strip(),
+                "symbol": symbol.upper(),
+                "side": "CALL" if side.lower().startswith("call") else "PUT",
+                "strike": float(strike),
+                "expiry": f"{mm_i}/{dd_i}",
+                "expiry_date": _adjust_expiry(
+                    smart_expiry(mm_i, dd_i, today=today), context="B1c trailing MM/DD"
+                ),
+                "price": float(price),
+                "tags": _extract_tags(text),
+            }
+
     # ----- B2: $SYMBOL [weekly] $STRIKE calls/puts $PRICE （无日期） -----
     p_weekly = re.compile(
         r"\$([A-Z]{1,5})\b"

@@ -104,6 +104,23 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
 
         if not result.get("success"):
             err = result.get("message", "unknown")
+            if result.get("naked_short"):
+                # broker 说没这么多 long → 脱钩。核销本地(0→CLOSED),停止每 tick 重挂;
+                # discard 让 code 不冻结,日后 reopen 时 SL 仍生效。只首次核销告警一次。
+                bq = result.get("broker_qty", 0)
+                changed = position_mgr.reconcile_to_broker(code, bq)
+                logger.error(
+                    f"[sl] naked-short desync {code}: broker long={bq}, "
+                    f"reconciled local DB (changed={changed})"
+                )
+                _triggered.discard(code)
+                if changed:
+                    await send_telegram(format_error(
+                        "持仓脱钩已核销",
+                        f"{code}: broker 实际持有 {bq} 张,本地 DB 高估。已核销并停止止损重试。\n"
+                        f"请核对 moomoo 持仓（必要时跑 scripts/sync_positions.py）。"
+                    ))
+                return
             logger.error(f"[sl] sell rejected: {err}")
             await send_telegram(format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
             _triggered.discard(code)

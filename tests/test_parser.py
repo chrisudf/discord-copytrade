@@ -503,3 +503,51 @@ def test_detect_action_locked_past_tense_is_recap():
     from src.parser.signal_parser import detect_action
     # 过去式 "locked in 200%" 是 PnL 复盘，不是平仓动作
     assert detect_action("locked in 200% on my runners today, what a day") == "OPEN"
+
+
+# ============ enrich 尾随日期（7/21 复盘：NVDA 7/22 被丢成 next-Friday） ============
+
+def test_enrich_trailing_date_after_price():
+    """`$NVDA $210 calls $.58 7/22` —— 日期跟在**价格之后**。
+
+    B0 只找 strike 前的 MM/DD;旧逻辑走到 B2（weekly 无日期）→ next-Friday 7/24。
+    B1c 必须先命中,honor 显式 7/22。
+    """
+    r = parse_signal("enrich:\nScalping - $NVDA $210 calls $.58 7/22\n\n@everyone $alert",
+                     msg_ts=date(2026, 7, 21))
+    assert r is not None and not r.get("skip")
+    assert r["symbol"] == "NVDA"
+    assert r["side"] == "CALL"
+    assert r["strike"] == 210.0
+    assert r["price"] == 0.58
+    assert r["expiry_date"] == date(2026, 7, 22)  # 不是 next-Friday 7/24
+
+
+def test_enrich_trailing_date_zh_twin():
+    """ZH 孪生 `$NVDA $210 看涨期权 $.58 7/22`（看涨期权→ calls 归一后同样命中 B1c）。"""
+    r = parse_signal("enrich:\n剥头皮 - $NVDA $210 看涨期权 $.58 7/22\n\n@everyone $alert",
+                     msg_ts=date(2026, 7, 21))
+    assert r is not None and not r.get("skip")
+    assert r["symbol"] == "NVDA"
+    assert r["strike"] == 210.0
+    assert r["expiry_date"] == date(2026, 7, 22)
+
+
+def test_date_before_strike_still_wins_over_trailing():
+    """`$XOM 7/24 $152.50 calls for $1.27` —— 日期在 strike 前,B0 命中,B1c 不介入。"""
+    r = parse_signal("enrich:\n$XOM 7/24 $152.50 calls for $1.27\n\n@everyone $alert",
+                     msg_ts=date(2026, 7, 21))
+    assert r is not None
+    assert r["symbol"] == "XOM"
+    assert r["strike"] == 152.5
+    assert r["expiry_date"] == date(2026, 7, 24)
+
+
+def test_weekly_no_date_still_falls_to_next_friday():
+    """无任何日期的 enrich weekly 仍走 B2 → next-Friday,不被 B1c 误伤。"""
+    r = parse_signal("enrich:\n$IBM weekly $310 calls $1.33\n\n@everyone $alert",
+                     msg_ts=date(2026, 7, 21))
+    assert r is not None
+    assert r["symbol"] == "IBM"
+    assert r["strike"] == 310.0
+    assert r["expiry_date"] == date(2026, 7, 24)  # 7/21 周二 → 本周五 7/24

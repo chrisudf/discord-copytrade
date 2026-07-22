@@ -940,9 +940,19 @@ import re as _re
 _OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b")
 # ZH 方向词不带 \b（汉字间无 word boundary）。parser 已归一化 看涨/看跌期权，
 # 这里兜的是 parser 因**其他**原因失败的 ZH 信号——有方向词就该报
-# "looks like signal"，而不是掉进 sized-entry 的"无 C/P 方向"（7/14 HOOD 误报）
+# "looks like signal"，而不是掉进 sized-entry 的"无 C/P 方向"（7/14 HOOD 误报）。
+#
+# EN 方向词要求**近旁有 strike**（紧凑 750c，或 strike 在前的 "$210 calls"）：
+# 裸 "calls"/"puts" 会误吞行情评论——7/21 "PDH here on SPY, calls up @ 3.80"
+# 三件套（SPY + calls + @3.80）全中,误报 "Parse failed (looks like signal)"。
+# 真开仓永远带 strike（"$210 calls"/"750c"/"$310 weekly calls"）,评论里的
+# "calls up"/"calls paying" 前面没数字 → 不再命中。ZH 保留裸 看涨/看跌期权
+# （中文评论里裸方向词极少,且 test_open_attempt 依赖 "买入看跌期权对冲" 命中）。
 _OPEN_SIDE_RE = _re.compile(
-    r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b|看[涨跌]期权", _re.I
+    r"\b\d+(?:\.\d+)?[cp]\b"                                      # 750c / 1050p（strike+方向一体）
+    r"|\$?\d{2,}(?:\.\d+)?\s*(?:[a-z]{1,10}\s+){0,3}?(?:calls?|puts?)\b"  # $210 [weekly] calls
+    r"|看[涨跌]期权",                                             # ZH 方向词
+    _re.I,
 )
 # 价格写法：$X.XX / @X.XX / .98 fill / .98 filled
 _OPEN_PRICE_RE = _re.compile(

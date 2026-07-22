@@ -513,6 +513,71 @@ def adjust_entry_price(option_code: str, expect_qty_total: int, dealt_avg: float
     return True
 
 
+def reconcile_to_broker(option_code: str, broker_qty: int) -> bool:
+    """本地持仓核销到 broker 实数（naked-short 脱钩时用）。
+
+    背景（7/21 复盘）：本地 positions_db 记了 OPEN（甚至有 FILL_ADJUST 证明买单成交过），
+    但 broker `position_list_query` 返回 0 long。TP/SL/EOD 守护挂卖单 → naked-short
+    防护正确拒单 → 但守护每 tick 重挂,一个合约整夜刷了几千次。重试永远救不回脱钩,
+    只有把本地核销到 broker 实数才能让它退出 get_open_positions() 从而停止扫描。
+
+    语义:
+    - 只处理 status IN ('OPEN','PARTIAL') 的行。
+    - broker_qty <= 0 → status=CLOSED, qty_remaining=0（从此不再被任何 watcher 选中）。
+    - 0 < broker_qty < qty_remaining → 缩到 broker_qty,保留 status（下一 tick 卖真实张数
+      会成交,不再 naked-short,自然收尾）。
+    - broker_qty >= qty_remaining → 无需核销（不应发生,naked-short 只在 available<卖量 时触发）。
+
+    Returns:
+        True = 确实改了一行 OPEN/PARTIAL（调用方据此**只告警一次**——核销成 CLOSED 后
+        get_open_positions 不再返回它,不会有第二次调用；partial 缩量后下轮卖单成交,
+        也不会再进本函数）。False = 没有可核销的活跃行（已 CLOSED/EXPIRED 或数量已一致）。
+    """
+    now = _utc_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        pos = conn.execute(
+            "SELECT * FROM positions WHERE option_code = ?",
+            (option_code,),
+        ).fetchone()
+        if pos is None or pos["status"] not in ("OPEN", "PARTIAL"):
+            return False
+        if pos["qty_remaining"] <= max(0, broker_qty):
+            return False  # 本地已不高于 broker,无需核销
+
+        new_qty = max(0, broker_qty)
+        if new_qty == 0:
+            conn.execute("""
+                UPDATE positions
+                SET qty_remaining = 0, status = 'CLOSED',
+                    last_action_at = ?, closed_at = ?
+                WHERE option_code = ?
+            """, (now, now, option_code))
+        else:
+            conn.execute("""
+                UPDATE positions
+                SET qty_remaining = ?, last_action_at = ?
+                WHERE option_code = ?
+            """, (new_qty, now, option_code))
+        conn.execute("""
+            INSERT INTO position_events (
+                option_code, event_type, qty_delta, price, pct,
+                trigger_source, ref_msg_id, ts, note
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+        """, (
+            option_code, "RECONCILE", new_qty - pos["qty_remaining"], None, None,
+            "broker_reconcile", None, now,
+            f"broker long={broker_qty}, 本地 qty_remaining {pos['qty_remaining']}→{new_qty} "
+            f"(naked-short 脱钩核销)",
+        ))
+    logger.warning(
+        f"[positions] RECONCILE {option_code}: broker long={broker_qty}, "
+        f"local {pos['qty_remaining']}→{new_qty}"
+        + (" → CLOSED" if new_qty == 0 else "")
+    )
+    return True
+
+
 def mark_tp_hit(option_code: str, tier_bit: int) -> None:
     """标记某档 TP 已触发。tier_bit 是位掩码（1=T1, 2=T2, 4=T3...）。
 

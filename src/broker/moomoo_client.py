@@ -497,9 +497,14 @@ def place_sell_order(
             f"asked to sell {qty}. This would open a naked short — refusing."
         )
         logger.error(f"[broker] {msg}")
+        # naked_short=True 是给守护用的"脱钩"信号（区别于上面 position_list_query
+        # 异常那种瞬时失败）：查询成功、broker 权威地说"没这么多 long"，说明本地 DB
+        # 高估了持仓。守护据此把本地核销到 broker 实数并停止重试，而不是每 tick 重挂。
+        # broker_qty 带回 broker 实际持有的 long 张数（0 = 完全不持有）。
         return {
             "success": False, "message": msg,
             "order_id": None, "code": option_code, "qty": qty, "price": limit_price,
+            "naked_short": True, "broker_qty": available,
         }
 
     try:

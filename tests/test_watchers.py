@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.storage import positions_db
-from src.position import manager, sl_watcher, eod_watcher
+from src.position import manager, sl_watcher, eod_watcher, tp_watcher
 
 
 ET_TZ = ZoneInfo("America/New_York")
@@ -409,3 +409,83 @@ def test_eod_window_ends_after_market_close():
     assert _is_eod_window(wed(16, 4), 15, 50) is True    # 收盘+5min 余量内
     assert _is_eod_window(wed(16, 10), 15, 50) is False  # 收盘后：合约命运已定
     assert _is_eod_window(wed(18, 50), 15, 50) is False  # 7/15 实测噪音时点
+
+
+# ============ naked-short 脱钩:核销 + 停止重试风暴（7/21 复盘） ============
+
+def _naked_short_result(code, qty):
+    return {
+        "success": False, "naked_short": True, "broker_qty": 0,
+        "message": "naked-short refused: broker has only 0 long...",
+        "order_id": None, "code": code, "qty": qty, "price": 0.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sl_naked_short_reconciles_and_stops_storm():
+    """SL 卖单被 naked-short 拒 → 核销成 CLOSED,第二轮不再挂卖单(风暴停止)。"""
+    code = _uniq_code("SLNAKED")
+    _open_weekly("SLNK", code, qty=1, entry=1.00)
+    sl_watcher._triggered.discard(code)
+
+    os.environ["STOP_LOSS_PCT"] = "0.50"
+    sell_mock = lambda **kw: _naked_short_result(code, kw["qty"])
+    tg = AsyncMock()
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
+         patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock) as sell, \
+         patch("src.position.sl_watcher.send_telegram", tg):
+        await sl_watcher._sl_tick()
+        # 第一轮:触发一次卖单被拒 → 核销
+        assert sell.call_count == 1
+        pos = positions_db.get(code)
+        assert pos["status"] == "CLOSED" and pos["qty_remaining"] == 0
+        # 第二轮:仓位已 CLOSED,退出 get_open_positions → 不再挂卖单
+        await sl_watcher._sl_tick()
+        assert sell.call_count == 1  # 没有增长 = 风暴停止
+
+    assert tg.await_count == 1  # 只告警一次
+
+
+@pytest.mark.asyncio
+async def test_tp_naked_short_reconciles_and_stops_storm():
+    """TP T1 卖单被 naked-short 拒 → 核销成 CLOSED,第二轮不再挂卖单。"""
+    code = _uniq_code("TPNAKED")
+    # entry 1.0, weekly T1 阈值 = 1.5;报价 2.0 → T1 命中
+    _open_weekly("TPNK", code, qty=1, entry=1.00)
+
+    sell_mock = lambda **kw: _naked_short_result(code, kw["qty"])
+    tg = AsyncMock()
+    with patch("src.position.tp_watcher.get_last_prices", side_effect=_quotes_for(code, 2.00)), \
+         patch("src.position.tp_watcher.place_sell_order", side_effect=sell_mock) as sell, \
+         patch("src.position.tp_watcher.send_telegram", tg):
+        await tp_watcher._tp_tick()
+        assert sell.call_count == 1
+        pos = positions_db.get(code)
+        assert pos["status"] == "CLOSED" and pos["qty_remaining"] == 0
+        await tp_watcher._tp_tick()
+        assert sell.call_count == 1  # 风暴停止
+
+    assert tg.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_tp_ordinary_rejection_still_retries_next_tick():
+    """非 naked-short 的普通拒单仍允许下轮重试(不误判成脱钩核销)。"""
+    code = _uniq_code("TPRETRY")
+    _open_weekly("TPRT", code, qty=1, entry=1.00)
+
+    def _reject(**kw):
+        return {"success": False, "message": "rate limited",
+                "order_id": None, "code": code, "qty": kw["qty"], "price": 0.5}
+    tg = AsyncMock()
+    with patch("src.position.tp_watcher.get_last_prices", side_effect=_quotes_for(code, 2.00)), \
+         patch("src.position.tp_watcher.place_sell_order", side_effect=_reject) as sell, \
+         patch("src.position.tp_watcher.send_telegram", tg):
+        await tp_watcher._tp_tick()
+        await tp_watcher._tp_tick()
+        # 普通拒单不核销 → 仓位仍 OPEN,每轮都重挂
+        assert sell.call_count == 2
+        assert positions_db.get(code)["status"] == "OPEN"
+    # 收尾
+    positions_db.record_close(code, qty_sold=1, fill_price=2.0,
+                              trigger_source="manual", note="ut cleanup")

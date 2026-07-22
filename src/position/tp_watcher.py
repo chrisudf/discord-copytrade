@@ -107,6 +107,22 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
 
         if not result.get("success"):
             err = result.get("message", "unknown")
+            if result.get("naked_short"):
+                # broker 权威说没这么多 long → 本地脱钩。核销到 broker 实数(0→CLOSED)
+                # 让它退出 get_open_positions,停止每 tick 重挂;只在首次核销时告警一次。
+                bq = result.get("broker_qty", 0)
+                changed = position_mgr.reconcile_to_broker(code, bq)
+                logger.error(
+                    f"[tp] naked-short desync {code}: broker long={bq}, "
+                    f"reconciled local DB (changed={changed})"
+                )
+                if changed:
+                    await send_telegram(format_error(
+                        "持仓脱钩已核销",
+                        f"{code}: broker 实际持有 {bq} 张,本地 DB 高估。已核销并停止止盈重试。\n"
+                        f"请核对 moomoo 持仓（必要时跑 scripts/sync_positions.py）。"
+                    ))
+                return
             logger.error(f"[tp] sell rejected: {err}")
             _triggered_this_tick.discard(key)
             await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))

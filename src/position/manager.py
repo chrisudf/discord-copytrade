@@ -143,6 +143,14 @@ def on_close_filled(
 
 # ============ 给 CLOSE parser / polling 用的查询接口 ============
 
+def reconcile_to_broker(option_code: str, broker_qty: int) -> bool:
+    """naked-short 脱钩时把本地持仓核销到 broker 实数。见 positions_db.reconcile_to_broker。
+
+    Returns True 仅当确实改动了一行活跃仓位（调用方据此只告警一次）。
+    """
+    return positions_db.reconcile_to_broker(option_code, broker_qty)
+
+
 def get_open_symbols() -> set[str]:
     """活跃仓位 symbol 集合（CLOSE parser 白名单）。"""
     return positions_db.get_open_symbols()

@@ -471,6 +471,55 @@ Two hidden failures fell out of this:
 
 ---
 
+## 17. A rejected auto-sell must reconcile local state, not retry forever — local DB and the (SIMULATE) broker silently desync
+
+**What happened (7/21):** the TP watcher fired `T1 HIT` on positions the
+local `positions_db` recorded as OPEN (some with a `FILL_ADJUST` event
+proving the buy filled), but `place_sell_order`'s naked-short guard
+(lesson #15) rejected every sell with *"broker has only 0 long"*. The
+watcher logged the rejection, discarded its per-tick trigger, and **tried
+again the next tick** — every ~6 s, for one contract from 01:15 to 06:00
+(~2,700 attempts), plus SPY 750c/755c/760c. The 8-hour log is ~99% this
+one storm, and each rejection also fired an un-deduped Telegram error →
+TG flood / 429s.
+
+**Two non-obvious things:**
+
+1. **moomoo SIMULATE `position_list_query` does not reliably reflect
+   filled option positions.** The buy order returns an `order_id` and a
+   fill (dealt_avg), our DB records OPEN, yet querying the paper account's
+   position list for that option returns empty (0 long). So the local DB
+   and the broker desync with *no error anywhere* — the only symptom is
+   the sell guard refusing. This isn't in any moomoo doc; don't assume
+   "buy filled" ⟹ "position query shows it" in SIMULATE.
+2. **A correct guard + a naïve retry loop = a self-inflicted DoS.** The
+   naked-short refusal is right (never open a naked short), and retrying
+   is the right default for *transient* failures — but a naked-short
+   rejection is a **desync signal, not a transient error**. No amount of
+   retrying fixes it; it just spams the broker and TG all night.
+
+**Defenses added:**
+- `place_sell_order` tags the naked-short branch distinctly
+  (`naked_short=True, broker_qty=N`) — separate from the
+  `position_list_query` *exception* path (that one stays transient and
+  retryable; we must never reconcile-to-CLOSED on a query failure, only on
+  an authoritative "you hold N").
+- New `positions_db.reconcile_to_broker(code, broker_qty)`: shrinks local
+  `qty_remaining` to the broker's actual (0 → CLOSED). Once CLOSED the
+  position drops out of `get_open_positions()`, so **all three** watchers
+  (TP/SL/EOD) stop scanning it — the storm ends structurally, not via a
+  per-watcher flag.
+- It returns `True` only on the first state change, which the watchers use
+  to alert **exactly once** (a CLOSED position is never re-selected; a
+  partial shrink succeeds on the next tick). The `sell_lock` serializes
+  the three watchers so only one reconciles + alerts.
+- Root cause is the DB↔broker desync itself (environmental to SIMULATE);
+  the code now *contains* it (reconcile + one alert) instead of storming.
+  The local DB still needs a manual reconcile / reset against the paper
+  account when it drifts.
+
+---
+
 ## Format guidelines for adding new lessons
 
 Keep entries focused on **gotchas that weren't documented or
