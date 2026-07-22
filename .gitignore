@@ -13,3 +13,6 @@ venv/
 .vscode/
 .idea/
 *.log
+
+# 真实频道/用户 ID 不入库（公开仓库会泄露你在跟哪个群哪个人的单）
+config/channels.json

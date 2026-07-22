@@ -55,6 +55,7 @@ from src.notifier.telegram_client import (
 )
 from src.storage.logger_db import log_raw_signal, log_order
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.position.sl_watcher import run_sl_watcher
 from src.position.eod_watcher import run_eod_watcher
 from src.position.tp_watcher import run_tp_watcher
@@ -64,6 +65,10 @@ TOKEN = os.getenv("DISCORD_USER_TOKEN")
 ET_TZ = ZoneInfo("America/New_York")
 
 client = discord.Client()
+
+# OPEN 链路串行锁：check_order → place_order → record_order 必须原子，
+# 否则两条几乎同时到达的信号都会用"旧配额"通过风控（见 handle_message 内注释）
+_order_flow_lock = asyncio.Lock()
 
 # ============================================================
 # Dedup: bounded deque + set 查重，避免无限增长
@@ -129,10 +134,13 @@ def _signal_fingerprint(sig: dict) -> str:
 # 场景：KC 机器人翻译流程会发英文 + 中文两条；
 #       现在 ZH parser 也能解析了，两条都会触发，需要二次拦截。
 # key = (kind, sorted symbols, pct)  —— 不带 lang，跨语言去重
-# 窗口 5min（同信号语义重发的时间尺度，参考 _is_duplicate_signal 设计）
+# 窗口 60s（7/8 调整，原 5min）：
+#   - 双语孪生/重发实测间隔 ≤8.5s，60s 有 7x 余量
+#   - 5min 窗口误伤真实的连续 trim：7/8 "BANG! Trimmed AAPL @ 2.00" 是
+#     82s 后的第二次 trim（价格都不同），被当 dup 拦掉——qty≥2 时会漏跟
 _close_fps: dict[tuple, "datetime"] = {}
 _CLOSE_FP_MAX = 100
-CLOSE_FP_WINDOW = timedelta(minutes=5)
+CLOSE_FP_WINDOW = timedelta(seconds=60)
 
 
 def _close_fingerprint(parsed: dict) -> tuple:
@@ -142,7 +150,15 @@ def _close_fingerprint(parsed: dict) -> tuple:
 
 
 def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
-    """返回 (是否重复, 距上次秒数)。结构同 _is_duplicate_signal。"""
+    """查重 + 登记，**原子**（单 event loop，中间无 await）。
+
+    7/8 教训：0005 曾把登记挪到 handler 末尾（执行成功后），但 KC bot 双发
+    间隔 ~0.9s < handler 耗时 ~1.2s（含 TG await）→ 第二条穿过 dup 检查
+    双重处理（连续两夜实锤，qty≥2 时会 trim 两次）。登记必须和查重同步做。
+
+    broker 失败时的重试语义（0005 的目的）改由回滚实现：handler 末尾发现
+    "零成交且有 broker 失败" → _unregister_close_fp，让下一条孪生重试。
+    """
     fp = _close_fingerprint(parsed)
     now = datetime.now(timezone.utc)
 
@@ -150,16 +166,20 @@ def _is_duplicate_close(parsed: dict) -> tuple[bool, float]:
     for k in expired:
         _close_fps.pop(k, None)
 
-    if len(_close_fps) >= _CLOSE_FP_MAX:
-        oldest = min(_close_fps, key=_close_fps.get)
-        _close_fps.pop(oldest, None)
-
     prev_ts = _close_fps.get(fp)
     if prev_ts is not None:
         return True, (now - prev_ts).total_seconds()
 
+    if len(_close_fps) >= _CLOSE_FP_MAX:
+        oldest = min(_close_fps, key=_close_fps.get)
+        _close_fps.pop(oldest, None)
     _close_fps[fp] = now
     return False, 0.0
+
+
+def _unregister_close_fp(parsed: dict):
+    """回滚指纹：broker 失败且零成交时调用，让双语孪生版本充当天然重试。"""
+    _close_fps.pop(_close_fingerprint(parsed), None)
 
 
 def _is_duplicate_signal(sig: dict) -> tuple[bool, float]:
@@ -215,20 +235,36 @@ def _extract_et_date(message) -> "date":
 # ============================================================
 # Discord events
 # ============================================================
+
+# on_ready 每次 gateway 重连都会触发（约 20-30 min 一次），
+# 频道校验 + TG 报警只做一次，避免重连刷屏 + REST 限流
+_channels_validated = False
+
+
 @client.event
 async def on_ready():
+    global _channels_validated
     logger.info(f"Discord logged in as: {client.user} (id={client.user.id})")
+    if _channels_validated:
+        return
+    _channels_validated = True
+
     failures = await validate_channels(client)
     if failures:
-        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        lines = "\n".join(
+            f"• {name} (id={cid}): {reason}" for cid, name, reason, _ in failures
+        )
         await _safe_notify(format_error(
             "频道配置校验失败",
             f"{len(failures)}/{len(registry.enabled_channel_ids())} 个频道无法解析:\n{lines}\n\n"
             f"请检查 config/channels.json 的 channel_id"
         ))
-        if len(failures) == len(registry.enabled_channel_ids()):
+        # 只有全部失败且**全部是确定性失败**（404/403 = 配置真的错了）才退出；
+        # 网络抖动/限流这类瞬时失败重连后会自愈，退出反而把 bot 干死在夜里
+        all_definitive = all(definitive for _, _, _, definitive in failures)
+        if len(failures) == len(registry.enabled_channel_ids()) and all_definitive:
             logger.error(
-                "❌ 所有 enabled 频道都校验失败，listener 没有任何消息源 — 退出。"
+                "❌ 所有 enabled 频道都确定性校验失败，listener 没有任何消息源 — 退出。"
                 " 修复 config/channels.json 后重启。"
             )
             await client.close()
@@ -279,6 +315,22 @@ async def handle_message(message):
         message.embeds (list, optional)
         message.attachments (list, optional)
     """
+    try:
+        await _handle_message_inner(message)
+    except Exception as e:
+        # 最后防线：任何未预料的异常都不能让信号静默消失。
+        # discord.py 会把 event handler 的异常吞进默认 on_error（只写日志），
+        # TG 侧完全看不到 —— 模块 docstring 承诺的"一切异常都吞掉只 log"
+        # 在这里兑现，并显式报警让人工接管。
+        logger.exception("handle_message crashed")
+        raw = getattr(message, "content", "") or ""
+        await _safe_notify(format_error(
+            "handle_message crashed",
+            f"{type(e).__name__}: {e}\n\nraw: {raw[:200]}",
+        ))
+
+
+async def _handle_message_inner(message):
     t0 = datetime.now(timezone.utc)
 
     # ---- 过滤 1：忽略自己发的消息 ----
@@ -319,10 +371,21 @@ async def handle_message(message):
     except Exception as e:
         logger.error(f"log_raw_signal failed: {e}")
 
+    # ---- 原文级去重 ----
+    # 7/14 起源频道每条消息双发（EN×2 + ZH×2，一个信号 4 条）。交易路径有
+    # 指纹 dedup 兜底，但 parse-fail 的 TG 告警会跟着双响（7/14 00:13 两条
+    # 一模一样的 looks-like-signal）。同频道同内容 30s 内只处理一次；
+    # 放在 log_raw_signal 之后——raw_signals 照常留底，复盘不丢原文。
+    if _is_duplicate_raw(cid, raw):
+        logger.info(f"🔁 duplicate raw message skipped (30s window): {raw[:60]}")
+        return
+
     # ---- 检测 OPEN / CLOSE ----
     action = detect_action(raw)
     if action == "CLOSE":
-        await _handle_close_signal(raw, message.id)
+        await _handle_close_signal(
+            raw, message.id, channel_name=cfg.name, channel_id=cid,
+        )
         return
 
     # ---- 解析信号 ----
@@ -349,7 +412,30 @@ async def handle_message(message):
                     f"(prev {(now - prev).total_seconds():.0f}s ago)"
                 )
         elif _looks_like_open_attempt(raw):
-            await _safe_notify(format_error("Parse failed (looks like signal)", raw))
+            twin_sym = _twin_of_recent_exec(raw, cid)
+            if twin_sym:
+                logger.info(
+                    f"🔁 parse-fail alert suppressed: {twin_sym} executed from "
+                    f"this channel <{_TWIN_SUPPRESS_WINDOW.total_seconds():.0f}s ago "
+                    f"(likely ZH/EN twin)"
+                )
+            else:
+                await _safe_notify(format_error("Parse failed (looks like signal)", raw))
+        else:
+            sized_sym = _looks_like_sized_entry(raw)
+            if sized_sym:
+                now = datetime.now(timezone.utc)
+                prev = _sized_entry_alerted.get(sized_sym)
+                if prev is None or now - prev > _ADDON_ALERT_WINDOW:
+                    _sized_entry_alerted[sized_sym] = now
+                    await _safe_notify(format_error(
+                        "疑似入场信号（无 C/P 方向，未自动下单）", raw
+                    ))
+                else:
+                    logger.info(
+                        f"🔁 sized-entry alert dedup: {sized_sym} "
+                        f"(prev {(now - prev).total_seconds():.0f}s ago)"
+                    )
         return
 
     if signal.get("skip"):
@@ -391,6 +477,20 @@ async def handle_message(message):
         )
         return
 
+    # ---- 短线标签 × 长 DTE 防护 ----
+    # 7/16 实锤：KC 笔误 "SPY 755c June 20 @ 2.17 day trade"（June 20 已过），
+    # smart_expiry 跨年滚动 → 买成 2027-06 合约（真实市场该合约根本不是 $2.17
+    # 量级）。day trade / scalp / lotto / 0dte 隐含短 DTE，解析出 30 天以上
+    # 只可能是喊单笔误或解析错位 → 不下单，TG 让人工确认。
+    # 真 LEAPS 不受影响："SOFI 20c Jan 15 2027 starter leap swing" tags=['swing']。
+    dte_guard_reason = _suspicious_long_dte(signal, msg_date_et)
+    if dte_guard_reason:
+        logger.warning(f"[dte-guard] {dte_guard_reason} — 不下单: {raw[:80]}")
+        await _safe_notify(format_error(
+            "疑似日期笔误（短线标签 + 长 DTE），未下单", f"{dte_guard_reason}\n\n{raw[:200]}",
+        ))
+        return
+
     # TODO P3: symbol blacklist
 
     # 解析成功立即预警，带 breakeven 提示 + KC tags
@@ -409,77 +509,87 @@ async def handle_message(message):
         tags=signal.get("tags") or None,
     ))
 
-    # ---- 风控 ----
-    # 关键参数说明：
-    # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
-    # - qty 来自 channel 配置，不同 channel 可以设不同张数
-    # - effective_price: broker 实际会挂 signal_price × (1+5~12% slippage)，
-    #   成本类风控（单笔/当日累计）必须按挂单价算，否则 REAL $1000 硬顶被滑点穿透
-    qty = cfg.default_qty
-    risk_result = check_order(
-        price=signal["price"],
-        qty=qty,
-        symbol=signal["symbol"],
-        strike=signal["strike"],
-        side=signal["side"],
-        expiry=signal.get("expiry", ""),
-        channel_name=cfg.name,
-        max_price_override=cfg.max_price,
-        effective_price=calc_limit_price(signal["price"]),
-    )
-
-    if not risk_result.passed:
-        logger.warning(
-            f"🛡️  Risk blocked: {risk_result.reason} - {risk_result.detail}"
-        )
-        await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
-        return
-
-    # ---- 下单 ----
-    # 下单（broker.place_order 是同步函数，必须 to_thread 包装）
-    try:
-        order_result = await asyncio.to_thread(place_order, signal, qty)
-    except Exception as e:
-        logger.exception("place_order failed")
-        await _safe_notify(format_error("Order error", str(e)))
-        return
-
-    # 落库订单（成功失败都记，作为业务日志）
-    try:
-        log_order(message.id, signal, order_result)
-    except Exception as e:
-        logger.error(f"log_order failed: {e}")
-
-    # === [改动 Bug A] 只有 success=True 才 record_order ===
-    # 实测背景：6/16 QCOM/IREN 期权代码错误（Juneteenth 未处理），
-    # broker 返回 success=False，但旧逻辑仍 record_order 污染配额，
-    # 导致 daily_orders 表出现"成功记录"但订单实际未成交。
-    # 现在失败 → 发 TG 提示用户 + 不污染配额。
-    if not order_result.get("success"):
-        err_msg = order_result.get("message", "unknown error")
-        logger.error(f"Order rejected by broker: {err_msg}")
-        await _safe_notify(format_error(
-            "Order rejected by broker",
-            f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
-            f"{signal.get('expiry', '')}\n{err_msg}"
-        ))
-        return
-
-    try:
-        # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
-        effective_price = order_result.get("price", signal["price"])
-        record_order(
-            price=effective_price,
+    # ---- 风控 + 下单 + 配额记录：整段串行 ----
+    # check_order 与 record_order 之间隔着 broker RTT（await），没有锁的话
+    # 两条几乎同时到达的信号会都用"旧配额"通过 Layer 3/4 检查，
+    # MAX_DAILY_COST / MAX_DAILY_ORDERS 可以被双双突破。
+    # 信号频率是每天个位数，串行化整个下单段的延迟代价可以忽略。
+    async with _order_flow_lock:
+        # ---- 风控 ----
+        # 关键参数说明：
+        # - max_price_override: channel 的 max_price 覆盖全局 MAX_PRICE_PER_CONTRACT
+        # - qty 来自 channel 配置，不同 channel 可以设不同张数
+        # - effective_price: broker 实际会挂 signal_price × (1+5~12% slippage)，
+        #   成本类风控（单笔/当日累计）必须按挂单价算，否则 REAL $1000 硬顶被滑点穿透
+        qty = cfg.default_qty
+        risk_result = check_order(
+            price=signal["price"],
             qty=qty,
             symbol=signal["symbol"],
             strike=signal["strike"],
             side=signal["side"],
             expiry=signal.get("expiry", ""),
-            channel_id=str(cid),
             channel_name=cfg.name,
+            max_price_override=cfg.max_price,
+            effective_price=calc_limit_price(signal["price"]),
         )
-    except Exception as e:
-        logger.error(f"record_order failed: {e}")
+
+        if not risk_result.passed:
+            logger.warning(
+                f"🛡️  Risk blocked: {risk_result.reason} - {risk_result.detail}"
+            )
+            await _safe_notify(format_risk_blocked(risk_result.reason, risk_result.detail))
+            return
+
+        # ---- 下单 ----
+        # 下单（broker.place_order 是同步函数，必须 to_thread 包装）
+        try:
+            order_result = await asyncio.to_thread(place_order, signal, qty)
+        except Exception as e:
+            logger.exception("place_order failed")
+            await _safe_notify(format_error("Order error", str(e)))
+            return
+
+        # 落库订单（成功失败都记，作为业务日志）
+        try:
+            log_order(message.id, signal, order_result)
+        except Exception as e:
+            logger.error(f"log_order failed: {e}")
+
+        # === [改动 Bug A] 只有 success=True 才 record_order ===
+        # 实测背景：6/16 QCOM/IREN 期权代码错误（Juneteenth 未处理），
+        # broker 返回 success=False，但旧逻辑仍 record_order 污染配额，
+        # 导致 daily_orders 表出现"成功记录"但订单实际未成交。
+        # 现在失败 → 发 TG 提示用户 + 不污染配额。
+        if not order_result.get("success"):
+            err_msg = order_result.get("message", "unknown error")
+            logger.error(f"Order rejected by broker: {err_msg}")
+            await _safe_notify(format_error(
+                "Order rejected by broker",
+                f"{signal['symbol']} {signal['strike']}{signal['side'][0]} "
+                f"{signal.get('expiry', '')}\n{err_msg}"
+            ))
+            return
+
+        # 下单成功 → 记录 (channel, symbol) + 合约快照：压制 ZH 孪生的
+        # parse-fail 报警 + 挡住被机翻成 close 动词的孪生（_close_is_open_twin）
+        _record_recent_exec(cid, signal)
+
+        try:
+            # 用 broker 实际挂单价计成本（含 slippage），否则 MAX_DAILY_COST 会被低估
+            effective_price = order_result.get("price", signal["price"])
+            record_order(
+                price=effective_price,
+                qty=qty,
+                symbol=signal["symbol"],
+                strike=signal["strike"],
+                side=signal["side"],
+                expiry=signal.get("expiry", ""),
+                channel_id=str(cid),
+                channel_name=cfg.name,
+            )
+        except Exception as e:
+            logger.error(f"record_order failed: {e}")
 
     # ---- 持仓追踪（用于后续 close 信号匹配 / SL polling / EOD 强平） ----
     try:
@@ -491,6 +601,16 @@ async def handle_message(message):
         )
     except Exception as e:
         logger.error(f"position_mgr.on_order_filled failed: {e}")
+
+    # ---- 成交确认（fire-and-forget）----
+    # broker success 只是"已提交"；确认成交后回填真实 avg_entry，
+    # 超时未成交则 TG 告警提示对账。见 fill_checker 模块 docstring。
+    fill_checker.spawn(fill_checker.confirm_buy_fill(
+        order_result.get("order_id") or "",
+        order_result.get("code") or "",
+        order_result.get("qty", qty),
+        order_result.get("price", 0.0) or 0.0,
+    ))
 
     # ---- 通知 + 延迟统计 ----
     elapsed = (datetime.now(timezone.utc) - t0).total_seconds() * 1000
@@ -539,16 +659,23 @@ def _calc_sell_limit(avg_entry: float, signal_price: float = None) -> "float | N
     return round(signal_price * (1 - SELL_SLIP), 2)
 
 
-async def _handle_close_signal(raw: str, msg_id: int):
+async def _handle_close_signal(
+    raw: str, msg_id: int, channel_name: str = None, channel_id: int = None,
+):
     """detect_action==CLOSE 时调用。
 
     流程：
       1. 查当前活跃持仓 symbols → 给 parser 做白名单消歧
       2. parse_close → dict | None
       3. 多 symbol 循环：每个 symbol 可能对应多 strike，全部按 pct 卖
+         （channel_name 传入时只平**同频道来源**的仓位——7/10 enrich 的
+         "$NVDA all out" 差点平掉我们跟 KC 开的 NVDA swing，两个频道是
+         两个独立 trader，close 不能跨源）
       4. broker.place_sell_order（to_thread 包同步调用）
       5. position_mgr.on_close_filled 扣减
       6. Telegram 通知
+
+    channel_name=None（测试/旧调用方）时不做频道过滤，保持旧行为。
     """
     open_symbols = position_mgr.get_open_symbols()
     if not open_symbols:
@@ -564,7 +691,8 @@ async def _handle_close_signal(raw: str, msg_id: int):
             await _safe_notify(format_close_skipped("parser skipped (recap/no-symbol)", raw))
         return
 
-    # CLOSE dedup —— 双语双发 / 同信号重发拦截
+    # CLOSE dedup —— 双语双发 / 同信号重发拦截（查即登记，原子堵双发窗口；
+    # broker 失败时末尾回滚指纹，孪生版本充当重试）
     is_dup, ago = _is_duplicate_close(parsed)
     if is_dup:
         logger.info(
@@ -575,27 +703,82 @@ async def _handle_close_signal(raw: str, msg_id: int):
         return
 
     if parsed["kind"] == "BULK_TRIM":
-        # 全仓 trim，遍历所有 open symbols
-        targets = list(open_symbols)
+        # 全仓 trim：遍历所有 open symbols，扣掉信号里的例外
+        # （7/8 "Closing all positions outside of the $IBM $310 lotto"——
+        # 不能连人家明确保留的仓位一起卖）
+        excluded = set(parsed.get("exclude_symbols") or [])
+        targets = [s for s in open_symbols if s not in excluded]
+        if excluded:
+            logger.info(f"[CLOSE] BULK exclude: {sorted(excluded)}")
     else:
         targets = parsed["symbols"]
 
     pct = parsed["pct"]
     any_executed = False
+    any_success = False  # 至少一笔卖单成功提交 → 登记 CLOSE 指纹
+    runner_preserved: list[str] = []  # 被 runner-preserve 跳过的仓位，循环外合并 TG
+    # broker 侧失败（异常/拒单）——这类失败是瞬时的，值得让 1-3s 后的
+    # 双语孪生版本重试；确定性跳过（runner-preserve / 无价格参照 /
+    # strike 不匹配）重试也是同样结果，不算在内
+    any_broker_failure = False
 
     hint_strike = parsed.get("hint_strike")
     hint_side = parsed.get("hint_side")
+    # hint 是从 symbols[0] 附近抽的（见 close_parser._extract_strike_hint），
+    # 只能约束**那一个** symbol。用 TSLA 的 420c 去过滤 MSFT 的持仓，
+    # 会把 MSFT 的平仓静默跳过（"Trimmed TSLA 420c and MSFT here" 案例）。
+    hint_source_symbol = (parsed.get("symbols") or [None])[0]
 
     for symbol in targets:
+        # 翻译孪生防护：刚开仓的 OPEN 消息被机翻出 close 动词
+        # （7/15 "smaller size"→"小规模减仓"），不平仓，TG 留痕
+        twin_reason = _close_is_open_twin(channel_id, symbol, parsed)
+        if twin_reason:
+            logger.warning(f"[CLOSE] open-twin guard: {twin_reason} — skip")
+            await _safe_notify(format_close_skipped(
+                f"疑似开仓消息的翻译孪生，不平仓：{twin_reason}", raw,
+            ))
+            any_executed = True  # 已发专属 TG，不再让外层报 "no matching"
+            continue
+
         positions = position_mgr.find_by_symbol(symbol)
         if not positions:
             logger.warning(f"[CLOSE] {symbol} not found in open positions")
             continue
 
+        # 频道来源过滤：只平信号来源频道开的仓位（channel_name 为空的历史
+        # 仓位放行）。7/10 实测：enrich "$NVDA - I'm practically all out"
+        # 匹配到我们跟 KC 开的 NVDA 230c —— enrich 平的是他自己的 0DTE，
+        # 两个频道是独立 trader，靠"无价格参照拒卖"才躲过 100% 误平。
+        if channel_name:
+            same_ch = [
+                p for p in positions
+                if not p.get("channel_name") or p["channel_name"] == channel_name
+            ]
+            if not same_ch:
+                logger.info(
+                    f"[CLOSE] {symbol}: {len(positions)} position(s) opened from "
+                    f"other channel(s) "
+                    f"({sorted({p.get('channel_name') for p in positions})}), "
+                    f"signal from '{channel_name}' — skip"
+                )
+                if parsed["kind"] == "CLOSE":
+                    # 定向 close 才提示（BULK 会扫到一堆别频道仓位，全提示会刷屏）
+                    await _safe_notify(format_close_skipped(
+                        f"频道不匹配：{symbol} 仓位来自 "
+                        f"{sorted({p.get('channel_name') or '?' for p in positions})}，"
+                        f"信号来自 {channel_name}，不跨源平仓",
+                        raw,
+                    ))
+                    any_executed = True  # 已发专属 TG，不再让外层报 "no matching"
+                continue
+            positions = same_ch
+
         # strike-aware filter：close 文本里显式给了 strike+side 时只关匹配的仓位。
         # 背景见 [docs/lessons.md](docs/lessons.md) #11：6/30 KC 平 TSLA 420c
         # 触发我们平 TSLA 425c，这次运气好两个 strike 价差小，下次未必。
-        if hint_strike is not None and hint_side is not None:
+        # 只对 hint 所属的 symbol 生效（多 symbol close 的其余 symbol 不受约束）。
+        if hint_strike is not None and hint_side is not None and symbol == hint_source_symbol:
             matched = [
                 p for p in positions
                 if p["strike"] == hint_strike and p["side"] == hint_side
@@ -610,6 +793,7 @@ async def _handle_close_signal(raw: str, msg_id: int):
                     f"strike 不匹配（KC 平 {symbol} {hint_strike}{hint_side[0]} 但我们持仓不同 strike）",
                     raw,
                 ))
+                any_executed = True  # 已发专属 TG，不再让外层报 "no matching"
                 continue
             logger.info(
                 f"[CLOSE] strike-filter: {symbol} {hint_strike}{hint_side[0]} → "
@@ -618,78 +802,97 @@ async def _handle_close_signal(raw: str, msg_id: int):
             positions = matched
 
         for pos in positions:
-            qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
-            if qty_to_sell <= 0:
-                # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
-                # 必须发专属 TG 并标记"已处理"——否则落到外层
-                # "no matching open positions" 兜底文案（7/6 IBM 两次实锤，
-                # 半夜看到会以为仓位状态错乱）
-                await _safe_notify(format_close_skipped(
-                    f"runner-preserve：{pos['symbol']} "
-                    f"{pos['strike']}{pos['side'][0]} 剩 1 张，"
-                    f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
-                    raw,
-                ))
-                any_executed = True
-                continue
-            limit = _calc_sell_limit(
-                pos["avg_entry_price"], parsed.get("signal_price"),
-            )
-            if limit is None:
-                # 信号没喊价 + OPRA 不可用 → 拒绝执行，TG 警报让人工接管
-                logger.warning(
-                    f"[CLOSE] no price ref for {pos['option_code']}, "
-                    f"skipping sell ({pct}%)"
+            # 卖出串行化：同一 option_code 上 SL/TP/EOD/CLOSE 四条路径互斥。
+            # 锁内重读仓位——等锁期间 watcher 可能已经卖过了。
+            async with position_mgr.sell_lock(pos["option_code"]):
+                fresh = position_mgr.get(pos["option_code"])
+                if fresh is not None:
+                    pos = fresh
+                if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+                    logger.info(
+                        f"[CLOSE] {pos['option_code']} already closed "
+                        f"while waiting for lock, skip"
+                    )
+                    any_executed = True  # 有人处理过了，不报 "no matching"
+                    continue
+                qty_to_sell = position_mgr.calc_qty_to_sell(pos, pct)
+                if qty_to_sell <= 0:
+                    # runner-preserve（策略 A）：remaining=1 且 pct<100 故意跳过 trim。
+                    # 收集起来循环外合并成一条 TG——多 strike 时逐仓位发会刷屏
+                    # （7/17 一夜 12+ 条，SPY/NVDA 各两个 strike × 每次 trim）。
+                    # 仍标记"已处理"，否则落到外层 "no matching" 兜底文案
+                    # （7/6 IBM 两次实锤，半夜看到会以为仓位状态错乱）
+                    runner_preserved.append(
+                        f"{pos['symbol']} {pos['strike']}{pos['side'][0]}"
+                    )
+                    any_executed = True
+                    continue
+                limit = _calc_sell_limit(
+                    pos["avg_entry_price"], parsed.get("signal_price"),
                 )
-                await _safe_notify(format_error(
-                    "CLOSE 跳过：无价格参照",
-                    f"{pos['option_code']} qty={qty_to_sell} ({pct}%)\n"
-                    f"原因：信号无价 + OPRA 报价不可用\n"
-                    f"请在 moomoo 手动平仓\n\n"
-                    f"原文: {raw[:200]}"
-                ))
-                any_executed = True  # 算"处理过"，不让外层再发 "no matching" 提示
-                continue
-            logger.info(
-                f"[CLOSE] sell {pos['option_code']} qty={qty_to_sell} "
-                f"limit={limit} ({pct}%, ref=signal)"
-            )
-            try:
-                result = await asyncio.to_thread(
-                    place_sell_order,
-                    option_code=pos["option_code"],
-                    qty=qty_to_sell,
-                    limit_price=limit,
-                    remark=f"kc_close_{pct}pct",
+                if limit is None:
+                    # 信号没喊价 + OPRA 不可用 → 拒绝执行，TG 警报让人工接管
+                    logger.warning(
+                        f"[CLOSE] no price ref for {pos['option_code']}, "
+                        f"skipping sell ({pct}%)"
+                    )
+                    await _safe_notify(format_error(
+                        "CLOSE 跳过：无价格参照",
+                        f"{pos['option_code']} qty={qty_to_sell} ({pct}%)\n"
+                        f"原因：信号无价 + OPRA 报价不可用\n"
+                        f"请在 moomoo 手动平仓\n\n"
+                        f"原文: {raw[:200]}"
+                    ))
+                    any_executed = True  # 算"处理过"，不让外层再发 "no matching" 提示
+                    continue
+                logger.info(
+                    f"[CLOSE] sell {pos['option_code']} qty={qty_to_sell} "
+                    f"limit={limit} ({pct}%, ref=signal)"
                 )
-            except Exception as e:
-                logger.exception("place_sell_order failed")
-                await _safe_notify(format_error("Sell order error", str(e)))
-                any_executed = True  # 持仓找到了只是 broker 异常，不再报 "no matching"
-                continue
+                try:
+                    result = await asyncio.to_thread(
+                        place_sell_order,
+                        option_code=pos["option_code"],
+                        qty=qty_to_sell,
+                        limit_price=limit,
+                        remark=f"kc_close_{pct}pct",
+                    )
+                except Exception as e:
+                    logger.exception("place_sell_order failed")
+                    await _safe_notify(format_error("Sell order error", str(e)))
+                    any_executed = True  # 持仓找到了只是 broker 异常，不再报 "no matching"
+                    any_broker_failure = True
+                    continue
 
-            if not result.get("success"):
-                err = result.get("message", "unknown")
-                logger.error(f"[CLOSE] sell rejected: {err}")
-                await _safe_notify(format_error(
-                    "Sell rejected by broker",
-                    f"{pos['option_code']} qty={qty_to_sell}\n{err}",
-                ))
-                any_executed = True  # 持仓找到了只是 broker 拒单，不再报 "no matching"
-                continue
+                if not result.get("success"):
+                    err = result.get("message", "unknown")
+                    logger.error(f"[CLOSE] sell rejected: {err}")
+                    await _safe_notify(format_error(
+                        "Sell rejected by broker",
+                        f"{pos['option_code']} qty={qty_to_sell}\n{err}",
+                    ))
+                    any_executed = True  # 持仓找到了只是 broker 拒单，不再报 "no matching"
+                    any_broker_failure = True
+                    continue
 
-            try:
-                position_mgr.on_close_filled(
-                    option_code=pos["option_code"],
-                    qty_sold=result.get("qty", qty_to_sell),
-                    fill_price=result.get("price", limit),
-                    trigger_source="kc_signal",
-                    ref_msg_id=str(msg_id),
-                    order_id=result.get("order_id"),
-                    note=f"pct={pct} matched={parsed['matched'][:60]}",
-                )
-            except Exception as e:
-                logger.error(f"on_close_filled failed: {e}")
+                try:
+                    position_mgr.on_close_filled(
+                        option_code=pos["option_code"],
+                        qty_sold=result.get("qty", qty_to_sell),
+                        fill_price=result.get("price", limit),
+                        trigger_source="kc_signal",
+                        ref_msg_id=str(msg_id),
+                        order_id=result.get("order_id"),
+                        note=f"pct={pct} matched={parsed['matched'][:60]}",
+                    )
+                except Exception as e:
+                    logger.error(f"on_close_filled failed: {e}")
+
+                # 卖单成交确认：DB 已按已平处理，若限价单实际没成交必须告警
+                fill_checker.spawn(fill_checker.confirm_sell_fill(
+                    result.get("order_id") or "", pos["option_code"],
+                    result.get("qty", qty_to_sell), "kc_close",
+                ))
 
             await _safe_notify(format_close_filled(
                 pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
@@ -697,6 +900,22 @@ async def _handle_close_signal(raw: str, msg_id: int):
                 pct, "kc_signal", result.get("order_id", "N/A"),
             ))
             any_executed = True
+            any_success = True
+
+    if runner_preserved:
+        await _safe_notify(format_close_skipped(
+            f"runner-preserve：{'、'.join(runner_preserved)} 各剩 1 张，"
+            f"跳过 {pct}% trim（策略 A，等 100% 全平信号）",
+            raw,
+        ))
+
+    if any_broker_failure and not any_success:
+        # 指纹已在 _is_duplicate_close 查重时登记（原子，堵双发竞态）。
+        # 零成交且出现过 broker 失败（异常/拒单）→ 回滚指纹，
+        # 让 1-3s 后到达的另一语言版本充当天然重试（0005 的目的）。
+        # 确定性结果（runner-preserve / 无价格参照 / strike 不匹配）不回滚——
+        # 孪生重试也是同样结果，只会重复刷 TG。
+        _unregister_close_fp(parsed)
 
     if not any_executed:
         await _safe_notify(format_close_skipped(
@@ -714,9 +933,27 @@ async def _handle_close_signal(raw: str, msg_id: int):
 
 import re as _re
 
-# 现成的"开仓"句法特征：含 $TICKER + (Nc/p|calls/puts) + 价格-like 数字
-_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b")
-_OPEN_SIDE_RE = _re.compile(r"\b\d+(?:\.\d+)?[cp]\b|\bcalls?\b|\bputs?\b", _re.I)
+# 现成的"开仓"句法特征：含 TICKER + (Nc/p|calls/puts) + 价格-like 数字
+# ticker 同时接受 $ 前缀和裸大写（parser 的 Pattern A 本身就是裸 ticker 语法，
+# 只认 $ 会把 "TSLA 250c 7/11 @ 1.20 好像没接住" 这类真漏检静默掉）。
+# 裸大写词（BANG/OK 等）会带来一点过报，但这只是 TG 告警闸门，宁多勿漏。
+_OPEN_TICKER_RE = _re.compile(r"\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b")
+# ZH 方向词不带 \b（汉字间无 word boundary）。parser 已归一化 看涨/看跌期权，
+# 这里兜的是 parser 因**其他**原因失败的 ZH 信号——有方向词就该报
+# "looks like signal"，而不是掉进 sized-entry 的"无 C/P 方向"（7/14 HOOD 误报）。
+#
+# EN 方向词要求**近旁有 strike**（紧凑 750c，或 strike 在前的 "$210 calls"）：
+# 裸 "calls"/"puts" 会误吞行情评论——7/21 "PDH here on SPY, calls up @ 3.80"
+# 三件套（SPY + calls + @3.80）全中,误报 "Parse failed (looks like signal)"。
+# 真开仓永远带 strike（"$210 calls"/"750c"/"$310 weekly calls"）,评论里的
+# "calls up"/"calls paying" 前面没数字 → 不再命中。ZH 保留裸 看涨/看跌期权
+# （中文评论里裸方向词极少,且 test_open_attempt 依赖 "买入看跌期权对冲" 命中）。
+_OPEN_SIDE_RE = _re.compile(
+    r"\b\d+(?:\.\d+)?[cp]\b"                                      # 750c / 1050p（strike+方向一体）
+    r"|\$?\d{2,}(?:\.\d+)?\s*(?:[a-z]{1,10}\s+){0,3}?(?:calls?|puts?)\b"  # $210 [weekly] calls
+    r"|看[涨跌]期权",                                             # ZH 方向词
+    _re.I,
+)
 # 价格写法：$X.XX / @X.XX / .98 fill / .98 filled
 _OPEN_PRICE_RE = _re.compile(
     r"\$\.?\d+(?:\.\d+)?"
@@ -724,6 +961,46 @@ _OPEN_PRICE_RE = _re.compile(
     r"|\.?\d+(?:\.\d+)?\s*fill(?:ed)?",
     _re.I,
 )
+
+# bot 名前缀会污染裸 ticker 启发式："KC Trades Bot:" 里的 "KC" 命中
+# `\b[A-Z]{2,5}\b`，让每条带价格的无 symbol 跟单 trim 都触发 TG
+# （7/8 一夜 ~10 条 "parser skipped" 噪音）。启发式判断前先剥掉。
+# "BANG" 是 KC 的情绪叹词（7/9 "BANG! Out half 2.45" 还是触发了 TG），
+# 全大写 4 位正好命中裸 ticker 形态，一并剥掉。
+# 只影响启发式，不影响 parser 本体。
+_BOT_NOISE_RE = _re.compile(
+    r"@everyone|KC\s*Trades\s*Bot|KC\s*交易机器人|美股会员网机器人|enrich|丰富"
+    r"|\bBANG\b",
+    _re.IGNORECASE,
+)
+
+
+def _strip_bot_noise(text: str) -> str:
+    return _BOT_NOISE_RE.sub(" ", text or "")
+
+
+# day_trade/scalp/lotto/0dte 隐含的 DTE 上限。30 天 = 宽松到不会误伤
+# "周内 lotto 放到下下周五"，又足以拦住跨年滚动（>300 天）
+_SHORT_TAG_MAX_DTE = 30
+_SHORT_TAGS = {"day_trade", "scalp", "lotto", "0dte"}
+
+
+def _suspicious_long_dte(signal: dict, msg_date) -> "str | None":
+    """短线标签 + 解析出的 DTE > 30 天 → 返回原因文本（不下单），否则 None。"""
+    expiry_d = signal.get("expiry_date")
+    if not expiry_d or not msg_date:
+        return None
+    hit_tags = _SHORT_TAGS & set(signal.get("tags") or [])
+    if not hit_tags:
+        return None
+    dte = (expiry_d - msg_date).days
+    if dte <= _SHORT_TAG_MAX_DTE:
+        return None
+    return (
+        f"{signal.get('symbol')} {signal.get('strike')}"
+        f"{(signal.get('side') or '?')[0]} 解析到期日 {expiry_d}"
+        f"（DTE={dte}），但标签 {sorted(hit_tags)} 是短线信号"
+    )
 
 
 def _looks_like_open_attempt(text: str) -> bool:
@@ -733,11 +1010,153 @@ def _looks_like_open_attempt(text: str) -> bool:
     """
     if not text:
         return False
+    text = _strip_bot_noise(text)
     return bool(
         _OPEN_TICKER_RE.search(text)
         and _OPEN_SIDE_RE.search(text)
         and _OPEN_PRICE_RE.search(text)
     )
+
+
+# ============================================================
+# 启发：enrich 风格"带仓位比例、无方向"的入场
+# ============================================================
+# 背景 7/13：enrich "$IBM weekly $310 $1.33 / 2% position"（中英×2 共 4 条）
+# 全部静默漏掉——B2 pattern 和 _looks_like_open_attempt 都硬要求 calls/puts，
+# 而 enrich 熟仓复入时会省掉方向（后续消息 "I'm in for now" 实锤是真入场）。
+# 没方向不能自动下单（不猜方向），但必须 TG 提醒人工。
+#
+# 三件套控误报（enrich 的 levels/watchlist/持仓更新都发不出来）：
+#   1. 恰好一个 $TICKER（watchlist 是一串 ticker；0 个不是信号）
+#   2. "N% position/头寸/仓位" 仓位标记（enrich 入场信号的签名格式）
+#   3. ≥2 个 $数字（strike + price；"Holding my 2% position" 这类纯状态没有）
+_SIZED_ENTRY_TICKER_RE = _re.compile(r"\$([A-Z]{1,5})\b")
+_SIZED_ENTRY_SIZE_RE = _re.compile(
+    r"\d{1,2}(?:\.\d+)?\s*%\s*(?:position|头寸|仓位)", _re.I
+)
+# scalp 简写没有仓位比例但有 NDTE（7/15 "Scalp - $MSFT 0DTE $397.50 $.90"
+# 中英双发全静默漏掉，后续 +200%）
+_SIZED_ENTRY_DTE_RE = _re.compile(r"\b\d+\s*DTE\b", _re.I)
+_SIZED_ENTRY_DOLLAR_NUM_RE = _re.compile(r"\$\s?\.?\d")
+
+
+def _looks_like_sized_entry(text: str) -> "str | None":
+    """检测 enrich 式无方向入场（N% position 或 NDTE 简写）。
+    返回命中的 symbol，未命中返回 None。"""
+    if not text:
+        return None
+    text = _strip_bot_noise(text)
+    tickers = {m.group(1) for m in _SIZED_ENTRY_TICKER_RE.finditer(text)}
+    if len(tickers) != 1:
+        return None
+    if not (_SIZED_ENTRY_SIZE_RE.search(text) or _SIZED_ENTRY_DTE_RE.search(text)):
+        return None
+    if len(_SIZED_ENTRY_DOLLAR_NUM_RE.findall(text)) < 2:
+        return None
+    return tickers.pop()
+
+
+# 双语双发 dedup：同 symbol 5 分钟只提醒一次（enrich 中英×2 一口气 4 条）
+_sized_entry_alerted: dict[str, datetime] = {}
+
+
+# ============================================================
+# 原文级消息去重
+# ============================================================
+# 7/14 起源频道把每条消息发两遍（EN×2 + ZH×2）。指纹 dedup 挡住了重复下单，
+# 但 parse-fail 告警、close-skipped TG、日志全部双份。同频道同原文 30s 内
+# 只处理第一条。窗口刻意短：KC 隔几分钟重发同文本（如同价再 trim）是
+# 真实场景，不能误吞；实测双发间隔 1-5s，30s 足够。
+_RAW_DEDUP_WINDOW = timedelta(seconds=30)
+_recent_raw: dict[tuple[int, str], datetime] = {}
+
+
+def _is_duplicate_raw(cid: int, raw: str) -> bool:
+    """同频道同原文在窗口内出现过 → True（并顺手清过期条目）。"""
+    now = datetime.now(timezone.utc)
+    for key in [k for k, ts in _recent_raw.items() if now - ts > _RAW_DEDUP_WINDOW]:
+        _recent_raw.pop(key, None)
+    key = (cid, raw)
+    if key in _recent_raw:
+        return True
+    _recent_raw[key] = now
+    return False
+
+
+# ============================================================
+# 双语孪生消息的 parse-fail 报警抑制
+# ============================================================
+# 背景 7/13：EN "MU 1050c July 15 @ 2.60" 执行成功后 ~1s，ZH 翻译版
+# "MU 1050c 7月15日 @ 2.60" parse-fail 触发 "Parse failed (looks like signal)"
+# 系统错误报警——每笔成功单后必跟一条假警报。
+# 规则：同频道 + 窗口内刚**成功下单**过的 symbol 出现在 fail 文本里 → 只 log。
+# 只认成功执行（风控拒/broker 拒不算），不同 symbol 的真漏检不受影响。
+_TWIN_SUPPRESS_WINDOW = timedelta(seconds=60)
+# (channel_id, symbol) → {"ts", "strike", "side", "price"}（开仓信号快照，
+# 供 parse-fail 报警抑制 + close 翻译孪生防护共用）
+_recent_exec: dict[tuple[int, str], dict] = {}
+
+
+def _record_recent_exec(cid: int, signal: dict):
+    now = datetime.now(timezone.utc)
+    # 顺手清掉过期条目，dict 不增长
+    for key in [k for k, e in _recent_exec.items() if now - e["ts"] > _TWIN_SUPPRESS_WINDOW]:
+        _recent_exec.pop(key, None)
+    _recent_exec[(cid, signal["symbol"])] = {
+        "ts": now,
+        "strike": signal.get("strike"),
+        "side": signal.get("side"),
+        "price": signal.get("price"),
+    }
+
+
+def _twin_of_recent_exec(text: str, cid: int) -> "str | None":
+    """fail 文本是否像"刚执行过的信号"的翻译孪生。返回命中 symbol 或 None。"""
+    now = datetime.now(timezone.utc)
+    for (c, sym), entry in _recent_exec.items():
+        if c != cid or now - entry["ts"] > _TWIN_SUPPRESS_WINDOW:
+            continue
+        # ZH 文本里汉字紧贴 ticker，\b 不触发——用 lookaround（同 BARE_SYM_PATTERN_ZH）
+        if _re.search(rf"(?<![A-Za-z0-9]){_re.escape(sym)}(?![A-Za-z0-9])", text):
+            return sym
+    return None
+
+
+def _close_is_open_twin(cid: "int | None", symbol: str, parsed: dict) -> "str | None":
+    """CLOSE 信号是否疑似"刚成功开仓的 OPEN 消息"的翻译孪生。返回原因或 None。
+
+    7/15 实测：SPY 开仓 2s 后，ZH 孪生把 "smaller size" 机翻成"小规模减仓"，
+    close parser 完整解析出 SPY 760c pct=33 @3.00（== 开仓价），一路走到卖出
+    计算，只靠 runner-preserve（恰好持 1 张）才没把刚开的仓原价卖掉。
+
+    判定：同频道 + 窗口内刚成功开仓过该 symbol，且满足其一——
+      a. close 喊价 ≈ 开仓信号价（±1%；同一条消息的翻译价格必然相同）
+      b. close 的 strike+side hint == 刚开的合约
+    真砍仓通常在几分钟后且价格/pnl 已变化；60s 内"同价平仓"只有机翻场景。
+    误杀时有 TG 提示，用户可手动补平。
+    """
+    if cid is None:
+        return None
+    entry = _recent_exec.get((cid, symbol))
+    if not entry:
+        return None
+    age = (datetime.now(timezone.utc) - entry["ts"]).total_seconds()
+    if age > _TWIN_SUPPRESS_WINDOW.total_seconds():
+        return None
+    close_price = parsed.get("signal_price")
+    open_price = entry.get("price")
+    if close_price is not None and open_price and abs(close_price - open_price) <= open_price * 0.01:
+        return (
+            f"{symbol} {age:.0f}s 前刚开仓 @ {open_price}，close 喊价相同"
+        )
+    if (parsed.get("hint_strike") is not None
+            and parsed.get("hint_strike") == entry.get("strike")
+            and parsed.get("hint_side") == entry.get("side")):
+        return (
+            f"{symbol} {age:.0f}s 前刚开仓 "
+            f"{entry.get('strike')}{(entry.get('side') or '?')[0]}，close 指向同一合约"
+        )
+    return None
 
 
 # ============================================================
@@ -769,6 +1188,7 @@ def _looks_like_addon_attempt(text: str) -> "str | None":
     """
     if not text:
         return None
+    text = _strip_bot_noise(text)
     has_kw = bool(_ADDON_KEYWORD_RE.search(text)) or any(
         k in text for k in _ZH_ADDON_KEYWORDS
     )
@@ -799,6 +1219,7 @@ def _looks_like_close_attempt(text: str) -> bool:
     """
     if not text:
         return False
+    text = _strip_bot_noise(text)
     has_ticker = bool(_OPEN_TICKER_RE.search(text)) or any(t in text for t in _ZH_TICKER_HINTS)
     # 价格-like：$X / @X / 任何 d.dd（不用 \b 边界，因为中文+数字无 word boundary）
     has_price_hint = bool(_re.search(r"\$\.?\d|@\s*\.?\d|\d+\.\d{1,2}", text))

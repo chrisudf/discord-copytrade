@@ -30,8 +30,9 @@ import asyncio
 import os
 from typing import Optional
 
-from src.broker.moomoo_client import place_sell_order, get_last_price
+from src.broker.moomoo_client import place_sell_order, get_last_prices
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.notifier.telegram_client import (
     send_telegram, format_close_filled, format_error,
 )
@@ -39,7 +40,11 @@ from src.utils.logger import logger
 
 
 def _cfg() -> dict:
-    """实时读取配置，便于 .env 改动不重启即生效（与 DRY_RUN 同策略）。"""
+    """每次调用重读 os.environ（方便测试 monkeypatch）。
+
+    注意：这**不是** .env 热更新——load_dotenv 只在 import 时跑一次，
+    运行中编辑 config/.env 不会生效，改配置需要重启进程。
+    """
     return {
         "sl_pct": float(os.getenv("STOP_LOSS_PCT", "0.50")),
         "interval": int(os.getenv("SL_POLL_INTERVAL", "5")),
@@ -66,51 +71,89 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
         return
     _triggered.add(code)
 
-    qty = pos["qty_remaining"]
-    limit = round(last_price * (1 - sell_slip), 2)
-    if limit <= 0:
-        # 极低价兜底——0.01 起挂
-        limit = 0.01
+    async with position_mgr.sell_lock(code):
+        # 锁内重读：等锁期间可能已被 TP/EOD/CLOSE 卖掉（部分或全部）
+        pos = position_mgr.get(code) or pos
+        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+            logger.debug(f"[sl] {code} already closed while waiting for lock, skip")
+            _triggered.discard(code)  # 没有卖出发生，维持 set 只含"已卖未落库"的不变式
+            return
 
-    logger.warning(
-        f"[sl] 🛑 TRIGGER {code}: last={last_price:.2f} <= threshold={threshold:.2f} "
-        f"(entry={pos['avg_entry_price']:.2f}), selling {qty} @ {limit}"
-    )
+        qty = pos["qty_remaining"]
+        limit = round(last_price * (1 - sell_slip), 2)
+        if limit <= 0:
+            # 极低价兜底——0.01 起挂
+            limit = 0.01
 
-    try:
-        result = await asyncio.to_thread(
-            place_sell_order,
-            option_code=code, qty=qty,
-            limit_price=limit, remark="sl_polling",
+        logger.warning(
+            f"[sl] 🛑 TRIGGER {code}: last={last_price:.2f} <= threshold={threshold:.2f} "
+            f"(entry={pos['avg_entry_price']:.2f}), selling {qty} @ {limit}"
         )
-    except Exception as e:
-        logger.exception("[sl] place_sell_order failed")
-        await send_telegram(format_error("SL sell error", f"{code}\n{e}"))
-        _triggered.discard(code)  # 让下一轮重试
-        return
 
-    if not result.get("success"):
-        err = result.get("message", "unknown")
-        logger.error(f"[sl] sell rejected: {err}")
-        await send_telegram(format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
-        _triggered.discard(code)
-        return
+        try:
+            result = await asyncio.to_thread(
+                place_sell_order,
+                option_code=code, qty=qty,
+                limit_price=limit, remark="sl_polling",
+            )
+        except Exception as e:
+            logger.exception("[sl] place_sell_order failed")
+            await send_telegram(format_error("SL sell error", f"{code}\n{e}"))
+            _triggered.discard(code)  # 让下一轮重试
+            return
 
-    try:
-        position_mgr.on_close_filled(
-            option_code=code,
-            qty_sold=result.get("qty", qty),
-            fill_price=result.get("price", limit),
-            trigger_source="sl_polling",
-            order_id=result.get("order_id"),
-            note=f"SL: last={last_price:.2f} threshold={threshold:.2f} entry={pos['avg_entry_price']:.2f}",
-        )
-        # DB 已转 CLOSED —— 释放 code，同合约日后 reopen 时 SL 仍然有效
-        _triggered.discard(code)
-    except Exception as e:
-        # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
-        # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单
-        logger.error(f"[sl] on_close_filled failed: {e}")
+        if not result.get("success"):
+            err = result.get("message", "unknown")
+            if result.get("naked_short"):
+                # broker 说没这么多 long → 脱钩。核销本地(0→CLOSED),停止每 tick 重挂;
+                # discard 让 code 不冻结,日后 reopen 时 SL 仍生效。只首次核销告警一次。
+                bq = result.get("broker_qty", 0)
+                changed = position_mgr.reconcile_to_broker(code, bq)
+                logger.error(
+                    f"[sl] naked-short desync {code}: broker long={bq}, "
+                    f"reconciled local DB (changed={changed})"
+                )
+                _triggered.discard(code)
+                if changed:
+                    await send_telegram(format_error(
+                        "持仓脱钩已核销",
+                        f"{code}: broker 实际持有 {bq} 张,本地 DB 高估。已核销并停止止损重试。\n"
+                        f"请核对 moomoo 持仓（必要时跑 scripts/sync_positions.py）。"
+                    ))
+                return
+            logger.error(f"[sl] sell rejected: {err}")
+            await send_telegram(format_error("SL sell rejected", f"{code} qty={qty}\n{err}"))
+            _triggered.discard(code)
+            return
+
+        try:
+            position_mgr.on_close_filled(
+                option_code=code,
+                qty_sold=result.get("qty", qty),
+                fill_price=result.get("price", limit),
+                trigger_source="sl_polling",
+                order_id=result.get("order_id"),
+                note=f"SL: last={last_price:.2f} threshold={threshold:.2f} entry={pos['avg_entry_price']:.2f}",
+            )
+            # DB 已转 CLOSED —— 释放 code，同合约日后 reopen 时 SL 仍然有效
+            _triggered.discard(code)
+        except Exception as e:
+            # 卖出成功但落库失败：DB 仍显示 OPEN。保留在 _triggered 里
+            # 冻结该 code 的 SL，防止下轮对已卖出的仓位重复挂卖单。
+            # 必须 TG 告警——冻结意味着该合约失去自动止损，且 DB 与 broker
+            # 已脱钩，只写日志半夜没人看得到。
+            logger.error(f"[sl] on_close_filled failed: {e}")
+            await send_telegram(format_error(
+                "SL 记账失败，已冻结该合约的 SL 自动触发",
+                f"{code}: 卖单已提交（order={result.get('order_id')}）但 DB 更新失败。\n"
+                f"请核对 moomoo 持仓并跑 scripts/sync_positions.py 对账，"
+                f"然后重启 bot 恢复该合约的 SL。"
+            ))
+
+        # 卖单成交确认：SL 场景价格在跌，限价单挂不上很常见——未成交必须告警
+        fill_checker.spawn(fill_checker.confirm_sell_fill(
+            result.get("order_id") or "", code, result.get("qty", qty), "sl_polling",
+        ))
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
@@ -120,7 +163,12 @@ async def _trigger_sl(pos: dict, last_price: float, threshold: float, sell_slip:
 
 
 async def _sl_tick():
-    """单轮检查。可独立测试。"""
+    """单轮检查。可独立测试。
+
+    批量取价（7/8 改造）：之前每仓位一次 get_last_price = 一次 snapshot RTT，
+    N 个仓位 × 5s tick 会打满 moomoo 60 次/30s 频率配额（连 validate 都被
+    挤到限频）。现在整个 tick 只发一次 get_last_prices。
+    """
     cfg = _cfg()
     positions = [
         p for p in position_mgr.get_open_positions()
@@ -129,9 +177,11 @@ async def _sl_tick():
     if not positions:
         return
 
+    codes = [p["option_code"] for p in positions]
+    prices = await asyncio.to_thread(get_last_prices, codes)
+
     for pos in positions:
-        code = pos["option_code"]
-        last = await asyncio.to_thread(get_last_price, code)
+        last = prices.get(pos["option_code"])
         if last is None:
             continue
         threshold = pos["avg_entry_price"] * (1 - cfg["sl_pct"])

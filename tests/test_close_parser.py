@@ -193,17 +193,23 @@ def test_action_scope_filters_commentary_symbols():
 
 # ========== 中文 fallback ==========
 
-def test_zh_chinese_company_name_returns_none(caplog):
-    """中文公司名不再映射 → ZH 返回 None + [zh_unrecognized] warning。
+def test_zh_chinese_company_name_maps_when_held():
+    """7/8 起：高频中文公司名走最小映射（白名单门控）。
 
-    依赖：1-3s 后 EN 版本会正确处理（见 test_en_handles_same_signal_as_zh_missed）。
+    '减仓亚马逊' + 持仓 AMZN → 直接解析，不再依赖 1-3s 后的 EN 版本兜底。
     """
-    import logging
-    caplog.set_level(logging.WARNING, logger="src.parser.close_parser")
     r = parse_close("KC Trades Bot:减仓亚马逊", OPEN_NOW_SET)
-    assert r is None
-    # warning 应被记录（便于运营时看实际漏哪些）
-    # loguru 不走 stdlib logging，所以这里只检查行为；warning 在运行时可见
+    assert r is not None
+    assert r["symbols"] == ["AMZN"]
+    assert r["lang"] == "zh"
+
+
+def test_zh_unmapped_company_name_still_none():
+    """映射表外的公司名（或未持仓）仍然 None → [zh_unrecognized]，EN 版本兜底。"""
+    # 未持仓：亚马逊在映射表里但 AMZN 不在白名单
+    assert parse_close("KC Trades Bot:减仓亚马逊", {"MSFT"}) is None
+    # 映射表外的公司名
+    assert parse_close("KC Trades Bot:减仓甲骨文", OPEN_NOW_SET) is None
 
 
 def test_en_handles_same_signal_as_zh_missed():
@@ -655,3 +661,235 @@ def test_date_not_mistaken_for_fraction():
     assert r is not None
     assert r["symbols"] == ["SPY"]
     assert r["pct"] == 33
+
+
+# === "out" 短语词边界回归（review 0012）===
+
+def test_overall_does_not_escalate_to_full_close():
+    """回归：'overall outlook' 跨词边界含 'all out' 子串，
+    旧 substring 匹配把普通 trim 升级成 100% 全平。"""
+    r = parse_close("Trimmed SPY here @ 3.00, overall outlook still bullish", {"SPY"})
+    assert r is not None
+    assert r["pct"] == 33  # trim 默认，绝不能是 100
+
+
+def test_out_half_sells_fifty_pct():
+    """'out half' 应该卖 50%，不是默认 33%。"""
+    r = parse_close("out half TSLA @ 8.05", {"TSLA"})
+    assert r is not None
+    assert r["pct"] == 50
+
+
+def test_out_full_is_full_close():
+    r = parse_close("out full TSLA @ 8.05", {"TSLA"})
+    assert r is not None
+    assert r["pct"] == 100
+
+
+# === 7/8 复盘回归：公司名映射 / BULK 例外 / 仓位标注 / stop at entry ===
+
+def test_all_out_company_name_maps_to_held_ticker():
+    """7/7 'all out apple' —— EN 公司名 + 持仓白名单 → AAPL 全平 100%"""
+    r = parse_close(
+        "KC Trades Bot:all out apple to secure green trade 🙏🏼 "
+        "will look to re-enter again for a put swing again",
+        {"AAPL"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["AAPL"]
+    assert r["pct"] == 100
+
+
+def test_company_name_without_holding_stays_none():
+    """没持仓 AAPL 时 'apple' 只是闲聊，不映射（白名单门控）。"""
+    r = parse_close("all out apple to secure green trade", {"MSFT"})
+    assert r is None
+
+
+def test_zh_company_name_maps_to_held_ticker():
+    """7/8 '💥苹果！！减仓3.15' —— ZH 公司名 + 白名单 → AAPL trim 33%"""
+    r = parse_close("KC交易机器人：💥苹果！！减仓3.15💰", {"AAPL"})
+    assert r is not None
+    assert r["symbols"] == ["AAPL"]
+    assert r["pct"] == 33
+    assert r["lang"] == "zh"
+
+
+def test_zh_chuqing_full_close():
+    """ZH '全部出清苹果仓位' → 出清 = 全平 100%"""
+    r = parse_close("KC 交易机器人：全部出清苹果仓位，确保交易盈利。", {"AAPL"})
+    assert r is not None
+    assert r["symbols"] == ["AAPL"]
+    assert r["pct"] == 100
+
+
+def test_bulk_close_all_with_exclusion_and_size_annotation():
+    """7/8 enrich 'Closing all positions outside of the $IBM $310 lotto -
+    this is a 1% position'：
+    - '1% position' 是仓位大小标注，不是 trim 比例（曾被读成 pct=1）
+    - 'closing all positions' 无显式比例 → 全清 100（不是 bulk 默认 50）
+    - 'outside of $IBM' → IBM 进例外表
+    """
+    r = parse_close(
+        "Alright - here's what I'm doing: Closing all positions outside of "
+        "the $IBM $310 lotto - this is a 1% position - I am 99% cash",
+        {"IBM", "DELL", "LLY"},
+    )
+    assert r is not None
+    assert r["kind"] == "BULK_TRIM"
+    assert r["pct"] == 100
+    assert r["exclude_symbols"] == ["IBM"]
+
+
+def test_trimming_all_positions_keeps_bulk_default():
+    """'trimming all positions' 无比例 → 仍是 bulk 默认 50，不升级 100"""
+    r = parse_close("trimming all positions at the open", {"IBM"})
+    assert r["kind"] == "BULK_TRIM"
+    assert r["pct"] == 50
+
+
+def test_stop_at_entry_not_breakeven_pnl():
+    """7/8 'trimmed AAPL +20% stop at entry' —— 'stop at entry' 是移止损备注，
+    pnl 应取 +20 而非被误判为保本 0。"""
+    r = parse_close("KC Trades Bot:trimmed AAPL +20% 💰 stop at entry", {"AAPL"})
+    assert r is not None
+    assert r["signal_pnl_pct"] == 20.0
+    assert r["pct"] == 33  # +20% 是 PnL 不是 trim 比例
+
+
+def test_bare_trim_imperative():
+    """7/9 'trim SPY runner at 3.10' —— 祈使式裸 trim 也是动作动词
+    （detect_action 认但 close_parser 曾拒，靠 ZH 孪生兜的底）。"""
+    r = parse_close(
+        "KC Trades Bot:trim SPY runner at 3.10 💰 leaving the rest for a "
+        "free swing trade into Friday for fun now! 😎",
+        {"SPY"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 33
+    assert r["signal_price"] == 3.10
+
+
+# === 7/10 事故回归：strike-hint 全文回退 / hold-context / 一半 ===
+
+def test_strike_hint_survives_sentence_split():
+    """7/10 事故消息：'SPY 755c IN THE MONEY! Closed @ 4.40' ——
+    hint 在感叹句、动作在下一句，分句后 hint 曾丢失 → symbol-only 匹配
+    把我们的 SPY put 当 call 平掉。现在 scope 未命中回退全文。"""
+    r = parse_close("KC Trades Bot:SPY 755c IN THE MONEY! Closed @ 4.40 💰", {"SPY"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 100
+    assert r["hint_strike"] == 755.0
+    assert r["hint_side"] == "CALL"
+
+
+def test_hold_context_symbol_not_close_target():
+    """7/10 near-miss：'+100% on SPY closed out ... just have runners on the
+    NVDA call swings' —— NVDA 是继续持有的对象，不是 close 目标。"""
+    msg = ("KC Trades Bot:no new swings for me, +100% on SPY closed out now "
+           "and just have runners on the NVDA call swings 🚀💰")
+    # 只持 NVDA（实况：SPY 已出白名单）→ 不应产出任何 close
+    assert parse_close(msg, {"NVDA"}) is None
+    # SPY 也在持仓时 → 只平 SPY，NVDA 仍被排除
+    r = parse_close(msg, {"SPY", "NVDA"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 100
+
+
+def test_zh_hold_context_symbol_excluded():
+    """ZH 孪生：'SPY已平仓获利+100%，仅保留NVDA看涨波段的持仓'"""
+    msg = "KC交易机器人：本日无新波段交易，SPY已平仓获利+100%，仅保留NVDA看涨波段的持仓🚀💰"
+    assert parse_close(msg, {"NVDA"}) is None
+    r = parse_close(msg, {"SPY", "NVDA"})
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+    assert r["pct"] == 100
+    assert r["lang"] == "zh"
+
+
+def test_zh_yiban_is_fifty_pct():
+    """7/10 '减仓一半' → 50%（曾落默认 33，与 EN 孪生 'out half'=50 指纹不匹配）"""
+    r = parse_close(
+        "KC Trades Bot: 嘭！206成交！NVDA以3.60美元成交 💰 减仓一半，止损设在入场价",
+        {"NVDA"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["NVDA"]
+    assert r["pct"] == 50
+
+
+def test_zh_jianban_verb_and_fifty():
+    """'减半仓' 是动作动词（"减仓"非其连续子串，旧词表接不住）且 pct=50"""
+    r = parse_close("减半仓 NVDA @ 2.45", {"NVDA"})
+    assert r is not None
+    assert r["pct"] == 50
+
+
+def test_trimmed_runner_of_symbol_still_closes():
+    """方向性检查：'trimmed 1 SPY runner @ 4.00' 是在 trim SPY（合法 close），
+    不能被 'runners on X' 的 hold 排除误伤。"""
+    r = parse_close(
+        "KC Trades Bot:trimmed 1 SPY runner here at 4.00 🚀 leaving 1 for in the money! 💰",
+        {"SPY"},
+    )
+    assert r is not None
+    assert r["symbols"] == ["SPY"]
+
+
+# ============ besides/除了 hold-context（7/15 "全现金只留 HOOD"） ============
+
+def test_hold_context_besides_en():
+    from src.parser.close_parser import _extract_symbols
+    text = ("All cash now besides $HOOD 1.5% position. WHAT A DAY.\n\n"
+            "Selling into strength is key, we timed that perfectly.")
+    assert _extract_symbols(text, {"HOOD"}) == []
+
+
+def test_hold_context_chule_zh():
+    from src.parser.close_parser import _extract_zh_symbols
+    text = "除了 $HOOD 1.5% 的头寸外，现在全是现金。真是一天。"
+    assert _extract_zh_symbols(text, {"HOOD"}) == []
+
+
+# ============ lock-in 平仓解析 + EN 周报 recap（7/17） ============
+
+def test_lock_in_close_parses_symbols():
+    from src.parser.close_parser import parse_close
+    p = parse_close("enrich:\n$XOM LOCK THEM ALL ON\n\n@everyone $alert", {"XOM"})
+    assert p is not None
+    assert p["symbols"] == ["XOM"]
+
+
+def test_weekly_recap_en_skipped():
+    """7/17 06:30 真实消息：EN 版曾被当 BULK close 解析出 7 个 symbol，
+    扇出 3 条 runner-preserve TG；ZH 版"每周回顾"一直会跳。"""
+    from src.parser.close_parser import parse_close
+    text = (
+        "enrich:\nWeekly recap, 7/13:\n\n$GOOGL 1,200%+\n$XOM 265%+\n"
+        "$META 260%+\n$MSFT 140%\n$ARM 100%+\n$HOOD 50%\n\n"
+        "$IBM x (terrible news overnight)\n\n"
+        "Came out of the week with one loss. Make sure you are selling "
+        "into strength.\n\n@everyone $alert"
+    )
+    assert parse_close(text, {"XOM", "ARM", "HOOD"}) is None
+
+
+def test_watchlist_with_lock_advice_skipped():
+    """watchlist 帖内文常带 "lock in profits" 建议——detect 会路由 CLOSE，
+    close parser 必须按 recap 拦掉（语料回放发现的 lock-in 副作用）。"""
+    from src.parser.close_parser import parse_close
+    text = (
+        "enrich:\nWatchlist for tomorrow, 4/23:\n\n"
+        "Crushed our $ARM swing today for 450%. "
+        "Make sure to lock in profits along the way.\n\n@everyone"
+    )
+    assert parse_close(text, {"ARM"}) is None
+
+
+def test_zh_watchlist_skipped():
+    from src.parser.close_parser import parse_close
+    text = "丰富：\n明天的观察列表，5/12：\n\n今天我们在TSLA上赚了160%。锁定收益。\n\n@everyone"
+    assert parse_close(text, {"TSLA"}) is None

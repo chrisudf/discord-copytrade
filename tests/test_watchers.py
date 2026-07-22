@@ -4,6 +4,7 @@
 """
 import asyncio
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch, AsyncMock
 from zoneinfo import ZoneInfo
@@ -11,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.storage import positions_db
-from src.position import manager, sl_watcher, eod_watcher
+from src.position import manager, sl_watcher, eod_watcher, tp_watcher
 
 
 ET_TZ = ZoneInfo("America/New_York")
@@ -47,9 +48,17 @@ def _quote_for(code: str, price):
     """生成一个只对指定 code 返回价格、其他返回 None 的 get_last_price mock。
 
     避免前面 test 留下的 OPEN 仓位被本 test 的 mock 一起命中。
+    （EOD watcher 仍用逐个接口；SL/TP 已改批量 → 用 _quotes_for）
     """
     def _f(c):
         return price if c == code else None
+    return _f
+
+
+def _quotes_for(code: str, price):
+    """批量版 get_last_prices mock：只对指定 code 返回价格，其他 None。"""
+    def _f(codes):
+        return {c: (price if c == code else None) for c in codes}
     return _f
 
 
@@ -61,7 +70,7 @@ async def test_sl_triggers_on_threshold():
     sl_watcher._triggered.discard(code)
 
     os.environ["STOP_LOSS_PCT"] = "0.50"
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order",
                return_value={"success": True, "qty": 3, "price": 0.37,
                              "order_id": "SL_ORD_1", "code": code}), \
@@ -87,7 +96,7 @@ async def test_sl_skips_above_threshold():
 
     os.environ["STOP_LOSS_PCT"] = "0.50"
     sell_mock = AsyncMock()
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.60)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.60)), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -113,7 +122,7 @@ async def test_sl_skips_apply_sl_false():
     sl_watcher._triggered.discard(code)
 
     sell_mock = AsyncMock()
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.05)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.05)), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -130,7 +139,8 @@ async def test_sl_skips_when_quote_unavailable():
     sl_watcher._triggered.discard(code)
 
     sell_mock = AsyncMock()
-    with patch("src.position.sl_watcher.get_last_price", return_value=None), \
+    with patch("src.position.sl_watcher.get_last_prices",
+               side_effect=lambda codes: {c: None for c in codes}), \
          patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -152,7 +162,7 @@ async def test_sl_triggered_set_released_after_success_allows_reopen():
     os.environ["STOP_LOSS_PCT"] = "0.50"
     sell_ok = {"success": True, "qty": 1, "price": 0.37,
                "order_id": "SL_ORD_5", "code": code}
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -162,7 +172,7 @@ async def test_sl_triggered_set_released_after_success_allows_reopen():
 
     # reopen 同 code，再次深跌 → SL 必须再次触发
     _open_weekly("SLT5", code, qty=1, entry=1.00)
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok), \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock):
         await sl_watcher._sl_tick()
@@ -183,7 +193,7 @@ async def test_sl_triggered_set_kept_when_record_close_fails():
     os.environ["STOP_LOSS_PCT"] = "0.50"
     sell_ok = {"success": True, "qty": 1, "price": 0.37,
                "order_id": "SL_ORD_6", "code": code}
-    with patch("src.position.sl_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
          patch("src.position.sl_watcher.place_sell_order", return_value=sell_ok) as sell_mock, \
          patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock), \
          patch.object(sl_watcher.position_mgr, "on_close_filled",
@@ -268,6 +278,37 @@ async def test_eod_force_closes_matching_expiry():
 
 
 @pytest.mark.asyncio
+async def test_eod_force_closes_weekly_expiring_today():
+    """周初开的 weekly（eod_force_close=False）到期日当天也必须被强平。
+
+    回归：老逻辑要求 eod_force_close=True，而该 flag 只在开仓当天 DTE==0 时置位，
+    导致提前几天开的仓位在到期日直接过期（ITM 自动行权）。
+    """
+    now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
+    while now_et.weekday() >= 5:
+        now_et = now_et - timedelta(days=1)
+    today_et = now_et.date()
+    code = _uniq_code("EODW")
+    positions_db.open_or_add(
+        option_code=code, symbol="EODTW", strike=10.0, side="CALL",
+        expiry=today_et, qty=2, fill_price=1.00,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+
+    with patch("src.position.eod_watcher.get_last_price", return_value=0.30), \
+         patch("src.position.eod_watcher.place_sell_order",
+               return_value={"success": True, "qty": 2, "price": 0.27,
+                             "order_id": "EOD_ORD_W", "code": code}), \
+         patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock), \
+         patch("src.position.eod_watcher._is_eod_window", return_value=True):
+        await eod_watcher._eod_tick(now_et)
+
+    pos = positions_db.get(code)
+    assert pos["status"] == "CLOSED"
+
+
+@pytest.mark.asyncio
 async def test_eod_skips_future_expiry():
     """eod_force_close=True 但 expiry 不是今天 → 不动"""
     future = date(2026, 12, 19)
@@ -303,4 +344,148 @@ async def test_eod_skips_before_window():
     # 收尾：这是个 today expiry + eod_force_close 的 lurking 仓位，
     # 不清会被下一个 test 的 _eod_tick 一锅端
     positions_db.record_close(code, qty_sold=1, fill_price=1.0,
+                              trigger_source="manual", note="ut cleanup")
+
+
+# ============ 卖出串行化 ============
+
+@pytest.mark.asyncio
+async def test_sell_lock_prevents_concurrent_double_sell():
+    """SL 与 EOD 并发触发同一仓位 → 只有一条卖单提交。
+
+    回归：之前四条卖出路径各自"读仓位 → await broker → 写 DB"，
+    两条路径可同时读到 qty_remaining=2 并各卖 2 张（broker 端超卖）。
+    现在 per-option_code 锁 + 锁内重读，后到者看到 CLOSED 直接跳过。
+    """
+    now_et = datetime.now(ET_TZ).replace(hour=15, minute=51, second=0, microsecond=0)
+    while now_et.weekday() >= 5:
+        now_et = now_et - timedelta(days=1)
+    today_et = now_et.date()
+    code = _uniq_code("LCK")
+    positions_db.open_or_add(
+        option_code=code, symbol="LCKT", strike=10.0, side="CALL",
+        expiry=today_et, qty=2, fill_price=1.00,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+    sl_watcher._triggered.discard(code)
+    eod_watcher._skip_until.pop(code, None)
+
+    calls = []
+
+    def slow_sell(option_code, qty, limit_price, remark):
+        time.sleep(0.05)  # 模拟 broker RTT，制造并发窗口
+        calls.append((option_code, qty, remark))
+        return {"success": True, "qty": qty, "price": limit_price,
+                "order_id": f"ORD{len(calls)}", "code": option_code}
+
+    with patch("src.position.sl_watcher.place_sell_order", side_effect=slow_sell), \
+         patch("src.position.eod_watcher.place_sell_order", side_effect=slow_sell), \
+         patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
+         patch("src.position.eod_watcher.get_last_price", side_effect=_quote_for(code, 0.40)), \
+         patch("src.position.sl_watcher.send_telegram", new_callable=AsyncMock), \
+         patch("src.position.eod_watcher.send_telegram", new_callable=AsyncMock):
+        pos = positions_db.get(code)
+        await asyncio.gather(
+            sl_watcher._trigger_sl(pos, 0.40, 0.50, 0.08),
+            eod_watcher._force_close(dict(pos), 0.10, now_et.timestamp()),
+        )
+
+    assert len(calls) == 1, f"expected exactly 1 sell order, got {calls}"
+    assert positions_db.get(code)["status"] == "CLOSED"
+
+
+# ============ EOD 时窗上界（7/15 收盘后告警到 18:50 ET） ============
+
+def test_eod_window_ends_after_market_close():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from src.position.eod_watcher import _is_eod_window
+
+    ET = ZoneInfo("America/New_York")
+    wed = lambda h, m: datetime(2026, 7, 15, h, m, tzinfo=ET)  # 周三
+    assert _is_eod_window(wed(15, 30), 15, 50) is False  # 未到 cutoff
+    assert _is_eod_window(wed(15, 55), 15, 50) is True   # 时窗内
+    assert _is_eod_window(wed(16, 4), 15, 50) is True    # 收盘+5min 余量内
+    assert _is_eod_window(wed(16, 10), 15, 50) is False  # 收盘后：合约命运已定
+    assert _is_eod_window(wed(18, 50), 15, 50) is False  # 7/15 实测噪音时点
+
+
+# ============ naked-short 脱钩:核销 + 停止重试风暴（7/21 复盘） ============
+
+def _naked_short_result(code, qty):
+    return {
+        "success": False, "naked_short": True, "broker_qty": 0,
+        "message": "naked-short refused: broker has only 0 long...",
+        "order_id": None, "code": code, "qty": qty, "price": 0.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sl_naked_short_reconciles_and_stops_storm():
+    """SL 卖单被 naked-short 拒 → 核销成 CLOSED,第二轮不再挂卖单(风暴停止)。"""
+    code = _uniq_code("SLNAKED")
+    _open_weekly("SLNK", code, qty=1, entry=1.00)
+    sl_watcher._triggered.discard(code)
+
+    os.environ["STOP_LOSS_PCT"] = "0.50"
+    sell_mock = lambda **kw: _naked_short_result(code, kw["qty"])
+    tg = AsyncMock()
+    with patch("src.position.sl_watcher.get_last_prices", side_effect=_quotes_for(code, 0.40)), \
+         patch("src.position.sl_watcher.place_sell_order", side_effect=sell_mock) as sell, \
+         patch("src.position.sl_watcher.send_telegram", tg):
+        await sl_watcher._sl_tick()
+        # 第一轮:触发一次卖单被拒 → 核销
+        assert sell.call_count == 1
+        pos = positions_db.get(code)
+        assert pos["status"] == "CLOSED" and pos["qty_remaining"] == 0
+        # 第二轮:仓位已 CLOSED,退出 get_open_positions → 不再挂卖单
+        await sl_watcher._sl_tick()
+        assert sell.call_count == 1  # 没有增长 = 风暴停止
+
+    assert tg.await_count == 1  # 只告警一次
+
+
+@pytest.mark.asyncio
+async def test_tp_naked_short_reconciles_and_stops_storm():
+    """TP T1 卖单被 naked-short 拒 → 核销成 CLOSED,第二轮不再挂卖单。"""
+    code = _uniq_code("TPNAKED")
+    # entry 1.0, weekly T1 阈值 = 1.5;报价 2.0 → T1 命中
+    _open_weekly("TPNK", code, qty=1, entry=1.00)
+
+    sell_mock = lambda **kw: _naked_short_result(code, kw["qty"])
+    tg = AsyncMock()
+    with patch("src.position.tp_watcher.get_last_prices", side_effect=_quotes_for(code, 2.00)), \
+         patch("src.position.tp_watcher.place_sell_order", side_effect=sell_mock) as sell, \
+         patch("src.position.tp_watcher.send_telegram", tg):
+        await tp_watcher._tp_tick()
+        assert sell.call_count == 1
+        pos = positions_db.get(code)
+        assert pos["status"] == "CLOSED" and pos["qty_remaining"] == 0
+        await tp_watcher._tp_tick()
+        assert sell.call_count == 1  # 风暴停止
+
+    assert tg.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_tp_ordinary_rejection_still_retries_next_tick():
+    """非 naked-short 的普通拒单仍允许下轮重试(不误判成脱钩核销)。"""
+    code = _uniq_code("TPRETRY")
+    _open_weekly("TPRT", code, qty=1, entry=1.00)
+
+    def _reject(**kw):
+        return {"success": False, "message": "rate limited",
+                "order_id": None, "code": code, "qty": kw["qty"], "price": 0.5}
+    tg = AsyncMock()
+    with patch("src.position.tp_watcher.get_last_prices", side_effect=_quotes_for(code, 2.00)), \
+         patch("src.position.tp_watcher.place_sell_order", side_effect=_reject) as sell, \
+         patch("src.position.tp_watcher.send_telegram", tg):
+        await tp_watcher._tp_tick()
+        await tp_watcher._tp_tick()
+        # 普通拒单不核销 → 仓位仍 OPEN,每轮都重挂
+        assert sell.call_count == 2
+        assert positions_db.get(code)["status"] == "OPEN"
+    # 收尾
+    positions_db.record_close(code, qty_sold=1, fill_price=2.0,
                               trigger_source="manual", note="ut cleanup")

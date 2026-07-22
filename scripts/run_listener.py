@@ -12,6 +12,7 @@ import sys
 import os
 import asyncio
 import signal
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,9 +29,12 @@ from src.listener.discord_client import handle_message
 from src.notifier.telegram_client import send_telegram, format_error
 from src.risk.risk_manager import get_daily_stats
 from src.broker.moomoo_client import (
-    probe_broker, probe_quote_access,
+    probe_broker, probe_quote_access, close_ctx,
     QUOTE_OK, QUOTE_DELAYED, QUOTE_NO_PERMISSION, QUOTE_ERROR,
 )
+from src.position.sl_watcher import run_sl_watcher
+from src.position.eod_watcher import run_eod_watcher, sweep_expired_and_notify
+from src.position.tp_watcher import run_tp_watcher
 
 
 # ============ 启动检查 ============
@@ -158,6 +162,10 @@ async def on_ready():
     # 仅首次 on_ready 做完整频道校验（REST fetch），重连只 log 不重新探测
     if _startup_notified:
         _log_reconnect_time("logged back in")
+        # on_ready（而非 on_resumed）= 完整重登录，gateway session 已丢，
+        # 掉线窗口内的消息**不会被重放**（7/20 一夜 ~25 次完整重登录 ×3s ≈
+        # 75s 盲区）。主动拉频道历史回补，_seen(msg_id) 去重保证幂等。
+        await _backfill_missed()
         return
     _startup_notified = True
 
@@ -165,7 +173,9 @@ async def on_ready():
     enabled_count = len(registry.enabled_channel_ids())
 
     if failures:
-        lines = "\n".join(f"• {name} (id={cid}): {reason}" for cid, name, reason in failures)
+        lines = "\n".join(
+            f"• {name} (id={cid}): {reason}" for cid, name, reason, _ in failures
+        )
         try:
             await send_telegram(
                 f"⚠️ 频道配置校验失败\n"
@@ -175,9 +185,11 @@ async def on_ready():
             )
         except Exception as e:
             logger.warning(f"Telegram channel-failure notify failed: {e}")
-        if len(failures) == enabled_count:
+        # 只有全部失败且全部确定性（404/403）才退出；瞬时失败重连自愈
+        all_definitive = all(definitive for _, _, _, definitive in failures)
+        if len(failures) == enabled_count and all_definitive:
             logger.error(
-                "❌ 所有 enabled 频道都校验失败，listener 没有消息源 — 退出。"
+                "❌ 所有 enabled 频道都确定性校验失败，listener 没有消息源 — 退出。"
                 " 修复 config/channels.json 后重启。"
             )
             await client.close()
@@ -226,6 +238,7 @@ import logging as _stdlib_logging
 
 _DISCONNECT_DEBOUNCE_SEC = 3.0
 _last_disconnect_ts: float = 0.0  # monotonic 秒
+_last_disconnect_wall: "datetime | None" = None  # 挂钟时间，供 history(after=) 回补用
 _disconnect_in_progress: bool = False
 _last_close_code: str = ""  # 最近一次 WS 关闭码（由下面的 logging 捕获填充）
 
@@ -237,6 +250,15 @@ _STORM_THRESHOLD = 3
 _recent_disconnects: list = []   # monotonic 时间戳 list
 _storm_notified_at: float = 0.0  # 防止 storm 期间 TG 重复轰炸
 _STORM_NOTIFY_COOLDOWN_SEC = 300.0  # 5 分钟内只告警一次
+
+# 慢性 churn 检测：storm 只抓「60s 内 3 次」的急促风暴，抓不住 7/20 那种
+# 每 15-20 分钟一次、持续整夜的慢性掉线（storm 从没触发，一整晚零告警）。
+# 这里用 30min 滚动窗口补上：累计 >= 5 次 → TG 告警，30min 内只发一次。
+_CHURN_WINDOW_SEC = 1800.0
+_CHURN_THRESHOLD = 5
+_churn_disconnects: list = []
+_churn_notified_at: float = 0.0
+_CHURN_NOTIFY_COOLDOWN_SEC = 1800.0
 
 
 # 关闭码速查（来自 RFC 6455 + Discord）：
@@ -291,13 +313,17 @@ _install_gateway_log_capture()
 
 @client.event
 async def on_disconnect():
-    global _last_disconnect_ts, _disconnect_in_progress, _last_close_code
-    global _storm_notified_at
+    global _last_disconnect_ts, _last_disconnect_wall, _disconnect_in_progress
+    global _last_close_code, _storm_notified_at, _churn_notified_at
     now = _time.monotonic()
     if _disconnect_in_progress and (now - _last_disconnect_ts) < _DISCONNECT_DEBOUNCE_SEC:
         # 同一次断线的成对回调，抑制重复日志
         return
     _last_disconnect_ts = now
+    # 只在"未处于断线中"时记挂钟起点——重登录成功会清空它，避免连环掉线
+    # 把回补起点越推越晚（要覆盖从**第一次**掉线到恢复的整段）
+    if _last_disconnect_wall is None:
+        _last_disconnect_wall = datetime.now(timezone.utc)
     _disconnect_in_progress = True
     code_suffix = f" code={_last_close_code}" if _last_close_code else ""
     logger.warning(f"⚠️  Discord on_disconnect fired (websocket dropped){code_suffix}")
@@ -327,6 +353,62 @@ async def on_disconnect():
             except Exception as e:
                 logger.warning(f"storm TG notify failed: {e}")
 
+    # 慢性 churn 检测：30min 窗口里累计 >= 5 次 → TG 告警一次
+    _churn_disconnects.append(now)
+    churn_cutoff = now - _CHURN_WINDOW_SEC
+    while _churn_disconnects and _churn_disconnects[0] < churn_cutoff:
+        _churn_disconnects.pop(0)
+    if len(_churn_disconnects) >= _CHURN_THRESHOLD:
+        if now - _churn_notified_at >= _CHURN_NOTIFY_COOLDOWN_SEC:
+            _churn_notified_at = now
+            n = len(_churn_disconnects)
+            logger.error(
+                f"🌀 Discord churn: {n} disconnects in last "
+                f"{_CHURN_WINDOW_SEC/60:.0f}min — network likely flapping"
+            )
+            try:
+                await send_telegram(
+                    f"🌀 Discord 慢性掉线：{_CHURN_WINDOW_SEC/60:.0f} 分钟内 {n} 次断线。\n"
+                    f"多为本机网络抖动（WiFi 省电 / 路由器丢空闲连接）。"
+                    f"完整重登录期间的信号已尝试自动回补，但建议检查网络。",
+                    parse_mode=None,
+                )
+            except Exception as e:
+                logger.warning(f"churn TG notify failed: {e}")
+
+
+async def _backfill_missed():
+    """完整重登录后回补掉线窗口内漏掉的消息。
+
+    on_resumed 会重放 gateway 事件，但 on_ready（完整 re-IDENTIFY）不会——
+    session 已丢，那段时间 KC 发的信号 on_message 根本收不到（7/20 实锤）。
+    这里按 _last_disconnect_wall 拉各监听频道的历史重新喂给 handle_message；
+    handle_message 顶部的 _seen(msg_id) 去重保证重放幂等，不会重复下单。
+    """
+    global _last_disconnect_wall
+    since = _last_disconnect_wall
+    _last_disconnect_wall = None  # 消费掉，避免下次重登录重复回补
+    if since is None:
+        return
+    # 往前多看 30s 安全余量：宁可多喂（_seen 挡住）也不漏边界消息
+    after = since - timedelta(seconds=30)
+    total = 0
+    for cid in registry.enabled_channel_ids():
+        ch = client.get_channel(cid)
+        if ch is None:
+            continue
+        try:
+            async for m in ch.history(limit=50, after=after, oldest_first=True):
+                total += 1
+                await handle_message(m)
+        except Exception as e:
+            logger.warning(f"[backfill] history fetch failed for {cid}: {e}")
+    if total:
+        logger.info(
+            f"[backfill] replayed {total} message(s) since {after.isoformat()} "
+            f"(_seen dedup 保证幂等)"
+        )
+
 
 def _log_reconnect_time(label: str):
     """on_ready / on_resumed 复用：算 disconnect→reconnect 用时"""
@@ -340,6 +422,10 @@ def _log_reconnect_time(label: str):
 
 @client.event
 async def on_resumed():
+    global _last_disconnect_wall
+    # resume 已重放 gateway 事件，这段掉线不需要回补 → 清掉起点，
+    # 避免随后的完整重登录把已重放的区间又拉一遍
+    _last_disconnect_wall = None
     _log_reconnect_time("session resumed")
 
 
@@ -350,12 +436,29 @@ async def on_error(event_name, *args, **kwargs):
 
 # ============ 优雅退出 ============
 
+_shutting_down = False
+
+
 async def shutdown():
+    # 幂等：第二次 ^C 不再重入（否则两条 shutdown 协程并发关 ctx/client，
+    # close_ctx 竞态、日志错乱，正是 7/20 连按两次 ^C 的场景）
+    global _shutting_down
+    if _shutting_down:
+        logger.info("已在退出中，忽略重复信号")
+        return
+    _shutting_down = True
     logger.info("收到退出信号，关闭 Discord client...")
     try:
         await send_telegram("🔴 *Listener 退出*")
     except Exception:
         pass
+    # moomoo SDK 的连接线程是非 daemon：不关掉的话 asyncio.run 结束后
+    # threading._shutdown 会 lock.acquire() 挂死，每次都要连按 ^C 硬杀
+    # （连续 5 晚复现）。先关 broker 线程再关 Discord。
+    try:
+        await asyncio.to_thread(close_ctx)
+    except Exception:
+        logger.exception("close_ctx failed (continuing shutdown)")
     await client.close()
 
 
@@ -370,7 +473,23 @@ async def main():
     token = preflight()
     loop = asyncio.get_running_loop()
     setup_signal_handlers(loop)
-    
+
+    # 过期仓位清扫必须在 watchers 之前：7/13 整夜 SL/TP 第一轮 tick 就对
+    # 7/10 过期的 DELL 取快照 → 报错 → 300s backoff 循环，validate 连带 fail-open。
+    try:
+        await sweep_expired_and_notify()
+    except Exception:
+        logger.exception("startup expiry sweep failed (continuing)")
+
+    # 保护性 watcher：SL 止损 / EOD 到期强平 / TP 分批止盈。
+    # 之前只有 src.main（start_listener）启动它们，而这个生产入口一直没起——
+    # src.main 又被硬卡禁止在 REAL 运行，等于真盘持仓完全没有自动保护。
+    # watcher 内部自带 try/except + DRY_RUN 无报价时 no-op，起在这里是安全的。
+    asyncio.create_task(run_sl_watcher(), name="sl_watcher")
+    asyncio.create_task(run_eod_watcher(), name="eod_watcher")
+    asyncio.create_task(run_tp_watcher(), name="tp_watcher")
+    logger.info("🛡️  watchers started: sl / eod / tp")
+
     try:
         await client.start(token)
     except discord.LoginFailure:

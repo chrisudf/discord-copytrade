@@ -89,7 +89,7 @@ class ChannelRegistry:
 registry = ChannelRegistry()
 
 
-async def validate_channels(client) -> list[tuple[int, str, str]]:
+async def validate_channels(client) -> list[tuple[int, str, str, bool]]:
     """在 on_ready 里调用，REST 校验每个 enabled 频道是否真实存在 + 可访问。
 
     用 fetch_channel (REST) 而非 get_channel (cache)：
@@ -100,11 +100,13 @@ async def validate_channels(client) -> list[tuple[int, str, str]]:
         client: discord.Client 实例（已 logged in）
 
     Returns:
-        失败列表 [(channel_id, name, reason), ...]；空表示全部 OK。
-        调用方根据返回判断是否报警 / 退出。
+        失败列表 [(channel_id, name, reason, definitive), ...]；空表示全部 OK。
+        definitive=True 表示确定性失败（404/403，配置错了）；
+        False 表示瞬时失败（网络抖动/限流/Discord 5xx）——重连后可能自愈，
+        调用方**不应**据此退出进程。
     """
     import discord  # 局部 import 避免 channel_loader 强依赖 discord 库（单测可绕过）
-    failures: list[tuple[int, str, str]] = []
+    failures: list[tuple[int, str, str, bool]] = []
     enabled = registry.enabled_channel_ids()
     logger.info(f"Monitoring {len(enabled)} channel(s):")
     for cid in enabled:
@@ -113,15 +115,15 @@ async def validate_channels(client) -> list[tuple[int, str, str]]:
             ch = await client.fetch_channel(cid)
         except discord.NotFound:
             logger.error(f"  ❌ {cfg.name} (id={cid}) 404 NOT FOUND — channel id 错误或频道已删")
-            failures.append((cid, cfg.name, "NotFound (id 错或频道已删)"))
+            failures.append((cid, cfg.name, "NotFound (id 错或频道已删)", True))
             continue
         except discord.Forbidden:
             logger.error(f"  ❌ {cfg.name} (id={cid}) 403 FORBIDDEN — token 无权限访问")
-            failures.append((cid, cfg.name, "Forbidden (token 无权限/未加入服务器)"))
+            failures.append((cid, cfg.name, "Forbidden (token 无权限/未加入服务器)", True))
             continue
         except Exception as e:
             logger.error(f"  ❌ {cfg.name} (id={cid}) fetch error: {type(e).__name__}: {e}")
-            failures.append((cid, cfg.name, f"{type(e).__name__}: {e}"))
+            failures.append((cid, cfg.name, f"{type(e).__name__}: {e}", False))
             continue
 
         guild = ch.guild.name if getattr(ch, "guild", None) else "DM"

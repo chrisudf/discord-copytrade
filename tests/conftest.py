@@ -13,6 +13,21 @@ EXISTS，无害）；这里 patch 掉 DB_PATH 后必须重跑 _init_db() 建 tmp
 test_risk_cost_cap.py 自己的 _isolate_env fixture 也 patch rm.DB_PATH——
 两个 autouse 叠加无冲突（都指向 tmp 文件，后设的生效）。
 """
+
+# ---- channels.json 兜底（隐私补丁之后真实文件不入库） ----
+# config/channels.json 已 gitignore（真实频道/用户 ID 不进仓库），
+# 新 clone / CI 上不存在。channel_loader 在 import 时就加载 registry，
+# 缺文件会让整个测试收集失败——这里在任何 src 模块 import 前从
+# example 模板兜底。生产路径不受影响：缺文件依然大声报错。
+from pathlib import Path as _Path
+import shutil as _shutil
+
+_cfg_dir = _Path(__file__).resolve().parents[1] / "config"
+_channels = _cfg_dir / "channels.json"
+_example = _cfg_dir / "channels.json.example"
+if not _channels.exists() and _example.exists():
+    _shutil.copy(_example, _channels)
+
 import pytest
 
 import src.risk.risk_manager as risk_manager

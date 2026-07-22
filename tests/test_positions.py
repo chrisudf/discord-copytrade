@@ -221,3 +221,126 @@ def test_calc_qty_to_sell_multi_contract_unchanged():
     assert manager.calc_qty_to_sell(pos, 25) == 1  # ceil(0.5) = 1
     assert manager.calc_qty_to_sell(pos, 50) == 1  # ceil(1.0) = 1
     assert manager.calc_qty_to_sell(pos, 100) == 2
+
+
+# ============ sweep_expired（7/13 复盘：过期合约残留 OPEN） ============
+
+def _open_test_pos(code: str, symbol: str, expiry: date, qty: int = 2):
+    positions_db.open_or_add(
+        option_code=code, symbol=symbol, strike=15.0, side="CALL",
+        expiry=expiry, qty=qty, fill_price=1.50,
+        category="weekly", apply_sl=True, eod_force_close=False,
+        tags=[], channel_name="test", msg_id="1",
+    )
+
+
+def test_sweep_expired_marks_and_excludes():
+    code = _uniq("EXPA")
+    _open_test_pos(code, "EXPA", date(2026, 7, 10))
+
+    swept = positions_db.sweep_expired(date(2026, 7, 13))
+
+    assert code in [p["option_code"] for p in swept]
+    pos = positions_db.get(code)
+    assert pos["status"] == "EXPIRED"
+    assert pos["qty_remaining"] == 0
+    # 移出 watcher 轮询和 close 白名单
+    assert code not in [p["option_code"] for p in positions_db.get_open_positions()]
+    assert "EXPA" not in positions_db.get_open_symbols()
+    # 事件流水留痕
+    events = positions_db.get_events(code)
+    assert events[-1]["event_type"] == "EXPIRE"
+    assert events[-1]["qty_delta"] == -2
+    assert events[-1]["trigger_source"] == "expiry_sweep"
+
+
+def test_sweep_expired_keeps_today_and_future():
+    """expiry == today 不清（当天仍可交易，EOD watcher 15:50 强平）。"""
+    today_code = _uniq("EXPB")
+    future_code = _uniq("EXPC")
+    _open_test_pos(today_code, "EXPB", date(2026, 7, 13))
+    _open_test_pos(future_code, "EXPC", date(2026, 8, 21))
+
+    swept = positions_db.sweep_expired(date(2026, 7, 13))
+
+    swept_codes = [p["option_code"] for p in swept]
+    assert today_code not in swept_codes
+    assert future_code not in swept_codes
+    assert positions_db.get(today_code)["status"] == "OPEN"
+    assert positions_db.get(future_code)["status"] == "OPEN"
+
+
+def test_sweep_expired_idempotent():
+    code = _uniq("EXPD")
+    _open_test_pos(code, "EXPD", date(2026, 7, 10))
+
+    first = positions_db.sweep_expired(date(2026, 7, 13))
+    second = positions_db.sweep_expired(date(2026, 7, 13))
+
+    assert [p["option_code"] for p in first].count(code) == 1
+    assert second == []
+
+
+# ============ naked-short 脱钩核销（7/21 复盘） ============
+
+def test_reconcile_to_broker_zero_closes():
+    """broker 0 long → 本地核销成 CLOSED,退出 get_open_positions。"""
+    code = _uniq("RECZERO")
+    positions_db.open_or_add(
+        option_code=code, symbol="RECZ", strike=10.0, side="CALL",
+        expiry=date(2026, 12, 18), qty=1, fill_price=1.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+    changed = positions_db.reconcile_to_broker(code, 0)
+    assert changed is True
+    pos = positions_db.get(code)
+    assert pos["status"] == "CLOSED"
+    assert pos["qty_remaining"] == 0
+    assert code not in {p["option_code"] for p in positions_db.get_open_positions()}
+
+
+def test_reconcile_to_broker_dedup_second_call_noop():
+    """核销成 CLOSED 后再调返回 False（守护据此只告警一次)。"""
+    code = _uniq("RECDEDUP")
+    positions_db.open_or_add(
+        option_code=code, symbol="RECD", strike=10.0, side="CALL",
+        expiry=date(2026, 12, 18), qty=1, fill_price=1.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+    assert positions_db.reconcile_to_broker(code, 0) is True
+    assert positions_db.reconcile_to_broker(code, 0) is False
+
+
+def test_reconcile_to_broker_partial_shrinks_keeps_open():
+    """broker 1 < 本地 3 → 缩到 1,仍 OPEN（下一 tick 卖真实张数会成交)。"""
+    code = _uniq("RECPART")
+    positions_db.open_or_add(
+        option_code=code, symbol="RECP", strike=10.0, side="CALL",
+        expiry=date(2026, 12, 18), qty=3, fill_price=1.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+    changed = positions_db.reconcile_to_broker(code, 1)
+    assert changed is True
+    pos = positions_db.get(code)
+    assert pos["status"] == "OPEN"
+    assert pos["qty_remaining"] == 1
+
+
+def test_reconcile_to_broker_noop_when_qty_already_le_broker():
+    """本地 1 张,broker 报 1（甚至更多）→ 无需核销,返回 False。"""
+    code = _uniq("RECNOOP")
+    positions_db.open_or_add(
+        option_code=code, symbol="RECN", strike=10.0, side="CALL",
+        expiry=date(2026, 12, 18), qty=1, fill_price=1.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m1",
+    )
+    assert positions_db.reconcile_to_broker(code, 1) is False
+    assert positions_db.get(code)["status"] == "OPEN"
+
+
+def test_reconcile_to_broker_missing_position_returns_false():
+    assert positions_db.reconcile_to_broker(_uniq("RECMISS"), 0) is False

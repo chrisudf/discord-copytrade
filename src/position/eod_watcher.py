@@ -3,7 +3,9 @@
 职责：
 - 每 EOD_CHECK_INTERVAL 秒检查 ET 时间
 - 到 EOD_HOUR:EOD_MIN（默认 15:50 ET）后，平掉所有
-  eod_force_close=True 且 expiry==today_et 且 status IN (OPEN, PARTIAL) 的仓位
+  expiry==today_et 且 status IN (OPEN, PARTIAL) 的仓位
+  （不看 eod_force_close flag —— 该 flag 只反映开仓时刻 DTE==0，
+   周初开的 weekly 到周五到期时 flag 是 False，但同样必须在过期前平掉）
 - 是工作日才执行（避免周末本地测试误触发）
 
 设计：
@@ -36,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 from src.broker.moomoo_client import place_sell_order, get_last_price
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.notifier.telegram_client import (
     send_telegram, format_close_filled, format_error,
 )
@@ -53,19 +56,26 @@ def _cfg() -> dict:
     }
 
 
-def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
-    """是否到了 EOD 时间窗（>=hour:minute 且当天是工作日，且未到第二天 00:00）。
+# 时窗上界：16:00 ET 收盘 + 5 分钟迟到成交余量。过点后合约命运已定
+# （到期日的过不了夜），继续尝试/告警纯属噪音——7/15 对已到期的 GOOGL/MU
+# 每 30 分钟"手动平仓"告警到 18:50 ET，直到人工 Ctrl-C。
+_WINDOW_END_HOUR, _WINDOW_END_MIN = 16, 5
 
-    简化：只看小时分钟。00:00 ET 自然进入下一天，下次开仓日重置。
+
+def _is_eod_window(now_et: datetime, hour: int, minute: int) -> bool:
+    """是否在 EOD 强平时窗内（工作日 hour:minute ～ 16:05 ET）。
 
     TODO: 半日交易日（黑五 / 平安夜 / 独立日前夜 / 元旦前夜等）13:00 ET 收盘，
-          应在 holidays.py 加 EARLY_CLOSE_DATES set，当日把 cutoff 调到 12:50。
-          实测一年才几次，不急；但漏掉那几天会变成"收盘后才挂卖单"。
+          应在 holidays.py 加 EARLY_CLOSE_DATES set，当日把 cutoff 调到 12:50、
+          上界调到 13:05。实测一年才几次，不急；但漏掉那几天会变成"收盘后才挂卖单"。
     """
     if now_et.weekday() >= 5:  # 周六/日
         return False
     cutoff = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return now_et >= cutoff
+    window_end = now_et.replace(
+        hour=_WINDOW_END_HOUR, minute=_WINDOW_END_MIN, second=0, microsecond=0
+    )
+    return cutoff <= now_et <= window_end
 
 
 # 单进程 backoff：连续失败的 code → 下次 tick 跳过
@@ -85,61 +95,89 @@ def _gc_skip(today_et: date_cls):
 async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     """单仓位强平。"""
     code = pos["option_code"]
-    qty = pos["qty_remaining"]
 
-    last = await asyncio.to_thread(get_last_price, code)
-    if last is None:
-        # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价
-        # backoff 30 分钟避免 30s tick 反复刷 TG
-        if _skip_until.get(code, 0) <= ts_now:
-            _skip_until[code] = ts_now + 1800
-            logger.warning(
-                f"[eod] no quote for {code}, refusing entry-fallback sell, "
-                f"manual close required"
+    async with position_mgr.sell_lock(code):
+        # 锁内重读：等锁期间可能已被 SL/TP/CLOSE 卖掉（部分或全部）
+        pos = position_mgr.get(code) or pos
+        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+            logger.debug(f"[eod] {code} already closed while waiting for lock, skip")
+            return
+        qty = pos["qty_remaining"]
+
+        last = await asyncio.to_thread(get_last_price, code)
+        if last is None:
+            # 没 quote 时不挂 entry-based 卖单——0DTE ITM 会被自残卖在远低于真实市价
+            # backoff 30 分钟避免 30s tick 反复刷 TG
+            if _skip_until.get(code, 0) <= ts_now:
+                _skip_until[code] = ts_now + 1800
+                logger.warning(
+                    f"[eod] no quote for {code}, refusing entry-fallback sell, "
+                    f"manual close required"
+                )
+                await send_telegram(format_error(
+                    "EOD 强平跳过：无报价",
+                    f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
+                    f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
+                    f"请在 moomoo 手动平仓"
+                ))
+            return
+
+        limit = max(0.01, round(last * (1 - sell_slip), 2))
+        logger.warning(
+            f"[eod] 🕒 force-close {code}: qty={qty} last={last:.2f} limit={limit}"
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                place_sell_order,
+                option_code=code, qty=qty,
+                limit_price=limit, remark="eod_force",
             )
-            await send_telegram(format_error(
-                "EOD 强平跳过：无报价",
-                f"{code} qty={qty} entry=${pos['avg_entry_price']:.2f}\n"
-                f"原因：OPRA 不可用，避免 entry × 0.9 自残卖\n"
-                f"请在 moomoo 手动平仓"
-            ))
-        return
+        except Exception as e:
+            logger.exception("[eod] place_sell_order failed")
+            _skip_until[code] = ts_now + 60  # 1 分钟后再试
+            await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
+            return
 
-    limit = max(0.01, round(last * (1 - sell_slip), 2))
-    logger.warning(
-        f"[eod] 🕒 force-close {code}: qty={qty} last={last:.2f} limit={limit}"
-    )
+        if not result.get("success"):
+            err = result.get("message", "unknown")
+            if result.get("naked_short"):
+                # broker 说没这么多 long → 脱钩。核销本地(0→CLOSED)让它退出待平列表,
+                # 停止每 60s 重挂 + 刷 TG;只首次核销告警一次。
+                bq = result.get("broker_qty", 0)
+                changed = position_mgr.reconcile_to_broker(code, bq)
+                logger.error(
+                    f"[eod] naked-short desync {code}: broker long={bq}, "
+                    f"reconciled local DB (changed={changed})"
+                )
+                if changed:
+                    await send_telegram(format_error(
+                        "持仓脱钩已核销",
+                        f"{code}: broker 实际持有 {bq} 张,本地 DB 高估。已核销并停止 EOD 强平重试。\n"
+                        f"请核对 moomoo 持仓（必要时跑 scripts/sync_positions.py）。"
+                    ))
+                return
+            logger.error(f"[eod] sell rejected: {err}")
+            _skip_until[code] = ts_now + 60
+            await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
+            return
 
-    try:
-        result = await asyncio.to_thread(
-            place_sell_order,
-            option_code=code, qty=qty,
-            limit_price=limit, remark="eod_force",
-        )
-    except Exception as e:
-        logger.exception("[eod] place_sell_order failed")
-        _skip_until[code] = ts_now + 60  # 1 分钟后再试
-        await send_telegram(format_error("EOD sell error", f"{code}\n{e}"))
-        return
+        try:
+            position_mgr.on_close_filled(
+                option_code=code,
+                qty_sold=result.get("qty", qty),
+                fill_price=result.get("price", limit),
+                trigger_source="eod",
+                order_id=result.get("order_id"),
+                note=f"EOD force close (last={last:.2f})",
+            )
+        except Exception as e:
+            logger.error(f"[eod] on_close_filled failed: {e}")
 
-    if not result.get("success"):
-        err = result.get("message", "unknown")
-        logger.error(f"[eod] sell rejected: {err}")
-        _skip_until[code] = ts_now + 60
-        await send_telegram(format_error("EOD sell rejected", f"{code} qty={qty}\n{err}"))
-        return
-
-    try:
-        position_mgr.on_close_filled(
-            option_code=code,
-            qty_sold=result.get("qty", qty),
-            fill_price=result.get("price", limit),
-            trigger_source="eod",
-            order_id=result.get("order_id"),
-            note=f"EOD force close (last={last:.2f})",
-        )
-    except Exception as e:
-        logger.error(f"[eod] on_close_filled failed: {e}")
+        # 卖单成交确认：收盘前 spread 跳水，限价卖单挂不上必须立刻知道
+        fill_checker.spawn(fill_checker.confirm_sell_fill(
+            result.get("order_id") or "", code, result.get("qty", qty), "eod",
+        ))
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
@@ -148,9 +186,39 @@ async def _force_close(pos: dict, sell_slip: float, ts_now: float):
     ))
 
 
+async def sweep_expired_and_notify() -> list[dict]:
+    """过期仓位清扫 + TG 通知。幂等（清过的 status=EXPIRED 不会再选中）。
+
+    listener 启动时调一次（watchers 起来之前），之后 eod watcher 每轮
+    tick 兜底跨日。TG 用 parse_mode=None 免转义。
+    """
+    swept = position_mgr.sweep_expired()
+    if not swept:
+        return swept
+    lines = "\n".join(
+        f"  • {p['option_code']} x{p['qty_remaining']} "
+        f"(entry ${p['avg_entry_price']:.2f}, expired {p['expiry']})"
+        for p in swept
+    )
+    try:
+        await send_telegram(
+            f"🧹 过期仓位清扫\n"
+            f"{len(swept)} 张合约已过期未平仓，标记 EXPIRED（移出 watcher 轮询"
+            f"和 close 白名单）：\n{lines}\n"
+            f"ITM 可能已被自动行权，请核对 moomoo 持仓"
+            f"（必要时跑 scripts/sync_positions.py）",
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.warning(f"[eod] expiry sweep TG notify failed: {e}")
+    return swept
+
+
 async def _eod_tick(now_et: datetime):
     """单轮：判断是否在 EOD 时窗、找待平仓位、依次强平。"""
     cfg = _cfg()
+    # 过期清扫放时窗判断之前——凌晨跨日后就要清，不能等到 15:50
+    await sweep_expired_and_notify()
     if not _is_eod_window(now_et, cfg["hour"], cfg["minute"]):
         return
 
@@ -158,10 +226,16 @@ async def _eod_tick(now_et: datetime):
     _gc_skip(now_et.date())
     ts_now = now_et.timestamp()
 
+    # 只看 expiry == today，不看 eod_force_close flag。
+    #
+    # 原因：eod_force_close 在**开仓时**由 categorize() 一次性算出（DTE==0 才 True），
+    # 之后不再重算。周一买的 weekly 周五到期时，它的 flag 还是 False —— 老逻辑
+    # 会让它在到期日直接过期（ITM 被自动行权，变成一笔没打算持有的正股/保证金头寸）。
+    # "0DTE 当天必过期，必须平"这个理由对**任何**到期日当天的仓位都成立，
+    # 所以这里用 expiry 本身判断。flag 保留在 DB 里仅作开仓时刻的信息性标注。
     positions = [
         p for p in position_mgr.get_open_positions()
-        if p.get("eod_force_close")
-        and p["expiry"] == today_iso
+        if p["expiry"] == today_iso
         and p["qty_remaining"] > 0
         and _skip_until.get(p["option_code"], 0) <= ts_now
     ]

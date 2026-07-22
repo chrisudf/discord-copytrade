@@ -26,12 +26,14 @@ def _reset_quote_state(monkeypatch):
 def _make_snapshot_row(code, last_price, update_offset_s=0):
     """构造一行 mock snapshot 数据。update_offset_s 负数代表多久之前更新过。
 
-    用 UTC 时间因为 broker 里 `pd.to_datetime(s).timestamp()` 把 naive
-    字符串当 UTC（pandas 行为，跟 Python datetime 不同）。生产数据如果
-    moomoo 返回的是本地/ET 时间，需要 broker 端 reconvert——见同名 TODO。
+    模拟生产实际：moomoo update_time 是**无 tz 的美东时间**字符串，
+    broker 端用 _quote_epoch 按 QUOTE_TZ（默认 America/New_York）本地化。
     """
     import pandas as pd
-    ts = pd.Timestamp.utcnow().tz_localize(None) + pd.Timedelta(seconds=update_offset_s)
+    ts = (
+        pd.Timestamp.now(tz=bc.QUOTE_TZ).tz_localize(None)
+        + pd.Timedelta(seconds=update_offset_s)
+    )
     return {
         "code": code,
         "last_price": last_price,
@@ -170,13 +172,26 @@ def test_validate_option_codes_dry_run_always_true(monkeypatch):
     assert out == {"US.ANYTHING": True}
 
 
-def test_validate_option_codes_snapshot_fails_all_false(monkeypatch):
-    """ret != RET_OK 全部 False（保守 reject，宁可不下也不错下）"""
+def test_validate_option_codes_definitely_missing_is_false(monkeypatch):
+    """明确 'Unknown stock' 类错误 → False（真不存在，拒单合理）"""
     ctx = MagicMock()
-    ctx.get_market_snapshot.return_value = (-1, "some error")
+    ctx.get_market_snapshot.return_value = (-1, "Unknown stock. US.X")
     monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
     out = bc.validate_option_codes(["US.X"])
     assert out == {"US.X": False}
+
+
+def test_validate_option_codes_transient_error_fails_open(monkeypatch):
+    """瞬时失败（quota/超时/未知错误）→ fail-open 放行，让 broker 判定。
+
+    回归：之前 fail-closed，snapshot 限频 backoff 期间 60s 内所有合法买单
+    都被 'contract not found' 误拒。预校验是优化不是闸门。
+    """
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (-1, "request timeout, try again later")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    out = bc.validate_option_codes(["US.X"])
+    assert out == {"US.X": True}
 
 
 def test_validate_option_codes_no_permission_falls_back_to_true(monkeypatch):
@@ -309,3 +324,73 @@ def test_probe_quote_access_dry_run_skipped(monkeypatch):
     status, msg = bc.probe_quote_access()
     assert status == bc.QUOTE_OK
     assert "DRY_RUN" in msg
+
+
+def test_get_last_prices_et_realtime_not_stale(monkeypatch):
+    """回归：update_time 是无 tz 的 ET 字符串。当 UTC 解析会整体偏早 4-5h，
+    所有实时报价都被 60s 新鲜度检查误判 stale → 真盘 SL/TP/EOD 永远拿不到价。
+    现在按 QUOTE_TZ 本地化，刚更新的报价必须通过。"""
+    rows = [_make_snapshot_row("US.AAPL", 5.20, update_offset_s=-5)]  # 5 秒前(ET)
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: _mock_ctx_returning(rows))
+    out = bc.get_last_prices(["US.AAPL"])
+    assert out["US.AAPL"] == 5.20
+
+
+# === 7/8 复盘回归：限频/无权限退避 ===
+
+def test_snapshot_high_frequency_triggers_backoff(monkeypatch):
+    """moomoo 限频报错原文不含 quota/limit 字样，旧关键词接不住 → 不退避硬打。"""
+    import time as _time
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (
+        -1, "Get Market Snapshot request failed due to high frequency. "
+            "Maximum 60 times per 30 seconds.")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    bc.get_last_prices(["US.X"])
+    assert bc._quote_backoff_until > _time.monotonic(), "限频必须触发退避"
+
+
+def test_snapshot_no_permission_long_backoff(monkeypatch):
+    """无 OPRA 权限 → 300s 长退避。7/8 整夜 watcher 空转打满频率配额，
+    连 validate 都被挤到限频（靠 fail-open 才没误拒买单）。"""
+    import time as _time
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (
+        -1, "No permission to get quotes for US.X. "
+            "Please check US MarketOptions quote permissions.")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    bc.get_last_prices(["US.X"])
+    # 长退避：显著大于普通 60s 档
+    assert bc._quote_backoff_until > _time.monotonic() + 200
+
+
+def test_snapshot_no_permission_warn_throttled(monkeypatch):
+    """7/9 实测：300s 退避到期后 SL/TP 各重探一次，每次都 WARNING
+    一夜刷 ~200 行。同原因一小时内只 WARNING 一次，其余 DEBUG。"""
+    from src.utils.logger import logger as _lg
+    ctx = MagicMock()
+    ctx.get_market_snapshot.return_value = (
+        -1, "No permission to get quotes for US.X.")
+    monkeypatch.setattr(bc, "_get_quote_ctx", lambda: ctx)
+    # None = "进程内没警告过"。不能用 0.0：uptime < 1h 的机器（CI runner）上
+    # monotonic - 0.0 < 3600，首条 WARNING 会被节流吞掉，测试在 CI 假失败
+    monkeypatch.setattr(bc, "_no_perm_last_warn", None)
+
+    records = []
+    sink = _lg.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="DEBUG",
+    )
+    try:
+        bc.get_last_prices(["US.X"])
+        monkeypatch.setattr(bc, "_quote_backoff_until", 0.0)  # 模拟退避到期
+        bc.get_last_prices(["US.X"])
+    finally:
+        _lg.remove(sink)
+
+    warns = [r for r in records
+             if r[0] == "WARNING" and "no-permission" in r[1]]
+    debugs = [r for r in records
+              if r[0] == "DEBUG" and "no-permission" in r[1]]
+    assert len(warns) == 1, f"一小时内同原因只应 WARNING 一次: {warns}"
+    assert len(debugs) == 1, "第二次应降为 DEBUG"

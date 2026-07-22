@@ -3,7 +3,9 @@
 补 6/18 IWM 事件暴露的两个 bug：
 - broker 拒单后误报 "no matching open positions"（原 any_executed 没 set）
 """
+import asyncio
 import os
+import time
 from datetime import date, datetime
 from unittest.mock import patch
 
@@ -285,3 +287,323 @@ def test_addon_requires_add_keyword():
         "ADX4 holding the line @ 1.86 nicely"
     )
     assert got is None
+
+
+# === CLOSE 指纹登记时机回归（review 0005）===
+
+@pytest.mark.asyncio
+async def test_failed_close_allows_bilingual_retry():
+    """卖单失败时不登记指纹 → 1-3s 后到达的另一语言版本可以正常重试。
+
+    回归：之前查即登记，ZH 版先到但 broker 拒单后，EN 版被当 dup 拦掉，
+    天然的重试机会丢失。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("RTY")
+    positions_db.open_or_add(
+        option_code=code, symbol="RTYX", strike=100.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_rty_1",
+    )
+    discord_client._close_fps.clear()
+
+    async def noop_notify(msg):
+        pass
+
+    calls = []
+
+    def failing_then_ok_sell(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"success": False, "message": "transient broker error",
+                    "order_id": None, "code": code, "qty": 1, "price": 1.9}
+        return {"success": True, "order_id": "RTY_OK", "code": code,
+                "qty": 1, "price": 1.9}
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop_notify), \
+         patch.object(discord_client, "place_sell_order", side_effect=failing_then_ok_sell):
+        # 第一发（模拟 ZH 先到）：broker 拒单 → 不应登记指纹
+        await discord_client._handle_close_signal("减仓 RTYX @ 2.45", msg_id=1111)
+        # 第二发（模拟 EN 双发）：应被当作重试执行，而不是 dup 拦掉
+        await discord_client._handle_close_signal("trimmed RTYX @ 2.45", msg_id=1112)
+
+    assert len(calls) == 2, f"第二发应重试卖出，实际 broker 调用: {len(calls)}"
+
+    # 第二发成功后指纹已登记 → 第三发同信号应被 dup 拦掉
+    with patch.object(discord_client, "_safe_notify", side_effect=noop_notify), \
+         patch.object(discord_client, "place_sell_order", side_effect=failing_then_ok_sell):
+        await discord_client._handle_close_signal("trimmed RTYX @ 2.45", msg_id=1113)
+    assert len(calls) == 2, "成功后同指纹信号应被 dup 拦截"
+
+    positions_db.record_close(code, 2, 2.0, "manual", note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_deterministic_skip_registers_fp_no_twin_spam():
+    """确定性跳过（runner-preserve）也登记指纹 → 双语孪生不会重复刷 TG。
+
+    这是对 0005 "只在成功后登记" 的本地精修：runner-preserve / 无价格参照
+    这类结果是确定性的，孪生重试只会重复告警，应照常去重。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("DSK")
+    positions_db.open_or_add(
+        option_code=code, symbol="DSKX", strike=100.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=1, fill_price=2.0,  # qty=1 → runner-preserve
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_dsk_1",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order") as sell_mock:
+        await discord_client._handle_close_signal("trimmed DSKX @ 2.45", msg_id=2221)
+        await discord_client._handle_close_signal("减仓 DSKX @ 2.45", msg_id=2222)
+
+    sell_mock.assert_not_called()
+    runner_alerts = [n for n in notifications if "runner" in n.lower()]
+    assert len(runner_alerts) == 1, (
+        f"孪生版本应被指纹去重，只发一条 runner-preserve TG，实际 {len(runner_alerts)}",
+        notifications,
+    )
+
+    positions_db.record_close(code, 1, 2.0, "manual", note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_multi_symbol_close_hint_only_scopes_first_symbol():
+    """'Trimmed TSLA 420c and MSFT here' —— strike hint 来自 TSLA，
+    不能拿去过滤 MSFT 的持仓（回归：MSFT 平仓被静默跳过）。"""
+    os.environ["DRY_RUN"] = "true"
+    code_a = _uniq_code("MSA")
+    code_b = _uniq_code("MSB")
+    positions_db.open_or_add(
+        option_code=code_a, symbol="TSLAM", strike=420.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="ms1",
+    )
+    positions_db.open_or_add(
+        option_code=code_b, symbol="MSFTM", strike=390.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.5,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="ms2",
+    )
+    discord_client._close_fps.clear()
+
+    sold_codes = []
+
+    def fake_sell(*args, **kwargs):
+        sold_codes.append(kwargs["option_code"])
+        return {"success": True, "order_id": "MS", "code": kwargs["option_code"],
+                "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    async def noop_notify(msg):
+        pass
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop_notify), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "Trimmed $TSLAM 420c and $MSFTM here @ 7.00", msg_id=55555,
+        )
+
+    assert code_a in sold_codes, "hint 匹配的 TSLA 420c 应该卖"
+    assert code_b in sold_codes, "MSFT 不该被 TSLA 的 strike hint 过滤掉"
+
+    positions_db.record_close(code_a, 2, 7.0, "manual", note="ut cleanup")
+    positions_db.record_close(code_b, 2, 7.0, "manual", note="ut cleanup")
+
+
+# === 7/8 复盘回归：fp 原子性 / BULK 例外 ===
+
+@pytest.mark.asyncio
+async def test_close_fp_atomic_blocks_inflight_twin():
+    """双发在第一条还没处理完时到达（实测 0.9s < handler 耗时 1.2s）
+    → 第二条必须被 dup 拦住。
+
+    7/7-7/8 连续两夜实锤：0005 把登记挪到 handler 末尾后，第二条 EN 穿过
+    dup 检查双重处理（qty≥2 时 trim 执行两次）。现在查即登记（原子）。
+    """
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("ATW")
+    positions_db.open_or_add(
+        option_code=code, symbol="ATWX", strike=100.0, side="CALL",
+        expiry=date(2026, 7, 17), qty=4, fill_price=2.0,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_atw",
+    )
+    discord_client._close_fps.clear()
+
+    calls = []
+
+    def slow_sell(*args, **kwargs):
+        time.sleep(0.05)  # 模拟 broker RTT，制造双发竞态窗口
+        calls.append(kwargs)
+        return {"success": True, "order_id": f"ATW{len(calls)}",
+                "code": code, "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    async def noop(msg):
+        pass
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop), \
+         patch.object(discord_client, "place_sell_order", side_effect=slow_sell):
+        await asyncio.gather(
+            discord_client._handle_close_signal("trimmed ATWX @ 2.45", msg_id=71),
+            discord_client._handle_close_signal("trimmed ATWX @ 2.45", msg_id=72),
+        )
+
+    assert len(calls) == 1, f"孪生并发必须只执行一次 trim，实际: {calls}"
+
+    positions_db.record_close(code, 4 - calls[0]["qty"], 2.45, "manual",
+                              note="ut cleanup")
+
+
+@pytest.mark.asyncio
+async def test_bulk_close_excludes_kept_symbol():
+    """7/8 'Closing all positions outside of the $IBM lotto'：
+    IBM 不卖，其余按 100% 全平。"""
+    os.environ["DRY_RUN"] = "true"
+    code_keep = _uniq_code("BKE")
+    code_sell = _uniq_code("BKS")
+    positions_db.open_or_add(
+        option_code=code_keep, symbol="IBM", strike=310.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.27,
+        category="lotto", apply_sl=False, eod_force_close=False, tags=["lotto"],
+        channel_name="ut", msg_id="m_bke",
+    )
+    positions_db.open_or_add(
+        option_code=code_sell, symbol="DELL", strike=465.0, side="CALL",
+        expiry=date(2026, 7, 10), qty=2, fill_price=2.65,
+        category="weekly", apply_sl=True, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_bks",
+    )
+    discord_client._close_fps.clear()
+
+    sold = []
+
+    def fake_sell(*args, **kwargs):
+        sold.append(kwargs["option_code"])
+        return {"success": True, "order_id": "BK", "code": kwargs["option_code"],
+                "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    async def noop(msg):
+        pass
+
+    with patch.object(discord_client, "_safe_notify", side_effect=noop), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "Alright - here's what I'm doing: Closing all positions outside of "
+            "the $IBM $310 lotto - this is a 1% position - I am 99% cash @ 2.80",
+            msg_id=73,
+        )
+
+    assert code_sell in sold, "DELL 应被全平"
+    assert code_keep not in sold, "IBM 在例外表里，不能卖"
+    assert positions_db.get(code_sell)["status"] == "CLOSED"  # pct=100 全平
+    assert positions_db.get(code_keep)["status"] == "OPEN"
+
+    positions_db.record_close(code_keep, 2, 2.27, "manual", note="ut cleanup")
+
+
+def test_bang_not_bare_ticker():
+    """7/9 'BANG! Out half 2.45' —— BANG 是叹词不是 ticker，无 symbol 的
+    跟单 trim 不该触发 looks-like-close TG。"""
+    assert discord_client._looks_like_close_attempt(
+        "@everyone\nKC Trades Bot:BANG! Out half 2.45, stop at 2.10 ✅"
+    ) is False
+    # 带真 ticker 的仍然要告警
+    assert discord_client._looks_like_close_attempt(
+        "@everyone\nKC Trades Bot:BANG! Out half SPY 2.45"
+    ) is True
+
+
+# === 7/10 事故回归：频道来源约束 / strike-hint 端到端 ===
+
+@pytest.mark.asyncio
+async def test_cross_channel_close_skipped():
+    """enrich 的 close 信号不能平 KC 来源的仓位（7/10 near-miss）。"""
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("XCH")
+    positions_db.open_or_add(
+        option_code=code, symbol="XCHX", strike=230.0, side="CALL",
+        expiry=date(2026, 8, 21), qty=2, fill_price=2.93,
+        category="swing", apply_sl=False, eod_force_close=False, tags=[],
+        channel_name="KC-期权-波段", msg_id="m_xch",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    sell_called = []
+
+    def fake_sell(*args, **kwargs):
+        sell_called.append(kwargs)
+        return {"success": True, "order_id": "XC", "code": code,
+                "qty": kwargs["qty"], "price": kwargs["limit_price"]}
+
+    # enrich 的信号 → 不卖 + 专属 TG
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "$XCHX - I'm practically all out @ 3.60", msg_id=81,
+            channel_name="enrich",
+        )
+    assert sell_called == [], "跨频道信号不能触发卖单"
+    text = "\n".join(notifications)
+    assert "频道不匹配" in text, ("应有频道不匹配 TG", text)
+    assert positions_db.get(code)["status"] == "OPEN"
+
+    # 同频道信号 → 正常平仓
+    discord_client._close_fps.clear()
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "$XCHX - I'm practically all out @ 3.60", msg_id=82,
+            channel_name="KC-期权-波段",
+        )
+    assert len(sell_called) == 1, "同频道信号应正常平仓"
+
+
+@pytest.mark.asyncio
+async def test_wrong_side_close_blocked_end_to_end():
+    """7/10 事故端到端复现：KC 平 755 call，我们持 730 put →
+    strike/side hint 现在能从全文抽到 → 不匹配 → 拒绝卖出。"""
+    os.environ["DRY_RUN"] = "true"
+    code = _uniq_code("WSC")
+    positions_db.open_or_add(
+        option_code=code, symbol="WSCX", strike=730.0, side="PUT",
+        expiry=date(2026, 7, 17), qty=1, fill_price=2.93,
+        category="swing", apply_sl=False, eod_force_close=False, tags=[],
+        channel_name="ut", msg_id="m_wsc",
+    )
+    discord_client._close_fps.clear()
+
+    notifications = []
+
+    async def capture(msg):
+        notifications.append(msg)
+
+    sell_called = []
+
+    def fake_sell(*args, **kwargs):
+        sell_called.append(kwargs)
+        return {"success": True}
+
+    with patch.object(discord_client, "_safe_notify", side_effect=capture), \
+         patch.object(discord_client, "place_sell_order", side_effect=fake_sell):
+        await discord_client._handle_close_signal(
+            "KC Trades Bot:WSCX 755c IN THE MONEY! Closed @ 4.40 💰", msg_id=83,
+        )
+
+    assert sell_called == [], "错向（call hint vs put 持仓）不能卖"
+    assert "不匹配" in "\n".join(notifications)
+    assert positions_db.get(code)["status"] == "OPEN"

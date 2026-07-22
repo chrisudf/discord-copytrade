@@ -27,8 +27,9 @@ import asyncio
 import os
 from typing import Optional
 
-from src.broker.moomoo_client import place_sell_order, get_last_price
+from src.broker.moomoo_client import place_sell_order, get_last_prices
 from src.position import manager as position_mgr
+from src.position import fill_checker
 from src.storage import positions_db
 from src.notifier.telegram_client import (
     send_telegram, format_close_filled, format_error,
@@ -71,54 +72,85 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
         return
     _triggered_this_tick.add(key)
 
-    qty_to_sell = max(1, round(pos["qty_remaining"] * trim_pct / 100))
-    qty_to_sell = min(qty_to_sell, pos["qty_remaining"])
-    limit = round(last_price * (1 - sell_slip), 2)
-    if limit <= 0:
-        limit = 0.01
+    async with position_mgr.sell_lock(code):
+        # 锁内重读：等锁期间可能已被 SL/EOD/CLOSE 卖掉，或同档已被标记
+        pos = position_mgr.get(code) or pos
+        if pos["status"] not in ("OPEN", "PARTIAL") or pos["qty_remaining"] <= 0:
+            logger.debug(f"[tp] {code} already closed while waiting for lock, skip")
+            return
+        if pos["tp_hits"] & tier_bit:
+            return
 
-    logger.info(
-        f"[tp] 🎯 T{tier_bit} HIT {code}: last={last_price:.2f} "
-        f">= entry*({1+threshold_pct:.2f})={pos['avg_entry_price']*(1+threshold_pct):.2f}, "
-        f"selling {qty_to_sell}/{pos['qty_remaining']} @ {limit}"
-    )
+        qty_to_sell = max(1, round(pos["qty_remaining"] * trim_pct / 100))
+        qty_to_sell = min(qty_to_sell, pos["qty_remaining"])
+        limit = round(last_price * (1 - sell_slip), 2)
+        if limit <= 0:
+            limit = 0.01
 
-    try:
-        result = await asyncio.to_thread(
-            place_sell_order,
-            option_code=code, qty=qty_to_sell,
-            limit_price=limit, remark=f"tp_t{tier_bit}",
+        logger.info(
+            f"[tp] 🎯 T{tier_bit} HIT {code}: last={last_price:.2f} "
+            f">= entry*({1+threshold_pct:.2f})={pos['avg_entry_price']*(1+threshold_pct):.2f}, "
+            f"selling {qty_to_sell}/{pos['qty_remaining']} @ {limit}"
         )
-    except Exception as e:
-        logger.exception("[tp] place_sell_order failed")
-        _triggered_this_tick.discard(key)
-        await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
-        return
 
-    if not result.get("success"):
-        err = result.get("message", "unknown")
-        logger.error(f"[tp] sell rejected: {err}")
-        _triggered_this_tick.discard(key)
-        await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
-        return
+        try:
+            result = await asyncio.to_thread(
+                place_sell_order,
+                option_code=code, qty=qty_to_sell,
+                limit_price=limit, remark=f"tp_t{tier_bit}",
+            )
+        except Exception as e:
+            logger.exception("[tp] place_sell_order failed")
+            _triggered_this_tick.discard(key)
+            await send_telegram(format_error("TP sell error", f"{code}\n{e}"))
+            return
 
-    # 先持久化档位（即使下面 on_close_filled 出错也不会重复触发同档）
-    try:
-        positions_db.mark_tp_hit(code, tier_bit)
-    except Exception as e:
-        logger.error(f"[tp] mark_tp_hit failed: {e}")
+        if not result.get("success"):
+            err = result.get("message", "unknown")
+            if result.get("naked_short"):
+                # broker 权威说没这么多 long → 本地脱钩。核销到 broker 实数(0→CLOSED)
+                # 让它退出 get_open_positions,停止每 tick 重挂;只在首次核销时告警一次。
+                bq = result.get("broker_qty", 0)
+                changed = position_mgr.reconcile_to_broker(code, bq)
+                logger.error(
+                    f"[tp] naked-short desync {code}: broker long={bq}, "
+                    f"reconciled local DB (changed={changed})"
+                )
+                if changed:
+                    await send_telegram(format_error(
+                        "持仓脱钩已核销",
+                        f"{code}: broker 实际持有 {bq} 张,本地 DB 高估。已核销并停止止盈重试。\n"
+                        f"请核对 moomoo 持仓（必要时跑 scripts/sync_positions.py）。"
+                    ))
+                return
+            logger.error(f"[tp] sell rejected: {err}")
+            _triggered_this_tick.discard(key)
+            await send_telegram(format_error("TP sell rejected", f"{code} qty={qty_to_sell}\n{err}"))
+            return
 
-    try:
-        position_mgr.on_close_filled(
-            option_code=code,
-            qty_sold=result.get("qty", qty_to_sell),
-            fill_price=result.get("price", limit),
-            trigger_source="tp_polling",
-            order_id=result.get("order_id"),
-            note=f"TP T{tier_bit} +{int(threshold_pct*100)}%: last={last_price:.2f}",
-        )
-    except Exception as e:
-        logger.error(f"[tp] on_close_filled failed: {e}")
+        # 先持久化档位（即使下面 on_close_filled 出错也不会重复触发同档）
+        try:
+            positions_db.mark_tp_hit(code, tier_bit)
+        except Exception as e:
+            logger.error(f"[tp] mark_tp_hit failed: {e}")
+
+        try:
+            position_mgr.on_close_filled(
+                option_code=code,
+                qty_sold=result.get("qty", qty_to_sell),
+                fill_price=result.get("price", limit),
+                trigger_source="tp_polling",
+                order_id=result.get("order_id"),
+                note=f"TP T{tier_bit} +{int(threshold_pct*100)}%: last={last_price:.2f}",
+            )
+        except Exception as e:
+            logger.error(f"[tp] on_close_filled failed: {e}")
+
+        # 卖单成交确认：未成交则 TG 告警（DB 已扣减，broker 端可能还持有）
+        fill_checker.spawn(fill_checker.confirm_sell_fill(
+            result.get("order_id") or "", code,
+            result.get("qty", qty_to_sell), f"tp_t{tier_bit}",
+        ))
 
     await send_telegram(format_close_filled(
         pos["symbol"], pos["strike"], pos["side"], pos["expiry"],
@@ -128,7 +160,11 @@ async def _trigger_tp(pos: dict, last_price: float, threshold_pct: float,
 
 
 async def _tp_tick():
-    """单轮检查。仅扫 category 在 LADDER 里的活跃仓位。"""
+    """单轮检查。仅扫 category 在 LADDER 里的活跃仓位。
+
+    批量取价（7/8 改造，同 sl_watcher._sl_tick）：整个 tick 只发一次
+    get_last_prices，避免打满 moomoo 60 次/30s 频率配额。
+    """
     cfg = _cfg()
     global _triggered_this_tick
     _triggered_this_tick = set()  # tick 边界重置（每轮独立判断）
@@ -140,9 +176,12 @@ async def _tp_tick():
     if not positions:
         return
 
+    codes = [p["option_code"] for p in positions]
+    prices = await asyncio.to_thread(get_last_prices, codes)
+
     for pos in positions:
         cat = pos["category"]
-        last = await asyncio.to_thread(get_last_price, pos["option_code"])
+        last = prices.get(pos["option_code"])
         if last is None:
             continue
 
